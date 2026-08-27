@@ -6,16 +6,25 @@
 #define N_SIMDGROUP 4
 #define SIMDGROUP_WIDTH 64
 
+// KALSA (2026-08-19): mask-then-shift is MISCOMPILED on Adreno 740 (driver 0676.73,
+// compiler E031.41.03.62). `(v & 0xF000) >> 12` treats the masked value as signed and
+// performs an ARITHMETIC shift, so whenever the top bit is set the sign propagates and
+// the result carries spurious high bits; a following `& 0x0F` does not save it, because
+// the compiler removes that mask as dead by known-bits (it assumes a logical shift).
+// Measured on device with an in-run buffer readback: corruption occurred in exactly the
+// cases where the source byte was >= 0x80, 16/16.
+// SHIFT FIRST, THEN MASK -- which is the form kernel_gemv_moe_q6_k_f32_ns.cl already
+// uses, and q6_K is the only nibble-packed MoE type that passes on this device (3/3).
 static inline float8 q4_0_to_fp32_packed8(ushort2 q4x8) {
     float8 fp32x8;
-    fp32x8.s0 = (float)((q4x8.s0 & 0x000F) - 8);
-    fp32x8.s1 = (float)(((q4x8.s0 & 0x00F0) >> 4) - 8);
-    fp32x8.s2 = (float)(((q4x8.s0 & 0x0F00) >> 8) - 8);
-    fp32x8.s3 = (float)(((q4x8.s0 & 0xF000) >> 12) - 8);
-    fp32x8.s4 = (float)((q4x8.s1 & 0x000F) - 8);
-    fp32x8.s5 = (float)(((q4x8.s1 & 0x00F0) >> 4) - 8);
-    fp32x8.s6 = (float)(((q4x8.s1 & 0x0F00) >> 8) - 8);
-    fp32x8.s7 = (float)(((q4x8.s1 & 0xF000) >> 12) - 8);
+    fp32x8.s0 = (float)((int)( q4x8.s0        & 0x000F) - 8);
+    fp32x8.s1 = (float)((int)((q4x8.s0 >>  4) & 0x000F) - 8);
+    fp32x8.s2 = (float)((int)((q4x8.s0 >>  8) & 0x000F) - 8);
+    fp32x8.s3 = (float)((int)((q4x8.s0 >> 12) & 0x000F) - 8);
+    fp32x8.s4 = (float)((int)( q4x8.s1        & 0x000F) - 8);
+    fp32x8.s5 = (float)((int)((q4x8.s1 >>  4) & 0x000F) - 8);
+    fp32x8.s6 = (float)((int)((q4x8.s1 >>  8) & 0x000F) - 8);
+    fp32x8.s7 = (float)((int)((q4x8.s1 >> 12) & 0x000F) - 8);
     return fp32x8;
 }
 

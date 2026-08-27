@@ -16,7 +16,6 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
-#include "llama.h"
 #include "models/models.h"
 
 #include "ggml.h"
@@ -85,8 +84,6 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_stablelm(params);
         case LLM_ARCH_MELLUM:
             return new llama_model_mellum(params);
-        case LLM_ARCH_NANBEIGE:
-            return new llama_model_nanbeige(params);
         case LLM_ARCH_QWEN:
             return new llama_model_qwen(params);
         case LLM_ARCH_QWEN2:
@@ -253,8 +250,6 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_arcee(params);
         case LLM_ARCH_AFMOE:
             return new llama_model_afmoe(params);
-        case LLM_ARCH_LAGUNA:
-            return new llama_model_laguna(params);
         case LLM_ARCH_ERNIE4_5:
             return new llama_model_ernie4_5(params);
         case LLM_ARCH_ERNIE4_5_MOE:
@@ -267,8 +262,6 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_hunyuan_vl(params);
         case LLM_ARCH_HUNYUAN_DENSE:
             return new llama_model_hunyuan_dense(params);
-        case LLM_ARCH_HY_V3:
-            return new llama_model_hy_v3(params);
         case LLM_ARCH_SMOLLM3:
             return new llama_model_smollm3(params);
         case LLM_ARCH_OPENAI_MOE:
@@ -287,8 +280,6 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_apertus(params);
         case LLM_ARCH_MINIMAX_M2:
             return new llama_model_minimax_m2(params);
-        case LLM_ARCH_MINIMAX_M3:
-            return new llama_model_minimax_m3(params);
         case LLM_ARCH_COGVLM:
             return new llama_model_cogvlm(params);
         case LLM_ARCH_PANGU_EMBED:
@@ -322,7 +313,8 @@ llama_model * llama_model_create(llm_arch arch, const llama_model_params & param
 
     if (model != nullptr) {
         model->arch = arch;
-        if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && !llm_arch_supports_sm_tensor(arch)) {
+        auto & devices = model->devices;
+        if (!devices.empty() && devices[0].is_meta && !llm_arch_supports_sm_tensor(arch)) {
             throw std::runtime_error(std::string("LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '") + llm_arch_name(arch) + "'");
         }
     }
@@ -344,40 +336,38 @@ struct lm_ggml_backend_meta_split_state llama_meta_device_get_split_state(const 
     const llama_hparams & hparams = ud->model->hparams;
     const std::string tensor_name = tensor->name;
 
-    static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
-    static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
-    static const std::regex pattern_qkv_weight      ("blk\\.\\d*\\.attn_qkv.weight");
-    static const std::regex pattern_q_bias          ("blk\\.\\d*\\.attn_q\\.bias");
-    static const std::regex pattern_kv_bias         ("blk\\.\\d*\\.attn_(k|v)\\.bias");
-    static const std::regex pattern_qkv_bias        ("blk\\.\\d*\\.attn_qkv.bias");
-    static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
-    static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
-    static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
-    static const std::regex pattern_attn_out_weight ("blk\\.\\d*\\.attn_output.weight");
-    static const std::regex pattern_attn_out_bias   ("blk\\.\\d*\\.attn_output.bias");
-    static const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
+    const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
+    const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
+    const std::regex pattern_qkv_weight      ("blk\\.\\d*\\.attn_qkv.weight");
+    const std::regex pattern_q_bias          ("blk\\.\\d*\\.attn_q\\.bias");
+    const std::regex pattern_kv_bias         ("blk\\.\\d*\\.attn_(k|v)\\.bias");
+    const std::regex pattern_qkv_bias        ("blk\\.\\d*\\.attn_qkv.bias");
+    const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
+    const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
+    const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
+    const std::regex pattern_attn_out_weight ("blk\\.\\d*\\.attn_output.weight");
+    const std::regex pattern_attn_out_bias   ("blk\\.\\d*\\.attn_output.bias");
+    const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
 
-    static const std::regex pattern_ssm_dt          ("blk\\.\\d*\\.ssm_dt.bias");
-    static const std::regex pattern_ssm_a           ("blk\\.\\d*\\.ssm_a");
-    static const std::regex pattern_ssm_alpha       ("blk\\.\\d*\\.ssm_alpha.weight");
-    static const std::regex pattern_ssm_beta        ("blk\\.\\d*\\.ssm_beta.weight");
-    static const std::regex pattern_ssm_beta_alpha  ("blk\\.\\d*\\.ssm_ba.weight");
-    static const std::regex pattern_r_cache         ("cache_r_l\\d*");
-    static const std::regex pattern_s_cache         ("cache_s_l\\d*");
-    static const std::regex pattern_ssm_conv1d      ("blk\\.\\d*\\.ssm_conv1d.weight");
-    static const std::regex pattern_ssm_out_weight  ("blk\\.\\d*\\.ssm_out.weight");
+    const std::regex pattern_ssm_dt          ("blk\\.\\d*\\.ssm_dt.bias");
+    const std::regex pattern_ssm_a           ("blk\\.\\d*\\.ssm_a");
+    const std::regex pattern_ssm_alpha       ("blk\\.\\d*\\.ssm_alpha.weight");
+    const std::regex pattern_ssm_beta        ("blk\\.\\d*\\.ssm_beta.weight");
+    const std::regex pattern_ssm_beta_alpha  ("blk\\.\\d*\\.ssm_ba.weight");
+    const std::regex pattern_r_cache         ("cache_r_l\\d*");
+    const std::regex pattern_s_cache         ("cache_s_l\\d*");
+    const std::regex pattern_ssm_conv1d      ("blk\\.\\d*\\.ssm_conv1d.weight");
+    const std::regex pattern_ssm_out_weight  ("blk\\.\\d*\\.ssm_out.weight");
 
-    static const std::regex pattern_ffn_up_weight     ("blk\\.\\d*\\.ffn_up(_exps)?.weight");
-    static const std::regex pattern_ffn_up_bias       ("blk\\.\\d*\\.ffn_up(_exps)?.bias");
-    static const std::regex pattern_ffn_gate_weight   ("blk\\.\\d*\\.ffn_gate(_exps)?.weight");
-    static const std::regex pattern_ffn_gate_bias     ("blk\\.\\d*\\.ffn_gate(_exps)?.bias");
-    static const std::regex pattern_ffn_gate_up_weight("blk\\.\\d*\\.ffn_gate_up(_exps)?.weight");
-    static const std::regex pattern_ffn_down_weight   ("blk\\.\\d*\\.ffn_down(_exps)?.weight");
-    static const std::regex pattern_ffn_down_bias     ("blk\\.\\d*\\.ffn_down.bias");
-    static const std::regex pattern_ffn_down_exps_bias("blk\\.\\d*\\.ffn_down_exps.bias");
+    const std::regex pattern_ffn_up_gate_weight("blk\\.\\d*\\.ffn_(up|gate)(_exps)?.weight");
+    const std::regex pattern_ffn_up_gate_bias  ("blk\\.\\d*\\.ffn_(up|gate)(_exps)?.bias");
+    const std::regex pattern_ffn_gate_up_weight("blk\\.\\d*\\.ffn_gate_up(_exps)?.weight");
+    const std::regex pattern_ffn_down_weight   ("blk\\.\\d*\\.ffn_down(_exps)?.weight");
+    const std::regex pattern_ffn_down_bias     ("blk\\.\\d*\\.ffn_down.bias");
+    const std::regex pattern_ffn_down_exps_bias("blk\\.\\d*\\.ffn_down_exps.bias");
 
-    static const std::regex pattern_output_weight("output\\.weight");
-    static const std::regex pattern_output_bias  ("output\\.bias");
+    const std::regex pattern_output_weight("output\\.weight");
+    const std::regex pattern_output_bias  ("output\\.bias");
 
     struct tensor_config {
         lm_ggml_backend_meta_split_axis axis;
@@ -478,10 +468,10 @@ struct lm_ggml_backend_meta_split_state llama_meta_device_get_split_state(const 
         }
 
         // FFN
-        if (std::regex_match(tensor_name, pattern_ffn_up_weight) || std::regex_match(tensor_name, pattern_ffn_gate_weight)) {
+        if (std::regex_match(tensor_name, pattern_ffn_up_gate_weight)) {
             return get_tensor_config_impl(LM_GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
         }
-        if (std::regex_match(tensor_name, pattern_ffn_up_bias) || std::regex_match(tensor_name, pattern_ffn_gate_bias)) {
+        if (std::regex_match(tensor_name, pattern_ffn_up_gate_bias)) {
             return get_tensor_config_impl(LM_GGML_BACKEND_SPLIT_AXIS_0, "ffn_down.weight", "ffn_down_exps.weight");
         }
         if (std::regex_match(tensor_name, pattern_ffn_gate_up_weight)) {
@@ -565,14 +555,6 @@ struct lm_ggml_backend_meta_split_state llama_meta_device_get_split_state(const 
             LM_GGML_ASSERT(tensor->ne[axis] == n_embd + 2*n_embd_gqa);
             return {{n_embd, 1}, {n_embd_gqa, 2}};
         }
-        if (std::regex_match(tensor_name, pattern_ffn_up_weight) || std::regex_match(tensor_name, pattern_ffn_up_bias)) {
-            const int64_t n_ff = hparams.n_ff(il);
-            // some models such as Phi 3 have fused up + gate tensors named "up" tensors, which need to be segmented
-            if (tensor->ne[axis] == 2*n_ff) {
-                return {{n_ff, 2}};
-            }
-            return {{tensor->ne[axis], 1}};
-        }
         if (std::regex_match(tensor_name, pattern_ffn_gate_up_weight)) {
             const int64_t n_ff_exp = hparams.n_ff_exp;
             LM_GGML_ASSERT(tensor->ne[axis] == 2*n_ff_exp);
@@ -649,8 +631,7 @@ struct lm_ggml_backend_meta_split_state llama_meta_device_get_split_state(const 
         }
 
         // FFN
-        if (std::regex_match(tensor_name, pattern_ffn_up_weight) || std::regex_match(tensor_name, pattern_ffn_up_bias) ||
-                std::regex_match(tensor_name, pattern_ffn_gate_weight) || std::regex_match(tensor_name, pattern_ffn_gate_bias) ||
+        if (std::regex_match(tensor_name, pattern_ffn_up_gate_weight) || std::regex_match(tensor_name, pattern_ffn_up_gate_bias) ||
                 std::regex_match(tensor_name, pattern_ffn_gate_up_weight) || std::regex_match(tensor_name, pattern_ffn_down_weight)) {
             const int64_t blck_size_perf = std::lcm(blck_size, 128);
             LM_GGML_ASSERT(segments.size() == 1);
@@ -822,7 +803,6 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_122B_A10B:     return "122B.A10B";
         case LLM_TYPE_196B_A11B:     return "196B.A11B";
         case LLM_TYPE_230B_A10B:     return "230B.A10B";
-        case LLM_TYPE_428B_A23B:     return "428B.A23B";
         case LLM_TYPE_235B_A22B:     return "235B.A22B";
         case LLM_TYPE_300B_A47B:     return "300B.A47B";
         case LLM_TYPE_310B_A15B:     return "310B.A15B";
@@ -1088,7 +1068,6 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_CAUSAL,        hparams.causal_attn,     false);
     ml.get_key(LLM_KV_POOLING_TYPE,            hparams.pooling_type,    false);
     ml.get_key(LLM_KV_BLOCK_COUNT,             hparams.n_layer_all);
-    LM_GGML_ASSERT(hparams.n_layer_all > 0 && hparams.n_layer_all <= LLAMA_MAX_LAYERS);
     ml.get_key(LLM_KV_EXPERT_COUNT,            hparams.n_expert,        false);
     ml.get_key(LLM_KV_EXPERT_USED_COUNT,       hparams.n_expert_used,   false);
     ml.get_key(LLM_KV_EXPERT_GROUP_COUNT,      hparams.n_expert_groups, false);
@@ -1134,7 +1113,6 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     std::fill(hparams.rope_sections.begin(), hparams.rope_sections.end(), 0);
     std::fill(hparams.is_swa_impl.begin(),   hparams.is_swa_impl.end(), 0);
     std::fill(hparams.is_recr_impl.begin(),  hparams.is_recr_impl.end(),  llm_arch_is_recurrent(ml.get_arch()) ? 1 : 0);
-    std::fill(hparams.is_indexer_full_impl.begin(), hparams.is_indexer_full_impl.end(), 0);
 
     std::fill(hparams.xielu_alpha_n.begin(), hparams.xielu_alpha_n.end(), 0.0f);
     std::fill(hparams.xielu_alpha_p.begin(), hparams.xielu_alpha_p.end(), 0.0f);
@@ -1251,7 +1229,7 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
 
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
-    const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
+    const auto & use_mlock    = params.use_mlock;
     const auto & tensor_split = params.tensor_split;
 
     const int n_layer_all = hparams.n_layer_all;
@@ -1261,8 +1239,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 
-    LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (load_mode = %s)\n",
-        __func__, llama_load_mode_name(params.load_mode));
+    LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s)\n",
+        __func__, ml.use_mmap ? "true" : "false", ml.use_direct_io ? "true" : "false");
 
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
@@ -1525,7 +1503,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    ml.init_mappings(params.mmap_prefetch >= 0, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -2071,7 +2049,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 res = nullptr;
             } break;
         case LLM_ARCH_DEEPSEEK32:
-        case LLM_ARCH_GLM_DSA:
             {
                 res = new llama_kv_cache_dsa(
                         *this,
@@ -2193,7 +2170,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
                     }
 
-                    if ((arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_HY_V3) && hparams.n_layer_nextn > 0) {
+                    if (arch == LLM_ARCH_STEP35 && hparams.n_layer_nextn > 0) {
                         if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
                             filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
                         } else {
@@ -2327,17 +2304,20 @@ llama_model_params llama_model_default_params() {
         /*.tensor_buft_overrides       =*/ nullptr,
         /*.n_gpu_layers                =*/ -1,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
-        /*.load_mode                   =*/ LLAMA_LOAD_MODE_MMAP,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.vocab_only                  =*/ false,
+        /*.use_mmap                    =*/ true,
+        /*.use_direct_io               =*/ false,
+        /*.use_mlock                   =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
+        /*.mmap_prefetch               =*/ 0, // 0=auto (prefault on; zero-init reproduces historic behavior)
     };
 
     return result;
@@ -2493,7 +2473,6 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_LLAMA_EMBED:
         case LLM_ARCH_MAINCODER:
         case LLM_ARCH_GLM_DSA:
-        case LLM_ARCH_NANBEIGE:
             return LLAMA_ROPE_TYPE_NORM;
 
         // the pairs of head values are offset by n_rot/2
@@ -2548,7 +2527,6 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_JAIS2:
         case LLM_ARCH_OPENAI_MOE:
         case LLM_ARCH_HUNYUAN_DENSE:
-        case LLM_ARCH_HY_V3:
         case LLM_ARCH_LFM2:
         case LLM_ARCH_LFM2MOE:
         case LLM_ARCH_SMALLTHINKER:
@@ -2556,11 +2534,9 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_GROVEMOE:
         case LLM_ARCH_APERTUS:
         case LLM_ARCH_MINIMAX_M2:
-        case LLM_ARCH_MINIMAX_M3:
         case LLM_ARCH_COGVLM:
         case LLM_ARCH_PANGU_EMBED:
         case LLM_ARCH_AFMOE:
-        case LLM_ARCH_LAGUNA:
         case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_MIMO2:
         case LLM_ARCH_STEP35:

@@ -6,7 +6,6 @@
 
 #include "ggml-opt.h"
 #include "ggml.h"
-#include "llama.h"
 
 #include <set>
 #include <sstream>
@@ -106,7 +105,6 @@ enum llama_example {
     LLAMA_EXAMPLE_RESULTS,
     LLAMA_EXAMPLE_EXPORT_GRAPH_OPS,
     LLAMA_EXAMPLE_DOWNLOAD,
-    LLAMA_EXAMPLE_TOKENIZE,
 
     LLAMA_EXAMPLE_COUNT,
 };
@@ -284,13 +282,15 @@ struct common_params_sampling {
 
     // reasoning budget sampler parameters
     // these are populated by the server/CLI based on chat template params
-    int32_t                   reasoning_budget_tokens   = -1;  // -1 = disabled, >= 0 = token budget
-    bool                      reasoning_budget_activate_immediately = false;
-    std::vector<llama_token>  reasoning_budget_start;          // start tag token sequence
-    std::vector<llama_tokens> reasoning_budget_end;            // end tag token sequences; the first tag is used as the forcing sequence
-    std::vector<llama_token>  reasoning_budget_forced;         // forced sequence (message + first end tag)
-    std::string               reasoning_budget_message;        // message injected before end tag when budget exhausted
-    bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
+    int32_t                  reasoning_budget_tokens   = -1;   // -1 = disabled, >= 0 = token budget
+    std::vector<llama_token> reasoning_budget_start;           // start tag token sequence
+    // End-tag alternatives.  The compatibility adapter intentionally uses
+    // only the first sequence in common_sampler_init (see sampling.cpp).
+    std::vector<llama_tokens> reasoning_budget_end;
+    std::vector<llama_token> reasoning_budget_forced;          // forced sequence (message + end tag)
+    std::string              reasoning_budget_message;         // message injected before end tag when budget exhausted
+    bool                     reasoning_control = false;        // create the budget sampler on demand so reasoning can be ended at runtime
+    bool                     reasoning_budget_activate_immediately = false; // start counting without waiting for the start tag
 
     bool backend_sampling = false;
 
@@ -450,7 +450,6 @@ struct lr_opt {
 struct lm_ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 
 struct common_params {
-    bool vocab_only               = false;
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
@@ -485,7 +484,7 @@ struct common_params {
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
-    enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_MMAP; // how to load the model
+    enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_MMAP;   // how to load the model
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
@@ -576,6 +575,10 @@ struct common_params {
     bool kv_unified        = false; // enable unified KV cache
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
+    bool vocab_only        = false; // only load the vocabulary, no weights
+    bool use_mmap          = true;  // enable mmap to use filesystem cache
+    bool use_direct_io     = false; // read from disk without buffering
+    bool use_mlock         = false; // use mlock to keep model in memory
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation
     bool no_kv_offload     = false; // disable KV offloading
@@ -586,9 +589,6 @@ struct common_params {
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
 
     bool single_turn       = false; // single turn chat conversation
-
-    llama_progress_callback progress_callback = nullptr;
-    void * progress_callback_user_data = nullptr;
 
     lm_ggml_type cache_type_k = LM_GGML_TYPE_F16; // KV cache data type for the K
     lm_ggml_type cache_type_v = LM_GGML_TYPE_F16; // KV cache data type for the V
@@ -635,14 +635,6 @@ struct common_params {
     std::string api_prefix    = "";                                                                         // NOLINT
     std::string chat_template = "";                                                                         // NOLINT
     bool use_jinja = true;                                                                                  // NOLINT
-
-    // server CORS params
-    std::string cors_origins = "*";
-    std::string cors_methods = "GET, POST, DELETE, OPTIONS";
-    std::string cors_headers = "*";
-    bool cors_credentials = true;
-    bool cors_origins_explicit = false; // for --agent option
-
     bool enable_chat_template = true;
     bool force_pure_content_parser = false;
     common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
@@ -672,10 +664,6 @@ struct common_params {
 
     // enable built-in tools
     std::vector<std::string> server_tools;
-
-    // MCP server configs (Cursor-compatible JSON)
-    std::string mcp_servers_config;   // path to JSON file with MCP server definitions
-    std::string mcp_servers_json;     // inline JSON with MCP server definitions
 
     // router server configs
     std::string models_dir    = "";     // directory containing models for the router server
@@ -733,12 +721,6 @@ struct common_params {
     // batched-bench params
     bool batched_bench_output_jsonl = false;
 
-    // tokenize params
-    bool tokenize_ids        = false; // if true, only print the token IDs
-    bool tokenize_stdin      = false; // if true, read the prompt from stdin
-    bool tokenize_no_bos     = false; // if true, do not add the BOS token
-    bool tokenize_show_count = false; // if true, print the total token count
-
     // common params
     std::string out_file; // output filename for all example programs
     // optional callback for model loading progress and cancellation:
@@ -746,6 +728,10 @@ struct common_params {
     // return false from callback to abort model loading or true to continue
     llama_progress_callback load_progress_callback = NULL;
     void *                  load_progress_callback_user_data = NULL;
+    // Wrapper-facing aliases.  common_model_params_to_llama falls back to
+    // the legacy load_* callback fields when these are not supplied.
+    llama_progress_callback progress_callback = NULL;
+    void *                  progress_callback_user_data = NULL;
     bool no_alloc = false; // Don't allocate model buffers
 };
 
@@ -929,6 +915,7 @@ using common_init_result_ptr = std::unique_ptr<common_init_result>;
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
 
 struct llama_model_params     common_model_params_to_llama  (      common_params & params);
+enum llama_load_mode          common_load_mode_from_flags   (bool use_mmap, bool use_mlock, bool use_direct_io);
 struct llama_context_params   common_context_params_to_llama(const common_params & params);
 struct lm_ggml_threadpool_params lm_ggml_threadpool_params_from_cpu_params(const common_cpu_params & params);
 
@@ -1103,9 +1090,6 @@ enum lm_ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 
 struct common_prompt_checkpoint {
     int64_t n_tokens;
-
-    // (optional) id of the task that created the checkpoint
-    int id_task = -1;
 
     llama_pos pos_min;
     llama_pos pos_max;

@@ -185,7 +185,9 @@ std::string common_params_sampling::print() const {
 }
 
 struct common_sampler * common_sampler_init(const struct llama_model * model, struct common_params_sampling & params) {
-    const llama_vocab * vocab = llama_model_get_vocab(model);
+    // A model is not needed for model-independent sampler construction.  The
+    // model-dependent samplers still require a non-null model/vocab.
+    const llama_vocab * vocab = model != nullptr ? llama_model_get_vocab(model) : nullptr;
 
     llama_sampler_chain_params lparams = llama_sampler_chain_default_params();
 
@@ -296,27 +298,34 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
     }
 
     // reasoning budget sampler (skip when budget is unlimited unless a lazy grammar is active, which needs rbudget for thinking-block suppression)
-    if (!params.reasoning_budget_start.empty() && !params.reasoning_budget_end.empty() && (params.grammar_lazy || params.reasoning_budget_tokens >= 0 || params.reasoning_control)) {
-        if (params.reasoning_budget_activate_immediately) {
-            rbudget = common_reasoning_budget_init(
-                vocab,
-                {params.reasoning_budget_start},
-                params.reasoning_budget_end,
-                params.reasoning_budget_forced,
-                params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens,
-                REASONING_BUDGET_COUNTING);
-        } else {
-            rbudget = common_reasoning_budget_init(
-                vocab,
-                {params.reasoning_budget_start},
-                params.reasoning_budget_end,
-                params.reasoning_budget_forced,
-                params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens);
-        }
+    if ((!params.reasoning_budget_start.empty() || params.reasoning_budget_activate_immediately) &&
+        !params.reasoning_budget_end.empty() &&
+        !params.reasoning_budget_end.front().empty() &&
+        (params.grammar_lazy || params.reasoning_budget_tokens >= 0 || params.reasoning_control)) {
+        // llama.rn can provide multiple end-tag sequences.  The fork's
+        // reasoning sampler has one matcher, so preserve its established
+        // semantics by deliberately adapting to the first sequence.
+        const auto & reasoning_budget_end = params.reasoning_budget_end.front();
+        const auto initial_state = params.reasoning_budget_activate_immediately
+            ? REASONING_BUDGET_COUNTING
+            : REASONING_BUDGET_IDLE;
+        rbudget = common_reasoning_budget_init(
+            vocab,
+            params.reasoning_budget_start,
+            reasoning_budget_end,
+            params.reasoning_budget_forced,
+            params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens,
+            initial_state);
 
-        for (const auto & token : prefill_tokens) {
-            llama_sampler_accept(rbudget, token);
-            LOG_DBG("%s: reasoning-budget accepted prefill token (%d)\n", __func__, token);
+        // Match the upstream #22488 path for the normal IDLE flow: a start tag
+        // embedded in the generation prompt arms the budget before generation.
+        // Immediate activation is already COUNTING (and may have budget == 0),
+        // so feeding its prompt would incorrectly consume generation budget.
+        if (initial_state == REASONING_BUDGET_IDLE) {
+            for (const auto & token : prefill_tokens) {
+                llama_sampler_accept(rbudget, token);
+                LOG_DBG("%s: reasoning-budget accepted prefill token (%d)\n", __func__, token);
+            }
         }
     }
 
@@ -463,17 +472,6 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
 
     if (gsmpl->rbudget && is_generated) {
         llama_sampler_accept(gsmpl->rbudget, token);
-
-        // if done, replay end sequence which may contain a grammar trigger
-        const bool is_done = common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_DONE;
-        if (gsmpl->grmr && !accept_grammar && is_done) {
-            const llama_tokens * end_seq = common_reasoning_budget_get_end_match(gsmpl->rbudget);
-            if (end_seq) {
-                for (const llama_token end_token : *end_seq) {
-                    llama_sampler_accept(gsmpl->grmr, end_token);
-                }
-            }
-        }
     }
 
     if (gsmpl->grmr && accept_grammar) {
@@ -691,6 +689,14 @@ bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {
     }
 
     return common_reasoning_budget_force(gsmpl->rbudget);
+}
+
+common_reasoning_budget_state common_sampler_reasoning_budget_get_state(const struct common_sampler * gsmpl) {
+    if (!gsmpl) {
+        return REASONING_BUDGET_IDLE;
+    }
+
+    return common_reasoning_budget_get_state(gsmpl->rbudget);
 }
 
 // helpers

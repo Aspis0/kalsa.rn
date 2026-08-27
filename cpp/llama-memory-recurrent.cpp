@@ -819,12 +819,7 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     bool res = true;
 
     res = res && state_read_meta(io, cell_count, seq_id);
-
-    try {
-        res = res && state_read_data(io, cell_count);
-    } catch (...) {
-        res = false;
-    }
+    res = res && state_read_data(io, cell_count);
 
     if (!res) {
         if (seq_id == -1) {

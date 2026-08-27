@@ -24,6 +24,7 @@
 #include <iterator>
 #include <regex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -1249,6 +1250,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         lora.reset(llama_adapter_lora_init(model, la.path.c_str()));
         if (lora == nullptr) {
             COM_ERR("failed to load lora adapter '%s'\n", la.path.c_str());
+            pimpl->model.reset(model);
             return;
         }
 
@@ -1547,6 +1549,11 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
     llama_set_adapters_lora(ctx, loras.data(), loras.size(), scales.data());
 }
 
+enum llama_load_mode common_load_mode_from_flags(bool use_mmap, bool use_mlock, bool use_direct_io) {
+    const int mode = (use_mmap ? 1 : 0) | (use_mlock ? 2 : 0) | (use_direct_io ? 4 : 0);
+    return static_cast<enum llama_load_mode>(mode);
+}
+
 struct llama_model_params common_model_params_to_llama(common_params & params) {
     auto mparams = llama_model_default_params();
 
@@ -1558,8 +1565,52 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.n_gpu_layers    = params.n_gpu_layers;
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
-    mparams.load_mode       = params.load_mode;
     mparams.tensor_split    = params.tensor_split;
+    mparams.vocab_only      = params.vocab_only;
+    switch (params.load_mode) {
+        case LLAMA_LOAD_MODE_NONE:
+            mparams.use_mmap      = false;
+            mparams.use_direct_io = false;
+            mparams.use_mlock     = false;
+            break;
+        case LLAMA_LOAD_MODE_MMAP:
+            mparams.use_mmap      = true;
+            mparams.use_direct_io = false;
+            mparams.use_mlock     = false;
+            break;
+        case LLAMA_LOAD_MODE_MLOCK:
+            mparams.use_mmap      = false;
+            mparams.use_direct_io = false;
+            mparams.use_mlock     = true;
+            break;
+        case LLAMA_LOAD_MODE_MMAP_MLOCK:
+            mparams.use_mmap      = true;
+            mparams.use_direct_io = false;
+            mparams.use_mlock     = true;
+            break;
+        case LLAMA_LOAD_MODE_DIRECT_IO:
+            mparams.use_mmap      = false;
+            mparams.use_direct_io = true;
+            mparams.use_mlock     = false;
+            break;
+        case LLAMA_LOAD_MODE_MMAP_DIRECT_IO:
+            mparams.use_mmap      = true;
+            mparams.use_direct_io = true;
+            mparams.use_mlock     = false;
+            break;
+        case LLAMA_LOAD_MODE_DIRECT_IO_MLOCK:
+            mparams.use_mmap      = false;
+            mparams.use_direct_io = true;
+            mparams.use_mlock     = true;
+            break;
+        case LLAMA_LOAD_MODE_MMAP_DIRECT_IO_MLOCK:
+            mparams.use_mmap      = true;
+            mparams.use_direct_io = true;
+            mparams.use_mlock     = true;
+            break;
+        default:
+            throw std::invalid_argument("invalid llama_load_mode");
+    }
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
@@ -1578,8 +1629,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
     }
 
-    mparams.progress_callback           = params.load_progress_callback;
-    mparams.progress_callback_user_data = params.load_progress_callback_user_data;
+    mparams.progress_callback           = params.progress_callback != nullptr ? params.progress_callback : params.load_progress_callback;
+    mparams.progress_callback_user_data = params.progress_callback != nullptr ? params.progress_callback_user_data : params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
 
     if (params.progress_callback != nullptr) {

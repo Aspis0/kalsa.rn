@@ -1218,9 +1218,8 @@ bool lm_ggml_metal_device_supports_op(lm_ggml_metal_device_t dev, const struct l
                    (lm_ggml_get_op_params_i32(op, 4) == 0) && (lm_ggml_get_op_params_i32(op, 6) == 0);
         case LM_GGML_OP_PAD_REFLECT_1D:
         case LM_GGML_OP_TIMESTEP_EMBEDDING:
-            return op->src[0]->type == LM_GGML_TYPE_F32;
         case LM_GGML_OP_LEAKY_RELU:
-            return op->src[0]->type == LM_GGML_TYPE_F32 || op->src[0]->type == LM_GGML_TYPE_F16;
+            return op->src[0]->type == LM_GGML_TYPE_F32;
         case LM_GGML_OP_ARGSORT:
         case LM_GGML_OP_TOP_K:
         case LM_GGML_OP_ARANGE:
@@ -1290,7 +1289,6 @@ bool lm_ggml_metal_device_supports_op(lm_ggml_metal_device_t dev, const struct l
                            case LM_GGML_TYPE_BF16:
                            case LM_GGML_TYPE_Q8_0:
                            case LM_GGML_TYPE_Q1_0:
-                           case LM_GGML_TYPE_Q2_0:
                            case LM_GGML_TYPE_Q4_0:
                            case LM_GGML_TYPE_Q4_1:
                            case LM_GGML_TYPE_Q5_0:
@@ -1318,7 +1316,6 @@ bool lm_ggml_metal_device_supports_op(lm_ggml_metal_device_t dev, const struct l
                                 return false;
                         }
                     case LM_GGML_TYPE_Q1_0:
-                    case LM_GGML_TYPE_Q2_0:
                     case LM_GGML_TYPE_Q4_0:
                     case LM_GGML_TYPE_Q4_1:
                     case LM_GGML_TYPE_Q5_0:
@@ -1341,11 +1338,7 @@ bool lm_ggml_metal_device_supports_op(lm_ggml_metal_device_t dev, const struct l
             return op->src[0]->type != LM_GGML_TYPE_NVFP4;
         case LM_GGML_OP_SET_ROWS:
             {
-                if (op->src[0]->type == LM_GGML_TYPE_F16) {
-                    return op->type == LM_GGML_TYPE_F16;
-                }
-
-                if (op->src[0]->type != LM_GGML_TYPE_F32) {
+                if (op->src[0]->type != LM_GGML_TYPE_F32 && op->src[0]->type != LM_GGML_TYPE_F16) {
                     return false;
                 }
 

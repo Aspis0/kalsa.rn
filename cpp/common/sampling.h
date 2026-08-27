@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include "common.h"
+#include "reasoning-budget.h"
 
 #include <string>
 #include <vector>
@@ -89,6 +90,9 @@ uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
+
+// inspect the reasoning-budget state; returns IDLE when no sampler is present.
+common_reasoning_budget_state common_sampler_reasoning_budget_get_state(const struct common_sampler * gsmpl);
 
 // helpers
 

@@ -3,6 +3,7 @@
 
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "traits.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
@@ -14,6 +15,7 @@
 #include "ops.h"
 #include "ggml.h"
 #include "common.h"
+#include "repack-q23k.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -53,6 +55,55 @@
 #ifdef LM_GGML_USE_CPU_RISCV64_SPACEMIT
 #    include "spacemit/ime.h"
 #endif
+
+// Process-global expert-ready hook, invoked from mul_mat_id before each expert is read.
+// Lets an external expert-streaming engine block until an expert's weights are resident.
+static lm_ggml_cpu_expert_ready_hook_t g_expert_ready_hook      = NULL;
+static void *                       g_expert_ready_hook_data = NULL;
+
+void lm_ggml_cpu_set_expert_ready_hook(lm_ggml_cpu_expert_ready_hook_t hook, void * user_data) {
+    g_expert_ready_hook      = hook;
+    g_expert_ready_hook_data = user_data;
+}
+
+static bool lm_ggml_cpu_type_is_k_quant(enum lm_ggml_type type) {
+    switch (type) {
+        case LM_GGML_TYPE_Q2_K:
+        case LM_GGML_TYPE_Q3_K:
+        case LM_GGML_TYPE_Q4_K:
+        case LM_GGML_TYPE_Q5_K:
+        case LM_GGML_TYPE_Q6_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Virtual tall GEMV over k selected experts. Only the proven-win case:
+// single-token decode + K-quant gate/up. Everything else stays on stock mul_mat_id.
+static bool lm_ggml_cpu_mul_mat_id_should_fuse(
+        const struct lm_ggml_compute_params * params,
+        const struct lm_ggml_tensor * src0,
+        const struct lm_ggml_tensor * ids) {
+    if (params->use_ref) {
+        return false;
+    }
+    if (!lm_ggml_cpu_get_moe_fused_gemv()) {
+        return false;
+    }
+    // Tiled CPU_REPACK extras are not native blocks. vec_dot on them is silent-wrong
+    // (q4_K/q5_K/q6_K 8x4 on Jelly-class, q2_K_8x8 on AVX512, q23k 8x4, …).
+    if (lm_ggml_cpu_repack_extra_is_tiled(src0->extra)) {
+        return false;
+    }
+    if (ids->ne[1] != 1) {
+        return false; // n_tokens != 1
+    }
+    if (ids->ne[0] < 1 || src0->ne[1] < 1) {
+        return false;
+    }
+    return lm_ggml_cpu_type_is_k_quant(src0->type);
+}
 
 // Note: once we move threading into a separate C++ file
 // will use std::hardware_destructive_interference_size instead of hardcoding it here
@@ -204,6 +255,150 @@ typedef pthread_t lm_ggml_thread_t;
 
 #define LM_GGML_THREADPOOL_N_THREADS_MASK (0xffffU)
 #define LM_GGML_THREADPOOL_N_THREADS_BITS (16)
+
+// 0/n/N/f/F and "off"/"OFF" disable (matches bmoe-cli --moe-fused-ffn off).
+static bool moe_fused_env_disabled(const char * e) {
+    if (!e || !e[0]) {
+        return false;
+    }
+    if (e[0] == '0' || e[0] == 'n' || e[0] == 'N' || e[0] == 'f' || e[0] == 'F') {
+        return true;
+    }
+    if ((e[0] == 'o' || e[0] == 'O') &&
+        (e[1] == 'f' || e[1] == 'F') &&
+        (e[2] == 'f' || e[2] == 'F') && e[3] == '\0') {
+        return true;
+    }
+    return false;
+}
+
+// -1 = not yet resolved (read env once). 0/1 = off/on.
+// atomic_int: first-graph-compute threads may race the lazy resolve.
+static atomic_int g_moe_fused_gemv = -1;
+static atomic_int g_moe_fused_ffn  = -1;
+
+static void moe_fused_gemv_resolve(void) {
+    if (atomic_load(&g_moe_fused_gemv) >= 0) {
+        return;
+    }
+    const char * e = getenv("LM_GGML_MOE_FUSED_GEMV");
+    atomic_store(&g_moe_fused_gemv, moe_fused_env_disabled(e) ? 0 : 1);
+}
+
+static void moe_fused_ffn_resolve(void) {
+    if (atomic_load(&g_moe_fused_ffn) >= 0) {
+        return;
+    }
+    const char * e = getenv("LM_GGML_MOE_FUSED_FFN");
+    atomic_store(&g_moe_fused_ffn, moe_fused_env_disabled(e) ? 0 : 1);
+}
+
+void lm_ggml_cpu_set_moe_fused_gemv(bool enabled) {
+    atomic_store(&g_moe_fused_gemv, enabled ? 1 : 0);
+}
+
+bool lm_ggml_cpu_get_moe_fused_gemv(void) {
+    moe_fused_gemv_resolve();
+    return atomic_load(&g_moe_fused_gemv) != 0;
+}
+
+void lm_ggml_cpu_set_moe_fused_ffn(bool enabled) {
+    atomic_store(&g_moe_fused_ffn, enabled ? 1 : 0);
+}
+
+bool lm_ggml_cpu_get_moe_fused_ffn(void) {
+    moe_fused_ffn_resolve();
+    return atomic_load(&g_moe_fused_ffn) != 0;
+}
+
+// S3 diagnosis: LM_GGML_MOE_REPACK_TRACE=1 prints which MUL_MAT[_ID] path ran (extra-buffer REPACK
+// vs stock vec_dot). LM_GGML_MOE_FUSED_FFN_PROFILE=1 times fused phases A-D every 28 launches.
+static int moe_repack_trace_on(void) {
+    static atomic_int v = -1;
+    int cur = atomic_load(&v);
+    if (cur >= 0) {
+        return cur;
+    }
+    const char * e = getenv("LM_GGML_MOE_REPACK_TRACE");
+    const int on = (e && e[0] && e[0] != '0') ? 1 : 0;
+    atomic_store(&v, on);
+    return on;
+}
+
+static int moe_fused_profile_on(void) {
+    static atomic_int v = -1;
+    int cur = atomic_load(&v);
+    if (cur >= 0) {
+        return cur;
+    }
+    const char * e = getenv("LM_GGML_MOE_FUSED_FFN_PROFILE");
+    const int on = (e && e[0] && e[0] != '0') ? 1 : 0;
+    atomic_store(&v, on);
+    return on;
+}
+
+static atomic_int g_moe_path_repack = 0;
+static atomic_int g_moe_path_stock  = 0;
+static atomic_int g_moe_path_printed = 0;
+
+static int64_t g_moe_prof_hook = 0;
+static int64_t g_moe_prof_a    = 0;
+static int64_t g_moe_prof_b    = 0;
+static int64_t g_moe_prof_c    = 0;
+static int64_t g_moe_prof_d    = 0;
+static int     g_moe_prof_n    = 0;
+
+static void moe_fused_prof_tick(int64_t * acc, int64_t * t0) {
+    const int64_t now = lm_ggml_time_us();
+    *acc += now - *t0;
+    *t0 = now;
+}
+
+static void moe_fused_prof_report(void) {
+    g_moe_prof_n++;
+    if (g_moe_prof_n % 28 != 0) {
+        return;
+    }
+    const double s = 1e-6;
+    fprintf(stderr,
+            "bmoe-fused-profile: n=%d  hook=%.3f ms  A=%.3f ms  B=%.3f ms  C=%.3f ms  D=%.3f ms  "
+            "sum=%.3f ms  (per-token last 28)\n",
+            g_moe_prof_n,
+            s * 1e3 * (double) g_moe_prof_hook,
+            s * 1e3 * (double) g_moe_prof_a,
+            s * 1e3 * (double) g_moe_prof_b,
+            s * 1e3 * (double) g_moe_prof_c,
+            s * 1e3 * (double) g_moe_prof_d,
+            s * 1e3 * (double) (g_moe_prof_hook + g_moe_prof_a + g_moe_prof_b + g_moe_prof_c + g_moe_prof_d));
+    g_moe_prof_hook = g_moe_prof_a = g_moe_prof_b = g_moe_prof_c = g_moe_prof_d = 0;
+}
+
+static void moe_repack_trace_op(const struct lm_ggml_tensor * tensor, bool via_repack) {
+    if (!moe_repack_trace_on()) {
+        return;
+    }
+    if (tensor->op != LM_GGML_OP_MUL_MAT && tensor->op != LM_GGML_OP_MUL_MAT_ID) {
+        return;
+    }
+    if (via_repack) {
+        atomic_fetch_add_explicit(&g_moe_path_repack, 1, memory_order_relaxed);
+    } else {
+        atomic_fetch_add_explicit(&g_moe_path_stock, 1, memory_order_relaxed);
+    }
+    const int printed = atomic_fetch_add_explicit(&g_moe_path_printed, 1, memory_order_relaxed);
+    if (printed >= 8) {
+        return;
+    }
+    const struct lm_ggml_tensor * src0 = tensor->src[0];
+    const char * buft = (src0 && src0->buffer) ? lm_ggml_backend_buffer_name(src0->buffer) : "null";
+    const int extra = (src0 && src0->extra) ? 1 : 0;
+    fprintf(stderr, "bmoe-repack-trace: op=%s type=%s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 "] buft=%s extra=%d path=%s  (repack=%d stock=%d)\n",
+            lm_ggml_op_name(tensor->op),
+            src0 ? lm_ggml_type_name(src0->type) : "?",
+            src0 ? src0->ne[0] : 0, src0 ? src0->ne[1] : 0, src0 ? src0->ne[2] : 0,
+            buft, extra, via_repack ? "REPACK" : "vec_dot",
+            atomic_load(&g_moe_path_repack), atomic_load(&g_moe_path_stock));
+}
 
 #if defined(__APPLE__)
 #include <unistd.h>
@@ -1531,6 +1726,114 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
+// One logical tall GEMV of (n_ids * ne01) rows. Row r maps to
+//   slot = r / ne01, local = r % ne01, expert = ids[slot]
+// with no weight copy: each expert slice is already contiguous in src0[:,:,expert].
+// Expert-ready hooks run for every selected expert before any row is read (v1: wait-all
+// then fuse — cache hits return immediately; misses serialize I/O before compute).
+static void lm_ggml_compute_forward_mul_mat_id_fused(
+        const struct lm_ggml_compute_params * params,
+        struct lm_ggml_tensor * dst,
+        char (*atomic_current_chunk)[CACHE_LINE_SIZE]) {
+
+    const struct lm_ggml_tensor * src0 = dst->src[0];
+    const struct lm_ggml_tensor * src1 = dst->src[1];
+    const struct lm_ggml_tensor * ids  = dst->src[2];
+
+    LM_GGML_TENSOR_BINARY_OP_LOCALS
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int n_ids = (int) ids->ne[0];
+    const int64_t n_rows = ne01;
+
+    const enum lm_ggml_type type = src0->type;
+    lm_ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
+    enum lm_ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+    const bool src1_cont = lm_ggml_is_contiguous(src1);
+    const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+    const size_t row_size = lm_ggml_row_size(vec_dot_type, ne10);
+
+    // Same readiness semantics as stock: every compute thread waits on each selected expert.
+    for (int slot = 0; slot < n_ids; ++slot) {
+        const int32_t expert = *(const int32_t *) ((const char *) ids->data + slot * ids->nb[0]);
+        LM_GGML_ASSERT(expert >= 0 && expert < ne02);
+        if (g_expert_ready_hook) {
+            g_expert_ready_hook(src0, expert, g_expert_ready_hook_data);
+        }
+    }
+
+    // Virtual tall GEMV: nr0 = k * rows, nr1 = 1. Same chunk plan as mul_mat GEMV.
+    const int64_t nr0 = n_ids * n_rows;
+    const int64_t nr1 = 1;
+
+    int chunk_size = 64;
+    int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
+    int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
+
+    if (nchunk0 * nchunk1 < nth * 4 || lm_ggml_is_numa()) {
+        nchunk0 = nr0 > nr1 ? nth : 1;
+        nchunk1 = nr0 > nr1 ? 1 : nth;
+    }
+
+    const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
+    const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
+
+    int current_chunk = ith;
+    atomic_int * current_chunk_ctr = (atomic_int *) (atomic_current_chunk + 0);
+
+    const int64_t blck_0 = 16;
+    float tmp[16];
+
+    while (current_chunk < nchunk0 * nchunk1) {
+        const int64_t ith0 = current_chunk % nchunk0;
+        const int64_t ith1 = current_chunk / nchunk0;
+
+        const int64_t ir0_start = dr0 * ith0;
+        const int64_t ir0_end   = MIN(ir0_start + dr0, nr0);
+        const int64_t ir1_start = dr1 * ith1;
+        const int64_t ir1_end   = MIN(ir1_start + dr1, nr1);
+
+        LM_GGML_UNUSED(ir1_start);
+        LM_GGML_UNUSED(ir1_end);
+
+        for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+            const int64_t blk_end = MIN(iir0 + blck_0, ir0_end);
+            int64_t ir0 = iir0;
+            while (ir0 < blk_end) {
+                const int64_t slot  = ir0 / n_rows;
+                const int64_t local = ir0 % n_rows;
+                const int64_t run_end = MIN(blk_end, (slot + 1) * n_rows);
+                const int64_t nrun = run_end - ir0;
+
+                const int32_t expert = *(const int32_t *) ((const char *) ids->data + slot * ids->nb[0]);
+                const char * src0_cur = (const char *) src0->data + (int64_t) expert * nb02;
+
+                const int64_t i11 = slot % ne11;
+                const char * src1_col = (const char *) wdata +
+                    (src1_cont || src1->type != vec_dot_type
+                     ? i11 * row_size
+                     : i11 * nb11);
+
+                float * dst_col = (float *) ((char *) dst->data + slot * nb1);
+
+                for (int64_t j = 0; j < nrun; ++j) {
+                    vec_dot(ne00, &tmp[j], 0, src0_cur + (local + j) * nb01, 0, src1_col, 0, 1);
+                }
+                memcpy(&dst_col[local], tmp, (size_t) nrun * sizeof(float));
+                ir0 = run_end;
+            }
+        }
+
+        if (nth >= nchunk0 * nchunk1) {
+            break;
+        }
+
+        current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
+    }
+}
+
 static void lm_ggml_compute_forward_mul_mat_id(
         const struct lm_ggml_compute_params * params,
               struct lm_ggml_tensor * dst) {
@@ -1644,11 +1947,22 @@ static void lm_ggml_compute_forward_mul_mat_id(
 
     lm_ggml_barrier(params->threadpool);
 
+    if (lm_ggml_cpu_mul_mat_id_should_fuse(params, src0, ids)) {
+        lm_ggml_compute_forward_mul_mat_id_fused(params, dst, atomic_current_chunk);
+        return;
+    }
+
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
         if (cne1 == 0) {
             continue;
+        }
+
+        // Signal an external expert-streaming engine that this expert is about to be
+        // consumed; the hook may block until src0's expert weights are resident.
+        if (g_expert_ready_hook) {
+            g_expert_ready_hook(src0, cur_a, g_expert_ready_hook_data);
         }
 
         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
@@ -1717,8 +2031,10 @@ static void lm_ggml_compute_forward(struct lm_ggml_compute_params * params, stru
 
     // extra_buffer op?
     if (lm_ggml_cpu_extra_compute_forward(params, tensor)) {
+        moe_repack_trace_op(tensor, true);
         return;
     }
+    moe_repack_trace_op(tensor, false);
 
     switch (tensor->op) {
         case LM_GGML_OP_DUP:
@@ -2060,22 +2376,6 @@ static void lm_ggml_compute_forward(struct lm_ggml_compute_params * params, stru
             {
                 lm_ggml_compute_forward_gated_delta_net(params, tensor);
             } break;
-        case LM_GGML_OP_LIGHTNING_INDEXER:
-            {
-                lm_ggml_compute_forward_lightning_indexer(params, tensor);
-            } break;
-        case LM_GGML_OP_DSV4_HC_COMB:
-            {
-                lm_ggml_compute_forward_dsv4_hc_comb(params, tensor);
-            } break;
-        case LM_GGML_OP_DSV4_HC_PRE:
-            {
-                lm_ggml_compute_forward_dsv4_hc_pre(params, tensor);
-            } break;
-        case LM_GGML_OP_DSV4_HC_POST:
-            {
-                lm_ggml_compute_forward_dsv4_hc_post(params, tensor);
-            } break;
         case LM_GGML_OP_MAP_CUSTOM1:
             {
                 lm_ggml_compute_forward_map_custom1(params, tensor);
@@ -2256,9 +2556,6 @@ static int lm_ggml_get_n_tasks(struct lm_ggml_tensor * node, int n_threads) {
         case LM_GGML_OP_COUNT_EQUAL:
         case LM_GGML_OP_SOLVE_TRI:
         case LM_GGML_OP_GATED_DELTA_NET:
-        case LM_GGML_OP_DSV4_HC_COMB:
-        case LM_GGML_OP_DSV4_HC_PRE:
-        case LM_GGML_OP_DSV4_HC_POST:
             {
                 n_tasks = n_threads;
             } break;
@@ -2399,7 +2696,6 @@ static int lm_ggml_get_n_tasks(struct lm_ggml_tensor * node, int n_threads) {
         case LM_GGML_OP_FLASH_ATTN_BACK:
         case LM_GGML_OP_SSM_CONV:
         case LM_GGML_OP_SSM_SCAN:
-        case LM_GGML_OP_LIGHTNING_INDEXER:
             {
                 n_tasks = n_threads;
             } break;
@@ -2871,17 +3167,17 @@ struct lm_ggml_cplan lm_ggml_graph_plan(
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                         // atomic_current_chunk
                         cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
+                        // fused FFN scratch (used only when matcher fires; leftover is harmless)
+                        // hidden_ff[k, n_ff] F32 + quantized hidden_ff[k, n_ff] + q_input already partly counted
+                        cur += ids->ne[0] * src0->ne[1] * sizeof(float);           // hidden_ff
+                        // q_hidden is covered by the *double* Q8_0 term from gate+up
+                        // (2 * 1.0625 B/el >= Q8_K 1.1406); +256 is alignment, not Q8_K-row slack.
+                        cur += ids->ne[0] * lm_ggml_row_size(LM_GGML_TYPE_Q8_0, src0->ne[1]) + 256;
+                        cur += lm_ggml_row_size(LM_GGML_TYPE_Q8_K, src0->ne[0]) + 256;   // q_input slack if src0 is down-shaped
                     } break;
                 case LM_GGML_OP_OUT_PROD:
                     {
-                        if (lm_ggml_is_quantized(node->src[0]->type) ||
-                            node->src[0]->type == LM_GGML_TYPE_F16) {
-                            cur = lm_ggml_type_size(LM_GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
-                        }
-                    } break;
-                case LM_GGML_OP_SET_ROWS:
-                    {
-                        if (node->src[0]->type == LM_GGML_TYPE_F16 && node->type != LM_GGML_TYPE_F16) {
+                        if (lm_ggml_is_quantized(node->src[0]->type)) {
                             cur = lm_ggml_type_size(LM_GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
                         }
                     } break;
@@ -2992,12 +3288,6 @@ struct lm_ggml_cplan lm_ggml_graph_plan(
                     {
                         LM_GGML_ABORT("fatal error");
                     }
-                case LM_GGML_OP_LIGHTNING_INDEXER:
-                    {
-                        // temp buffer for dequantizing lightning indexer keys
-                        const int64_t ne10 = node->src[1]->ne[0];
-                        cur += sizeof(float)*ne10*n_tasks;
-                    } break;
                 default:
                     break;
             }
@@ -3019,6 +3309,541 @@ struct lm_ggml_cplan lm_ggml_graph_plan(
 }
 
 
+// lm_ggml_can_fuse cannot match this span: gate/up MUL_MAT_IDs are siblings (both
+// feed GLU, not a same-shape src-chain) and down changes shape (n_ff -> n_embd).
+
+static bool moe_ffn_tensor_in_range(
+        const struct lm_ggml_cgraph * cgraph,
+        int lo, int hi,
+        const struct lm_ggml_tensor * t) {
+    for (int i = lo; i < hi; ++i) {
+        if (cgraph->nodes[i] == t) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// VIEW of mul, or an ADD/CONT already accepted into the reduce tail.
+static bool moe_ffn_is_reduce_src(
+        const struct lm_ggml_tensor * t,
+        const struct lm_ggml_tensor * mul,
+        const struct lm_ggml_cgraph * cgraph,
+        int tail_lo, int tail_hi) {
+    if (!t || !moe_ffn_tensor_in_range(cgraph, tail_lo, tail_hi, t)) {
+        return false;
+    }
+    if (t->op == LM_GGML_OP_VIEW && t->src[0] == mul) {
+        return true;
+    }
+    return t->op == LM_GGML_OP_ADD || t->op == LM_GGML_OP_CONT;
+}
+
+static bool moe_ffn_span_has_external_use(
+        const struct lm_ggml_cgraph * cgraph,
+        int first, int last) {
+    for (int i = first; i < last; ++i) {
+        const struct lm_ggml_tensor * node = cgraph->nodes[i];
+        if (node->flags & LM_GGML_TENSOR_FLAG_OUTPUT) {
+            return true;
+        }
+        int span_uses = 0;
+        for (int j = i + 1; j <= last; ++j) {
+            const struct lm_ggml_tensor * other = cgraph->nodes[j];
+            for (int s = 0; s < LM_GGML_MAX_SRC; ++s) {
+                if (other->src[s] == node) {
+                    span_uses++;
+                }
+            }
+        }
+        if (span_uses != lm_ggml_node_get_use_count(cgraph, i)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Expert-ready: every compute thread waits on every selected expert of
+// gate_exps AND up_exps AND down_exps before any weight row is read (v1 wait-all-
+// three). Cache hits return immediately; misses serialize I/O before any GEMV.
+// We lose compute(expert i) ∥ wait(expert i+1).
+static void lm_ggml_compute_forward_moe_swiglu_id_fused(
+        const struct lm_ggml_compute_params * params,
+        const struct lm_ggml_tensor * gate_exps,
+        const struct lm_ggml_tensor * up_exps,
+        const struct lm_ggml_tensor * down_exps,
+        const struct lm_ggml_tensor * hidden,
+        const struct lm_ggml_tensor * ids,
+        const struct lm_ggml_tensor * weights,
+        struct lm_ggml_tensor * dst,
+        const bool reduce) {
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int k        = (int) ids->ne[0];
+    const int n_embd   = (int) gate_exps->ne[0];
+    const int n_ff     = (int) gate_exps->ne[1];
+    const int n_expert = (int) gate_exps->ne[2];
+
+    const bool prof = moe_fused_profile_on();
+    int64_t t_phase = 0;
+    if (prof && ith == 0) {
+        t_phase = lm_ggml_time_us();
+        static atomic_int fused_trace = 0;
+        if (atomic_fetch_add_explicit(&fused_trace, 1, memory_order_relaxed) < 4) {
+            const char * buft = (gate_exps->buffer) ? lm_ggml_backend_buffer_name(gate_exps->buffer) : "null";
+            fprintf(stderr, "bmoe-repack-trace: FUSED_FFN k=%d n_ff=%d n_embd=%d gate_buft=%s extra=%d path=vec_dot\n",
+                    k, n_ff, n_embd, buft, gate_exps->extra ? 1 : 0);
+        }
+    }
+
+    const enum lm_ggml_type type_gate = gate_exps->type;
+    const enum lm_ggml_type type_up   = up_exps->type;
+    const enum lm_ggml_type type_down = down_exps->type;
+
+    lm_ggml_vec_dot_t    const vec_dot_gate = type_traits_cpu[type_gate].vec_dot;
+    lm_ggml_vec_dot_t    const vec_dot_up   = type_traits_cpu[type_up].vec_dot;
+    lm_ggml_vec_dot_t    const vec_dot_down = type_traits_cpu[type_down].vec_dot;
+    enum lm_ggml_type    const vdt_gate     = type_traits_cpu[type_gate].vec_dot_type;
+    enum lm_ggml_type    const vdt_down     = type_traits_cpu[type_down].vec_dot_type;
+    lm_ggml_from_float_t const from_float_h = type_traits_cpu[vdt_gate].from_float;
+    lm_ggml_from_float_t const from_float_d = type_traits_cpu[vdt_down].from_float;
+
+    const size_t q_input_sz  = lm_ggml_row_size(vdt_gate, n_embd);
+    const size_t q_hidden_sz = lm_ggml_row_size(vdt_down, n_ff);
+
+    void * wdata_cur = params->wdata;
+    char * q_input_buf = (char *) incr_ptr_aligned(&wdata_cur, q_input_sz, sizeof(int64_t));
+    float * hidden_ff  = (float *) incr_ptr_aligned(&wdata_cur, (size_t) k * (size_t) n_ff * sizeof(float), sizeof(float));
+    char * q_hidden    = (char *) incr_ptr_aligned(&wdata_cur, (size_t) k * q_hidden_sz, sizeof(int64_t));
+    char (*atomic_chunk)[CACHE_LINE_SIZE] =
+        incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE, CACHE_LINE_SIZE);
+
+    LM_GGML_ASSERT(params->wsize >= (size_t) ((char *) wdata_cur - (char *) params->wdata));
+    LM_GGML_ASSERT(vec_dot_gate && vec_dot_up && vec_dot_down);
+    LM_GGML_ASSERT(dst->nb[0] == sizeof(float));
+
+    const bool hidden_already_q = (hidden->type == vdt_gate) && lm_ggml_is_contiguous(hidden);
+    const char * q_input = hidden_already_q ? (const char *) hidden->data : q_input_buf;
+
+    const bool down_is_f32 = (vdt_down == LM_GGML_TYPE_F32);
+    const char * q_hidden_use = down_is_f32 ? (const char *) hidden_ff : q_hidden;
+    const size_t q_hidden_stride = down_is_f32 ? (size_t) n_ff * sizeof(float) : q_hidden_sz;
+
+    if (prof && ith == 0) {
+        t_phase = lm_ggml_time_us();
+    }
+    for (int slot = 0; slot < k; ++slot) {
+        const int32_t expert = *(const int32_t *) ((const char *) ids->data + (int64_t) slot * ids->nb[0]);
+        LM_GGML_ASSERT(expert >= 0 && expert < n_expert);
+        if (g_expert_ready_hook) {
+            g_expert_ready_hook(gate_exps, expert, g_expert_ready_hook_data);
+            g_expert_ready_hook(up_exps,   expert, g_expert_ready_hook_data);
+            g_expert_ready_hook(down_exps, expert, g_expert_ready_hook_data);
+        }
+    }
+    if (prof && ith == 0) {
+        moe_fused_prof_tick(&g_moe_prof_hook, &t_phase);
+    }
+
+    // Phase A — quantize hidden to vec_dot_type(gate). Same block split as stock mul_mat_id.
+    if (!hidden_already_q) {
+        LM_GGML_ASSERT(hidden->type == LM_GGML_TYPE_F32);
+        LM_GGML_ASSERT(from_float_h);
+        const size_t bs = lm_ggml_blck_size(vdt_gate);
+        const int64_t n_blocks = (int64_t) n_embd / (int64_t) bs;
+        const int64_t blk0 = (ith * n_blocks) / nth;
+        const int64_t blk1 = ((ith + 1) * n_blocks) / nth;
+        const int64_t n_elem = (blk1 - blk0) * (int64_t) bs;
+        if (n_elem > 0) {
+            from_float_h(
+                (const float *) ((const char *) hidden->data + blk0 * (int64_t) bs * hidden->nb[0]),
+                (void *) (q_input_buf + blk0 * lm_ggml_type_size(vdt_gate)),
+                n_elem);
+        }
+    }
+
+    lm_ggml_barrier(params->threadpool);
+    if (prof && ith == 0) {
+        moe_fused_prof_tick(&g_moe_prof_a, &t_phase);
+    }
+
+    // Phase B — gate + up + SwiGLU into hidden_ff. Virtual tall GEMV, reuse S1 row map.
+    {
+        const int64_t nr0 = (int64_t) k * n_ff;
+        const int64_t nr1 = 1;
+
+        int chunk_size = 64;
+        int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
+        int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
+
+        if (nchunk0 * nchunk1 < nth * 4 || lm_ggml_is_numa()) {
+            nchunk0 = nr0 > nr1 ? nth : 1;
+            nchunk1 = nr0 > nr1 ? 1 : nth;
+        }
+
+        const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
+        const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
+
+        atomic_int * current_chunk_ctr = (atomic_int *) (atomic_chunk + 0);
+        if (ith == 0) {
+            *current_chunk_ctr = nth;
+        }
+        lm_ggml_barrier(params->threadpool);
+
+        int current_chunk = ith;
+        const int64_t blck_0 = 16;
+        float gate_tmp[16];
+        float up_tmp[16];
+
+        while (current_chunk < nchunk0 * nchunk1) {
+            const int64_t ith0 = current_chunk % nchunk0;
+            const int64_t ith1 = current_chunk / nchunk0;
+
+            const int64_t ir0_start = dr0 * ith0;
+            const int64_t ir0_end   = MIN(ir0_start + dr0, nr0);
+
+            LM_GGML_UNUSED(ith1);
+            LM_GGML_UNUSED(dr1);
+
+            for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+                const int64_t blk_end = MIN(iir0 + blck_0, ir0_end);
+                int64_t ir0 = iir0;
+                while (ir0 < blk_end) {
+                    const int64_t slot  = ir0 / n_ff;
+                    const int64_t local = ir0 % n_ff;
+                    const int64_t run_end = MIN(blk_end, (slot + 1) * (int64_t) n_ff);
+                    const int64_t nrun = run_end - ir0;
+
+                    const int32_t expert = *(const int32_t *) ((const char *) ids->data + slot * ids->nb[0]);
+                    const char * gate_cur = (const char *) gate_exps->data + (int64_t) expert * gate_exps->nb[2];
+                    const char * up_cur   = (const char *) up_exps->data   + (int64_t) expert * up_exps->nb[2];
+
+                    for (int64_t j = 0; j < nrun; ++j) {
+                        vec_dot_gate(n_embd, &gate_tmp[j], 0, gate_cur + (local + j) * gate_exps->nb[1], 0, q_input, 0, 1);
+                        vec_dot_up  (n_embd, &up_tmp[j],   0, up_cur   + (local + j) * up_exps->nb[1],   0, q_input, 0, 1);
+                    }
+                    lm_ggml_vec_swiglu_f32((int) nrun, hidden_ff + slot * n_ff + local, gate_tmp, up_tmp);
+                    ir0 = run_end;
+                }
+            }
+
+            if (nth >= nchunk0 * nchunk1) {
+                break;
+            }
+            current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
+        }
+    }
+
+    lm_ggml_barrier(params->threadpool);
+    if (prof && ith == 0) {
+        moe_fused_prof_tick(&g_moe_prof_b, &t_phase);
+    }
+
+    // Phase C — quantize hidden_ff to vec_dot_type(down) per expert slot.
+    if (!down_is_f32) {
+        LM_GGML_ASSERT(from_float_d);
+        const size_t bs = lm_ggml_blck_size(vdt_down);
+        const int64_t n_blocks = (int64_t) n_ff / (int64_t) bs;
+        for (int slot = 0; slot < k; ++slot) {
+            const int64_t blk0 = (ith * n_blocks) / nth;
+            const int64_t blk1 = ((ith + 1) * n_blocks) / nth;
+            const int64_t n_elem = (blk1 - blk0) * (int64_t) bs;
+            if (n_elem > 0) {
+                from_float_d(
+                    hidden_ff + (int64_t) slot * n_ff + blk0 * (int64_t) bs,
+                    (void *) (q_hidden + (size_t) slot * q_hidden_sz + (size_t) blk0 * lm_ggml_type_size(vdt_down)),
+                    n_elem);
+            }
+        }
+    }
+
+    lm_ggml_barrier(params->threadpool);
+    if (prof && ith == 0) {
+        moe_fused_prof_tick(&g_moe_prof_c, &t_phase);
+    }
+
+    // Phase D — down GEMV + weighted accumulate into the final dst.
+    {
+        const int64_t nr0 = n_embd;
+        const int64_t nr1 = 1;
+
+        int chunk_size = 64;
+        int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
+        int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
+
+        if (nchunk0 * nchunk1 < nth * 4 || lm_ggml_is_numa()) {
+            nchunk0 = nr0 > nr1 ? nth : 1;
+            nchunk1 = nr0 > nr1 ? 1 : nth;
+        }
+
+        const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
+
+        atomic_int * current_chunk_ctr = (atomic_int *) (atomic_chunk + 0);
+        if (ith == 0) {
+            *current_chunk_ctr = nth;
+        }
+        lm_ggml_barrier(params->threadpool);
+
+        int current_chunk = ith;
+
+        while (current_chunk < nchunk0 * nchunk1) {
+            const int64_t ith0 = current_chunk % nchunk0;
+            const int64_t ir0_start = dr0 * ith0;
+            const int64_t ir0_end   = MIN(ir0_start + dr0, nr0);
+
+            for (int64_t j = ir0_start; j < ir0_end; ++j) {
+                float acc = 0.0f;
+                for (int s = 0; s < k; ++s) {
+                    const int32_t expert = *(const int32_t *) ((const char *) ids->data + (int64_t) s * ids->nb[0]);
+                    const char * down_row = (const char *) down_exps->data
+                        + (int64_t) expert * down_exps->nb[2]
+                        + j * down_exps->nb[1];
+                    const char * qh = q_hidden_use + (size_t) s * q_hidden_stride;
+                    const float w = *(const float *) ((const char *) weights->data + (int64_t) s * weights->nb[1]);
+                    float partial = 0.0f;
+                    vec_dot_down(n_ff, &partial, 0, down_row, 0, qh, 0, 1);
+                    if (reduce) {
+                        acc += partial * w;
+                    } else {
+                        float * d = (float *) ((char *) dst->data + j * dst->nb[0] + (int64_t) s * dst->nb[1]);
+                        *d = partial * w;
+                    }
+                }
+                if (reduce) {
+                    float * d = (float *) ((char *) dst->data + j * dst->nb[0]);
+                    *d = acc;
+                }
+            }
+
+            if (nth >= nchunk0 * nchunk1) {
+                break;
+            }
+            current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
+        }
+    }
+    if (prof && ith == 0) {
+        moe_fused_prof_tick(&g_moe_prof_d, &t_phase);
+        moe_fused_prof_report();
+    }
+}
+
+// Match the production 5-node MoE SwiGLU core (and optional VIEW/ADD/CONT reduce)
+// and run it as one launch. Returns n_skipped = last_consumed - node_n, or 0.
+static int lm_ggml_cpu_try_fuse_moe_ffn(
+        const struct lm_ggml_cgraph * cgraph,
+        const int node_n,
+        const struct lm_ggml_compute_params * params) {
+
+    if (!lm_ggml_cpu_get_moe_fused_ffn()) {
+        return 0;
+    }
+    if (node_n + 4 >= cgraph->n_nodes) {
+        return 0;
+    }
+
+    struct lm_ggml_tensor * n0 = cgraph->nodes[node_n];
+    struct lm_ggml_tensor * n1 = cgraph->nodes[node_n + 1];
+    struct lm_ggml_tensor * n2 = cgraph->nodes[node_n + 2];
+    struct lm_ggml_tensor * n3 = cgraph->nodes[node_n + 3];
+    struct lm_ggml_tensor * n4 = cgraph->nodes[node_n + 4];
+
+    if (n0->op != LM_GGML_OP_MUL_MAT_ID ||
+        n1->op != LM_GGML_OP_MUL_MAT_ID ||
+        n2->op != LM_GGML_OP_GLU ||
+        n3->op != LM_GGML_OP_MUL_MAT_ID ||
+        n4->op != LM_GGML_OP_MUL) {
+        return 0;
+    }
+
+    // Fused FFN launches native vec_dot on gate/up/down. Any tiled
+    // CPU_REPACK extra is not that layout; skip fusion and let extra MUL_MAT_ID run.
+    if ((n0->src[0] && lm_ggml_cpu_repack_extra_is_tiled(n0->src[0]->extra)) ||
+        (n1->src[0] && lm_ggml_cpu_repack_extra_is_tiled(n1->src[0]->extra)) ||
+        (n3->src[0] && lm_ggml_cpu_repack_extra_is_tiled(n3->src[0]->extra))) {
+        return 0;
+    }
+
+    if ((n0->flags & LM_GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+        (n1->flags & LM_GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+        (n2->flags & LM_GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+        (n3->flags & LM_GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+        (n4->flags & LM_GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return 0;
+    }
+
+    if (lm_ggml_get_glu_op(n2) != LM_GGML_GLU_OP_SWIGLU) {
+        return 0;
+    }
+    if (lm_ggml_get_op_params_i32(n2, 1) != 0) {
+        return 0; // swapped
+    }
+    if (!n2->src[0] || !n2->src[1]) {
+        return 0;
+    }
+
+    // Identify gate vs up by GLU srcs (SiLU on src[0]). Both node orders match.
+    struct lm_ggml_tensor * gate_mm = n2->src[0];
+    struct lm_ggml_tensor * up_mm   = n2->src[1];
+    if (!((gate_mm == n0 && up_mm == n1) || (gate_mm == n1 && up_mm == n0))) {
+        return 0;
+    }
+
+    struct lm_ggml_tensor * down_mm = n3;
+    if (down_mm->src[1] != n2) {
+        return 0;
+    }
+
+    if (gate_mm->src[1] != up_mm->src[1] ||
+        gate_mm->src[2] != up_mm->src[2] ||
+        down_mm->src[2] != gate_mm->src[2]) {
+        return 0;
+    }
+
+    const struct lm_ggml_tensor * hidden    = gate_mm->src[1];
+    const struct lm_ggml_tensor * ids       = gate_mm->src[2];
+    const struct lm_ggml_tensor * gate_exps = gate_mm->src[0];
+    const struct lm_ggml_tensor * up_exps   = up_mm->src[0];
+    const struct lm_ggml_tensor * down_exps = down_mm->src[0];
+
+    if (!hidden || !ids || !gate_exps || !up_exps || !down_exps) {
+        return 0;
+    }
+
+    struct lm_ggml_tensor * mul = n4;
+    struct lm_ggml_tensor * weights = (mul->src[0] == down_mm) ? mul->src[1] : mul->src[0];
+    if (mul->src[0] != down_mm && mul->src[1] != down_mm) {
+        return 0;
+    }
+    if (!weights || weights->type != LM_GGML_TYPE_F32) {
+        return 0;
+    }
+
+    if (ids->ne[1] != 1) {
+        return 0; // n_tokens != 1; prefill stays stock
+    }
+    if (ids->ne[0] < 1) {
+        return 0;
+    }
+
+    const int k        = (int) ids->ne[0];
+    const int n_embd   = (int) gate_exps->ne[0];
+    const int n_ff     = (int) gate_exps->ne[1];
+    const int n_expert = (int) gate_exps->ne[2];
+
+    if (n_embd < 1 || n_ff < 1 || n_expert < 1) {
+        return 0;
+    }
+    if (hidden->ne[0] != n_embd || hidden->ne[1] != 1) {
+        return 0;
+    }
+    if (up_exps->ne[0] != n_embd || up_exps->ne[1] != n_ff || up_exps->ne[2] != n_expert) {
+        return 0;
+    }
+    if (down_exps->ne[0] != n_ff || down_exps->ne[1] != n_embd || down_exps->ne[2] != n_expert) {
+        return 0;
+    }
+    // Kernel reads a single scalar per slot (element (0,s)). Stock MUL
+    // broadcasts over dim 0, so any ne[0] != 1 would silently change math.
+    if (weights->ne[0] != 1 || weights->ne[1] != k || weights->ne[2] != 1) {
+        return 0;
+    }
+
+    if (!lm_ggml_cpu_type_is_k_quant(gate_exps->type) || !lm_ggml_cpu_type_is_k_quant(up_exps->type)) {
+        return 0;
+    }
+    if (!type_traits_cpu[down_exps->type].vec_dot) {
+        return 0;
+    }
+    if (type_traits_cpu[gate_exps->type].vec_dot_type != type_traits_cpu[up_exps->type].vec_dot_type) {
+        return 0;
+    }
+
+    const enum lm_ggml_type vdt_gate = type_traits_cpu[gate_exps->type].vec_dot_type;
+    const enum lm_ggml_type vdt_down = type_traits_cpu[down_exps->type].vec_dot_type;
+    if (hidden->type != vdt_gate) {
+        if (hidden->type != LM_GGML_TYPE_F32 || !type_traits_cpu[vdt_gate].from_float) {
+            return 0;
+        }
+    } else if (!lm_ggml_is_contiguous(hidden)) {
+        return 0; // kernel from_float / already-q path assumes a packed row
+    }
+    if (vdt_down != LM_GGML_TYPE_F32 && !type_traits_cpu[vdt_down].from_float) {
+        return 0;
+    }
+
+    // Optional VIEW + ADD reduce + CONT tail (production build_moe_ffn, or a test
+    // graph that stops at MUL). Interleaved VIEW/ADD (post-order expand) is ok.
+    int last = node_n + 4;
+    int n_views = 0;
+    int n_adds  = 0;
+    int n_conts = 0;
+    int p = node_n + 5;
+    while (p < cgraph->n_nodes) {
+        struct lm_ggml_tensor * t = cgraph->nodes[p];
+        if (t->op == LM_GGML_OP_VIEW && t->src[0] == mul) {
+            // In-order coverage: view s must be column s of the MUL dst.
+            // Duplicated/overlapping views change the reduce vs stock.
+            if (t->view_offs != (size_t) n_views * mul->nb[1] ||
+                t->ne[0] != n_embd || t->ne[1] != 1) {
+                break;
+            }
+            n_views++;
+            last = p;
+            p++;
+            continue;
+        }
+        if (t->op == LM_GGML_OP_ADD &&
+            moe_ffn_is_reduce_src(t->src[0], mul, cgraph, node_n + 5, p) &&
+            moe_ffn_is_reduce_src(t->src[1], mul, cgraph, node_n + 5, p)) {
+            n_adds++;
+            last = p;
+            p++;
+            continue;
+        }
+        if (t->op == LM_GGML_OP_CONT &&
+            moe_ffn_is_reduce_src(t->src[0], mul, cgraph, node_n + 5, p)) {
+            n_conts++;
+            last = p;
+            p++;
+            continue;
+        }
+        break;
+    }
+
+    bool reduce = false;
+    if (k >= 1 && n_views == k && n_adds == k - 1 && n_conts == 0) {
+        reduce = true;
+    } else if (k == 1 && n_views == 1 && n_adds == 0 && n_conts == 1) {
+        reduce = true;
+    } else {
+        last = node_n + 4;
+        reduce = false;
+    }
+
+    if (moe_ffn_span_has_external_use(cgraph, node_n, last)) {
+        return 0;
+    }
+
+    {
+        size_t need = 64;
+        need += lm_ggml_row_size(vdt_gate, n_embd) + 64;
+        need += (size_t) k * (size_t) n_ff * sizeof(float) + 64;
+        need += (size_t) k * lm_ggml_row_size(vdt_down, n_ff) + 64;
+        need += CACHE_LINE_SIZE + 64;
+        if (params->wsize < need) {
+            return 0;
+        }
+    }
+
+    struct lm_ggml_tensor * dst = cgraph->nodes[last];
+    lm_ggml_compute_forward_moe_swiglu_id_fused(
+        params, gate_exps, up_exps, down_exps, hidden, ids, weights, dst, reduce);
+
+    return last - node_n;
+}
+
 // Try to fuse the current node with subsequent nodes for better performance.
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
 static bool lm_ggml_cpu_disable_fusion = false;  // initialized once in lm_ggml_cpu_init(), read-only afterwards
@@ -3034,6 +3859,13 @@ static int lm_ggml_cpu_try_fuse_ops(
     }
 
     struct lm_ggml_tensor * node = cgraph->nodes[node_n];
+
+    {
+        const int n_moe = lm_ggml_cpu_try_fuse_moe_ffn(cgraph, node_n, params);
+        if (n_moe > 0) {
+            return n_moe;
+        }
+    }
 
     if (node->op == LM_GGML_OP_RMS_NORM) {
         // RMS_NORM + MUL fusion
@@ -3807,14 +4639,6 @@ int lm_ggml_cpu_has_sme(void) {
 #endif
 }
 
-int lm_ggml_cpu_has_sme2(void) {
-#if defined(__ARM_ARCH) && defined(__ARM_FEATURE_SME2)
-    return 1;
-#else
-    return 0;
-#endif
-}
-
 void lm_ggml_cpu_init(void) {
     // needed to initialize lm_ggml_time
     {
@@ -3887,6 +4711,9 @@ void lm_ggml_cpu_init(void) {
             const char * env = getenv("LM_GGML_CPU_DISABLE_FUSION");
             lm_ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
         }
+        // Resolve fused-kernel flags before any compute thread can race the lazy path.
+        moe_fused_gemv_resolve();
+        moe_fused_ffn_resolve();
 
         is_first_call = false;
     }

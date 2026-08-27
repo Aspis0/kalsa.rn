@@ -18,7 +18,6 @@
 #include "htp-ctx.h"
 #include "htp-ops.h"
 #include "htp-ops.h"
-#include "htp-tensor.h"
 
 // Redefined the rope type constants as we can't include ggml.h
 #define HTP_ROPE_TYPE_NORMAL 0
@@ -713,11 +712,17 @@ static int execute_op_rope_f32(struct htp_ops_context * octx) {
 }
 
 int op_rope(struct htp_ops_context * octx) {
+    int err = HTP_STATUS_OK;
+
     switch (octx->src[0]->type) {
         case HTP_TYPE_F32:
-            return execute_op_rope_f32(octx);
+            err = execute_op_rope_f32(octx);
+            break;
 
         default:
-            return HTP_STATUS_NO_SUPPORT;
+            err = HTP_STATUS_NO_SUPPORT;
+            break;
     }
+
+    return err;
 }

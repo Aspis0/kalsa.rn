@@ -842,7 +842,7 @@ static void dsv4_build_comp_inputs(
         LM_GGML_ASSERT(n_stream > 0);
         LM_GGML_ASSERT(n_tokens%n_stream == 0);
 
-        inp.kq_mask = lm_ggml_new_tensor_4d(ctx, (strcmp(name, "lid") != 0 && cparams.flash_attn) || (strcmp(name, "lid") == 0 && cparams.fused_lid) ? LM_GGML_TYPE_F16 : LM_GGML_TYPE_F32, plan.n_kv, n_tokens/n_stream, 1, n_stream);
+        inp.kq_mask = lm_ggml_new_tensor_4d(ctx, cparams.flash_attn && strcmp(name, "lid") != 0 ? LM_GGML_TYPE_F16 : LM_GGML_TYPE_F32, plan.n_kv, n_tokens/n_stream, 1, n_stream);
         lm_ggml_set_input(inp.kq_mask);
         lm_ggml_set_name(inp.kq_mask, (std::string("dsv4_") + name + "_kq_mask").c_str());
     }
@@ -1708,17 +1708,6 @@ lm_ggml_tensor * llm_graph_context::build_ffn(
             {
                 cur = lm_ggml_swiglu(ctx0, cur);
                 cb(cur, "ffn_swiglu", il);
-            } break;
-        case LLM_FFN_SWIGLU_OAI_MOE:
-            if (gate && type_gate == LLM_FFN_PAR) {
-                // same alpha/limit constants as gpt-oss
-                const float alpha = 1.702f;
-                const float limit = 7.0f;
-                cur = lm_ggml_swiglu_oai(ctx0, cur, tmp, alpha, limit);
-                cb(cur, "ffn_swiglu_oai", il);
-                type_gate = LLM_FFN_SEQ;
-            } else {
-                LM_GGML_ABORT("LLM_FFN_SWIGLU_OAI_MOE requires a parallel gate");
             } break;
         case LLM_FFN_GEGLU:
             {
@@ -2679,7 +2668,7 @@ lm_ggml_tensor * llm_graph_context::build_attn(
         lm_ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    lm_ggml_tensor * kq_mask = inp->get_kq_mask();
+    const auto & kq_mask = inp->get_kq_mask();
 
     lm_ggml_tensor * q = q_cur;
     lm_ggml_tensor * k = mctx_cur->get_k(ctx0, il);
@@ -3036,9 +3025,9 @@ llm_graph_input_attn_k_dsa * llm_graph_context::build_attn_inp_k_dsa() const {
     {
         inp->self_k_idxs_lid = mctx_cur->get_lid()->build_input_k_idxs(ctx0, ubatch);
 
-        // ensure that mask type matches fused lightning indexer use (requires f16 mask)
+        // ensure F32 mask
         auto cparams_copy = cparams;
-        cparams_copy.flash_attn = cparams.fused_lid;
+        cparams_copy.flash_attn = false;
 
         inp->self_kq_mask_lid = build_attn_inp_kq_mask(ctx0, mctx_cur->get_lid(), ubatch, cparams_copy);
         inp->self_kq_mask_lid_cnv = inp->self_kq_mask_lid;

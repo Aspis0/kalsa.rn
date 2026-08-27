@@ -8,7 +8,7 @@
 #include "jinja/runtime.h"
 #include "jinja/caps.h"
 
-#include "nlohmann/json.hpp"
+#include "nlohmann/json_fwd.hpp"
 
 #include <chrono>
 #include <functional>
@@ -38,9 +38,6 @@ struct common_chat_tool_call {
 struct common_chat_msg_content_part {
     std::string type;
     std::string text;
-    // Preserves non-standard fields from the original JSON (e.g. source_lang_code,
-    // target_lang_code for TranslateGemma) so they survive the parse/serialize round-trip.
-    nlohmann::ordered_json extra_fields;
 
     // TODO @ngxson : no known chat templates support reasoning_content in content parts yet
     //                this can be useful for models with interleaved thinking (like Kimi-K2)
@@ -48,7 +45,7 @@ struct common_chat_msg_content_part {
     // std::string reasoning_content;
 
     bool operator==(const common_chat_msg_content_part & other) const {
-        return type == other.type && text == other.text && extra_fields == other.extra_fields;
+        return type == other.type && text == other.text;
     }
 };
 
@@ -277,13 +274,18 @@ struct common_chat_params {
     std::string                         generation_prompt;
     bool                                supports_thinking    = false;
     std::string                         thinking_start_tag;  // e.g., "<think>"
-    std::vector<std::string>            thinking_end_tags;   // e.g., "</think>"
+    std::string                         thinking_end_tag;    // e.g., "</think>"
+    std::vector<std::string>            thinking_end_tags;   // alternate end tags; singular stays as the first tag
     std::vector<common_grammar_trigger> grammar_triggers;
     std::vector<std::string>            preserved_tokens;
     std::vector<std::string>            additional_stops;
     std::string                         parser;
     common_chat_msg_delimiters          message_delimiters;
 };
+
+// Keep the legacy singular thinking end tag coherent with the wrapper-facing
+// plural representation.
+void common_chat_params_sync_thinking_end_tags(common_chat_params & params);
 
 // per-message parsing syntax
 // should be derived from common_chat_params
@@ -351,20 +353,6 @@ common_chat_tool_choice common_chat_tool_choice_parse_oaicompat(const std::strin
 
 bool common_chat_templates_support_enable_thinking(const common_chat_templates * chat_templates);
 
-// Template capabilities structure (for exposing capabilities to external code)
-struct common_chat_template_caps {
-    bool supports_tools = true;
-    bool supports_tool_calls = true;
-    bool supports_system_role = true;
-    bool supports_parallel_tool_calls = true;
-};
-
-// Get template capabilities for a specific variant ("" for default, "tool_use" for tool_use template)
-common_chat_template_caps common_chat_templates_get_caps(const struct common_chat_templates * tmpls, const std::string & variant);
-
-// Check if a template variant exists
-bool common_chat_templates_has_variant(const struct common_chat_templates * tmpls, const std::string & variant);
-
 // Parses a JSON array of messages in OpenAI's chat completion API format.
 std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const nlohmann::ordered_json & messages);
 
@@ -379,6 +367,19 @@ nlohmann::ordered_json common_chat_tools_to_json_oaicompat(const std::vector<com
 
 // get template caps, useful for reporting to server /props endpoint
 std::map<std::string, bool> common_chat_templates_get_caps(const common_chat_templates * chat_templates);
+
+// Get capabilities for the default (empty variant) or tool-use template.
+struct common_chat_template_caps {
+    bool supports_tools = true;
+    bool supports_tool_calls = true;
+    bool supports_system_role = true;
+    bool supports_parallel_tool_calls = true;
+};
+
+common_chat_template_caps common_chat_templates_get_caps(const struct common_chat_templates * chat_templates,
+                                                         const std::string & variant);
+bool common_chat_templates_has_variant(const struct common_chat_templates * chat_templates,
+                                       const std::string & variant);
 
 std::string common_chat_template_direct_apply(
     const common_chat_template & tmpl,

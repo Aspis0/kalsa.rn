@@ -202,16 +202,19 @@ extern "C" {
         LLAMA_SPLIT_MODE_TENSOR = 3,
     };
 
+    // Model loading modes used by the common parameter layer.  These values
+    // preserve the three independent loader flags as a bit combination while
+    // retaining the original values used by the wrapper-facing modes.
     enum llama_load_mode {
-        LLAMA_LOAD_MODE_NONE       = 0, // no special loading mode
-        LLAMA_LOAD_MODE_MMAP       = 1, // memory map the model
-        LLAMA_LOAD_MODE_MLOCK      = 2, // force system to keep model in RAM rather than swapping or compressing
-        LLAMA_LOAD_MODE_MMAP_MLOCK = 3, // mmap + force system to keep model in RAM rather than swapping or compressing
-        LLAMA_LOAD_MODE_DIRECT_IO  = 4, // use direct I/O if available
+        LLAMA_LOAD_MODE_NONE               = 0,
+        LLAMA_LOAD_MODE_MMAP               = 1,
+        LLAMA_LOAD_MODE_MLOCK              = 2,
+        LLAMA_LOAD_MODE_MMAP_MLOCK = 3,
+        LLAMA_LOAD_MODE_DIRECT_IO          = 4,
+        LLAMA_LOAD_MODE_MMAP_DIRECT_IO    = 5,
+        LLAMA_LOAD_MODE_DIRECT_IO_MLOCK   = 6,
+        LLAMA_LOAD_MODE_MMAP_DIRECT_IO_MLOCK = 7,
     };
-
-    LLAMA_API const char * llama_load_mode_name(enum llama_load_mode load_mode);
-    LLAMA_API enum llama_load_mode llama_load_mode_from_str(const char * str);
 
     enum llama_context_type {
         LLAMA_CONTEXT_TYPE_DEFAULT = 0,
@@ -312,7 +315,6 @@ extern "C" {
 
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
-        enum llama_load_mode  load_mode;  // how to load the model
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
@@ -333,10 +335,16 @@ extern "C" {
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
+        bool use_mmap;        // use mmap if possible
+        bool use_direct_io;   // use direct io, takes precedence over use_mmap when supported
+        bool use_mlock;       // force system to keep model in RAM
         bool check_tensors;   // validate model tensor data
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
+        // Appended at end so existing field offsets stay stable for ABI consumers.
+        // 0 = auto (prefault attivo, comportamento storico), 1 = prefault forzato, -1 = prefault disattivato
+        int32_t mmap_prefetch;
     };
 
     struct llama_sampler_seq_config {

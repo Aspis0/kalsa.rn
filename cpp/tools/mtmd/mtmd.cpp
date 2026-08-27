@@ -463,13 +463,6 @@ struct mtmd_context {
                     img_end = "<|vision_end|>";
                     image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
                 } break;
-            case PROJECTOR_TYPE_MINIMAX_M3:
-                {
-                    // ]<]start of image[>[ ... (image embeddings) ... ]<]end of image[>[
-                    img_beg = "]<]start of image[>[";
-                    img_end = "]<]end of image[>[";
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
-                } break;
             case PROJECTOR_TYPE_YOUTUVL:
                 {
                     // <|vision_start|> ... (image embeddings) ... <|vision_end|>
@@ -562,17 +555,9 @@ struct mtmd_context {
                 } break;
             case PROJECTOR_TYPE_KIMIK25:
                 {
-                    // GLM-5.2-V reuses the Kimi-K2.5 vision encoder and projector, but marks
-                    // images with its own tokens, so decide based on the text model vocab
-                    if (lookup_token("<|begin_of_image|>") != LLAMA_TOKEN_NULL) {
-                        // <|begin_of_image|> ... (image embeddings) ... <|end_of_image|>
-                        img_beg = "<|begin_of_image|>";
-                        img_end = "<|end_of_image|>";
-                    } else {
-                        // <|media_begin|> ... (image embeddings) ... <|media_end|>
-                        img_beg = "<|media_begin|>";
-                        img_end = "<|media_end|>";
-                    }
+                    // <|media_begin|> ... (image embeddings) ... <|media_end|>
+                    img_beg = "<|media_begin|>";
+                    img_end = "<|media_end|>";
                     image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
                 } break;
             case PROJECTOR_TYPE_LIGHTONOCR:
@@ -730,12 +715,6 @@ struct mtmd_context {
                     aud_end = "<audio|>";
                     audio_preproc = std::make_unique<mtmd_audio_preprocessor_gemma4ua>(ctx_a);
                 } break;
-            case PROJECTOR_TYPE_MIMO_AUDIO:
-                {
-                    aud_beg = "<|mimo_audio_start|>";
-                    aud_end = "<|mimo_audio_end|>";
-                    audio_preproc = std::make_unique<mtmd_audio_preprocessor_mimo_audio>(ctx_a);
-                } break;
             default:
                 throw std::runtime_error(string_format("%s: unexpected audio projector type %d\n", __func__, proj));
         }
@@ -830,7 +809,7 @@ void mtmd_free(mtmd_context * ctx) {
 struct mtmd_tokenizer {
     mtmd_context * ctx;
 
-    std::string input_text; // note: can contain null bytes; do not use c_str()
+    std::string input_text;
     bool add_special;
     bool parse_special;
     const llama_vocab * vocab;
@@ -860,9 +839,8 @@ struct mtmd_tokenizer {
             size_t n_bitmaps) : ctx(ctx) {
         add_special   = text->add_special;
         parse_special = text->parse_special;
-        vocab         = ctx->vocab;
-
         input_text.assign(text->text, text->text_len);
+        vocab         = ctx->vocab;
 
         std::vector<const mtmd_bitmap *> bitmaps(bmps, bmps + n_bitmaps);
         auto parts_str = split_text(input_text, ctx->media_marker);

@@ -10,18 +10,26 @@
 #define QK_K 256
 #define K_SCALE_SIZE 12
 
+// Pass the bitmasks as kernel arguments instead of literal constants: the
+// Qualcomm Adreno E031 compiler miscompiles the literal-mask form of this
+// helper (device-verified on Adreno 740: all MUL_MAT_ID q4_K/q5_K cases fail
+// with literals, pass with arguments; same workaround as the dense noshuffle
+// kernels).
 inline void get_scale_min_k4(
     int j,
     global const uchar * q,
     uchar * d,
-    uchar * m
+    uchar * m,
+    uchar mask_d6,
+    uchar mask_d4,
+    uchar mask_hi2
 ) {
     if (j < 4) {
-        *d = q[j]   & 63;
-        *m = q[j+4] & 63;
+        *d = q[j]   & mask_d6;
+        *m = q[j+4] & mask_d6;
     } else {
-        *d = (q[j+4] & 0x0F) | ((q[j-4] & 0xC0) >> 2);
-        *m = ((q[j+4] >> 4) & 0x0F) | ((q[j]   & 0xC0) >> 2);
+        *d = (q[j+4] & mask_d4) | ((q[j-4] & mask_hi2) >> 2);
+        *m = ((q[j+4] >> 4) & mask_d4) | ((q[j]   & mask_hi2) >> 2);
     }
 }
 
@@ -170,7 +178,10 @@ kernel void kernel_gemm_moe_q5_k_f32_ns(
         uint ne00,
         uint ne01,
         uint is_ragged,
-        uint skip_gran
+        uint skip_gran,
+        uchar mask_d6,
+        uchar mask_d4,
+        uchar mask_hi2
 ) {
     uint block_id_m = get_global_id(1); // m_tile
     uint block_id_n = get_global_id(2); // n_tile
@@ -222,6 +233,9 @@ kernel void kernel_gemm_moe_q5_k_f32_ns(
     uint num_superblocks = ne00 / QK_K;
     uint scales_per_row = num_superblocks * K_SCALE_SIZE;
     uint row_idx = row + get_global_id(0);
+    const bool valid = (row_idx < ne01);
+    const uint row_load = valid ? row_idx : (ne01 - 1u);
+    const uint row_offset = row_load - row;
 
     // Loop along K axis, 32 elements per iteration (one sub-block), divided into 2 halves of 16
     for (uint step = 0; step < ne00; step += TILESIZE_K * 2) {
@@ -230,20 +244,20 @@ kernel void kernel_gemm_moe_q5_k_f32_ns(
         uint j = sub % 8;
 
         // Load d and dm for super-block
-        uint d_offset = row + sb * ne01 + expert_id * num_superblocks * ne01 + get_global_id(0);
+        uint d_offset = row + sb * ne01 + expert_id * num_superblocks * ne01 + row_offset;
         half d_val = src0_d[d_offset];
         half dm_val = src0_dm[d_offset];
 
         // Load sub-block scale and min
-        global const uchar * sc = src0_s + (expert_id * ne01 + row_idx) * scales_per_row + sb * K_SCALE_SIZE;
+        global const uchar * sc = src0_s + (expert_id * ne01 + row_load) * scales_per_row + sb * K_SCALE_SIZE;
         uchar sv, mn;
-        get_scale_min_k4(j, sc, &sv, &mn);
+        get_scale_min_k4(j, sc, &sv, &mn, mask_d6, mask_d4, mask_hi2);
 
         float scale = (float)d_val * (float)sv;
         float minv = -(float)dm_val * (float)mn;
 
         // qh is stored at sub-block granularity
-        uint qh_offset = row + sub * ne01 + expert_id * num_superblocks * 8 * ne01 + get_global_id(0);
+        uint qh_offset = row + sub * ne01 + expert_id * num_superblocks * 8 * ne01 + row_offset;
         uchar4 qhx32 = as_uchar4(src0_qh[qh_offset]);
 
         // First sub-block (16 elements)
@@ -252,8 +266,8 @@ kernel void kernel_gemm_moe_q5_k_f32_ns(
 
         // Load 16 q (64-bits) in transposed layout
         uint2 q4x16;
-        q4x16.x = read_imageui(src0_q, q_sub_offset + sub_block_id_m).x;
-        q4x16.y = read_imageui(src0_q, q_sub_offset + sub_block_id_m + ne01).x;
+        q4x16.x = read_imageui(src0_q, q_sub_offset + row_offset).x;
+        q4x16.y = read_imageui(src0_q, q_sub_offset + row_offset + ne01).x;
 
         // Load 16x32 floats from matrix B
         float8 bx8_f32;
@@ -279,8 +293,8 @@ kernel void kernel_gemm_moe_q5_k_f32_ns(
         q_sub_offset = row + ((ne01 * half_step) >> 3) + ((expert_id * ne00 * ne01) >> 3);
         b_sub_offset = col * ne00 + half_step;
 
-        q4x16.x = read_imageui(src0_q, q_sub_offset + sub_block_id_m).x;
-        q4x16.y = read_imageui(src0_q, q_sub_offset + sub_block_id_m + ne01).x;
+        q4x16.x = read_imageui(src0_q, q_sub_offset + row_offset).x;
+        q4x16.y = read_imageui(src0_q, q_sub_offset + row_offset + ne01).x;
 
         bx8_f32.lo = read_imagef(src1, (b_sub_offset + b_global_offset.x) / 4);
         bx8_f32.hi = read_imagef(src1, (b_sub_offset + b_global_offset.y) / 4);
@@ -296,10 +310,6 @@ kernel void kernel_gemm_moe_q5_k_f32_ns(
         if (!skip_g1) { dotx8_reduce4(reg_a, shared_b, reg_c.lo.hi, 8); }
         if (!skip_g2) { dotx8_reduce4(reg_a, shared_b, reg_c.hi.lo, 16); }
         if (!skip_g3) { dotx8_reduce4(reg_a, shared_b, reg_c.hi.hi, 24); }
-    }
-
-    if ((get_global_id(0) + block_id_m * TILESIZE_M) >= ne01) {
-        return;
     }
 
     // Load post router and share in LM
@@ -318,6 +328,7 @@ kernel void kernel_gemm_moe_q5_k_f32_ns(
     // Scatter results back to original position in output grid
     uint m_offset = row + get_local_id(0);
 
+    if (valid) {
     write_imagef(dst, out_idx[1] + m_offset, (reg_c.s1));
     write_imagef(dst, out_idx[2] + m_offset, (reg_c.s2));
     write_imagef(dst, out_idx[3] + m_offset, (reg_c.s3));
@@ -349,8 +360,11 @@ kernel void kernel_gemm_moe_q5_k_f32_ns(
     write_imagef(dst, out_idx[29] + m_offset, (reg_c.st));
     write_imagef(dst, out_idx[30] + m_offset, (reg_c.su));
     write_imagef(dst, out_idx[31] + m_offset, (reg_c.sv));
+    }
 
     // Store zero padding parts to the index of first output in tile
     barrier(CLK_GLOBAL_MEM_FENCE);
-    write_imagef(dst, out_idx[0] + m_offset, (reg_c.s0));
+    if (valid) {
+        write_imagef(dst, out_idx[0] + m_offset, (reg_c.s0));
+    }
 }

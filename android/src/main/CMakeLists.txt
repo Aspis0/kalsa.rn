@@ -4,6 +4,15 @@ project(llama.rn)
 
 set(CMAKE_ANDROID_STL_TYPE c++_shared)
 
+# Keep Android/Ninja native builds within the app's memory budget. The CPU
+# variants are large shared-library links; serializing only the link phase
+# prevents several lld processes from multiplying peak RSS.
+if (ANDROID AND CMAKE_GENERATOR MATCHES "Ninja")
+    set_property(GLOBAL PROPERTY JOB_POOLS compile_pool=2 link_pool=1)
+    set(CMAKE_JOB_POOL_COMPILE compile_pool)
+    set(CMAKE_JOB_POOL_LINK link_pool)
+endif()
+
 find_package(ReactAndroid CONFIG REQUIRED)
 # Try to find fbjni separately if not in ReactAndroid
 find_package(fbjni CONFIG REQUIRED)

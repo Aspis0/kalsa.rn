@@ -18,6 +18,7 @@ apply plugin: "com.android.library"
 def repoRootDir = project.projectDir.parentFile
 def htpLibSourceDir = new File(repoRootDir, "bin/arm64-v8a")
 def isRNLlamaBuildFromSource = (project.findProperty("rnllamaBuildFromSource") ?: "false").toString() == "true"
+def isRNLlamaHexagon = (project.findProperty("rnllamaHexagon") ?: "false").toString() == "true"
 
 def appProject = rootProject.allprojects.find { it.plugins.hasPlugin('com.android.application') }
 
@@ -150,14 +151,19 @@ android {
       "-DREACT_NATIVE_MINOR_VERSION=${REACT_NATIVE_MINOR_VERSION}"
     ]
 
-    if (hexagonPresent) {
+    if (isRNLlamaHexagon && hexagonPresent) {
       println("✅ Hexagon SDK detected — enabling DSP build")
       cmakeArgs += [
+        "-DRNLLAMA_ENABLE_HEXAGON=ON",
         "-DHEXAGON_SDK_ROOT=${hexagonSdkRoot}",
         "-DHEXAGON_TOOLS_ROOT=${hexagonToolsRoot}"
       ]
+    } else if (isRNLlamaHexagon) {
+      println("⚠️ rnllamaHexagon=true but Hexagon SDK is incomplete — CMake will report the missing DSP inputs")
+      cmakeArgs += ["-DRNLLAMA_ENABLE_HEXAGON=ON"]
     } else {
-      println("🚫 Hexagon SDK not found — building CPU-only")
+      println("🚫 Hexagon disabled (set -PrnllamaHexagon=true to opt in) — building CPU-only")
+      cmakeArgs += ["-DRNLLAMA_ENABLE_HEXAGON=OFF"]
     }
 
     externalNativeBuild {

@@ -4,6 +4,7 @@ project(rnllama)
 
 option(HEXAGON_SDK_ROOT "Hexagon SDK root directory" OFF)
 option(HEXAGON_TOOLS_ROOT "Hexagon SDK toolchain directory" OFF)
+option(RNLLAMA_ENABLE_HEXAGON "Enable the optional Hexagon/OpenCL target and QAIC artifacts" OFF)
 
 find_package(Python3 REQUIRED)
 set(CMAKE_CXX_STANDARD 17)
@@ -95,7 +96,7 @@ function(build_rnllama_library target_name arch cpu_flags)
     endif ()
 
     set(ENABLE_HEXAGON OFF)
-    if (${target_name} MATCHES ".*_hexagon.*")
+    if (RNLLAMA_ENABLE_HEXAGON AND "${target_name}" MATCHES ".*_hexagon.*")
         set(ENABLE_HEXAGON ON)
     endif ()
 
@@ -444,7 +445,11 @@ if (ANDROID_ABI AND ANDROID_ABI STREQUAL "arm64-v8a")
     build_rnllama_library("rnllama_v8_2_dotprod" "arm" "-march=armv8.2-a+dotprod")
     build_rnllama_library("rnllama_v8_2_i8mm" "arm" "-march=armv8.2-a+i8mm")
     build_rnllama_library("rnllama_v8_2_dotprod_i8mm" "arm" "-march=armv8.2-a+dotprod+i8mm")
-    build_rnllama_library("rnllama_v8_2_dotprod_i8mm_hexagon_opencl" "arm" "-march=armv8.2-a+dotprod+i8mm")
+    if (RNLLAMA_ENABLE_HEXAGON)
+        build_rnllama_library("rnllama_v8_2_dotprod_i8mm_hexagon_opencl" "arm" "-march=armv8.2-a+dotprod+i8mm")
+    else()
+        message(STATUS "Hexagon/OpenCL target disabled; building CPU targets only")
+    endif()
 
 elseif (ANDROID_ABI AND ANDROID_ABI STREQUAL "x86_64")
     # x86_64 target

@@ -1,6 +1,6 @@
 [submodule "third_party/llama.cpp"]
 	path = third_party/llama.cpp
-	url = https://github.com/ggml-org/llama.cpp
+	url = https://github.com/Aspis0/kalsallama.git
 
 [submodule "third_party/OpenCL-ICD-Loader"]
 	path = third_party/OpenCL-ICD-Loader

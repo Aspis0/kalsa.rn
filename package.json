@@ -40,7 +40,7 @@
     "test": "jest",
     "typecheck": "tsc --noEmit",
     "lint": "eslint \"**/*.{js,ts,tsx}\"",
-    "postinstall": "node ./install/download-native-artifacts.js",
+    "postinstall": "node ./install/download-native-artifacts.js --source",
     "download:native-artifacts": "node ./install/download-native-artifacts.js",
     "build": "bob build",
     "prepack": "bob build",

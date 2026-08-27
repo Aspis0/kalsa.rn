@@ -18,6 +18,7 @@ const manifest = JSON.parse(
   fs.readFileSync(path.join(__dirname, 'native-artifacts.json'), 'utf8'),
 )
 const force = process.argv.includes('--force')
+const sourceBuild = process.argv.includes('--source')
 
 function normalizeRepositoryUrl(repository) {
   const rawUrl =
@@ -215,6 +216,13 @@ async function installArtifact(artifact) {
 }
 
 async function main() {
+  if (sourceBuild) {
+    console.log(
+      'llama.rn: skipping native artifact download for the pinned source build',
+    )
+    return
+  }
+
   if (process.env.RNLLAMA_SKIP_POSTINSTALL === '1') {
     console.log(
       'llama.rn: skipping native artifact download because RNLLAMA_SKIP_POSTINSTALL=1',

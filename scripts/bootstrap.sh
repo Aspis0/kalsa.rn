@@ -162,6 +162,7 @@ cp ./$LLAMA_DIR/ggml/src/ggml-cpu/quants.c ./cpp/ggml-cpu/quants.c
 cp ./$LLAMA_DIR/ggml/src/ggml-cpu/arch-fallback.h ./cpp/ggml-cpu/arch-fallback.h
 cp ./$LLAMA_DIR/ggml/src/ggml-cpu/repack.cpp ./cpp/ggml-cpu/repack.cpp
 cp ./$LLAMA_DIR/ggml/src/ggml-cpu/repack.h ./cpp/ggml-cpu/repack.h
+cp ./$LLAMA_DIR/ggml/src/ggml-cpu/repack-q23k.h ./cpp/ggml-cpu/repack-q23k.h
 cp ./$LLAMA_DIR/ggml/src/ggml-cpu/traits.h ./cpp/ggml-cpu/traits.h
 cp ./$LLAMA_DIR/ggml/src/ggml-cpu/traits.cpp ./cpp/ggml-cpu/traits.cpp
 cp ./$LLAMA_DIR/ggml/src/ggml-cpu/common.h ./cpp/ggml-cpu/common.h
@@ -299,8 +300,12 @@ cp ./$LLAMA_DIR/common/unicode.h ./cpp/common/unicode.h
 cp ./$LLAMA_DIR/common/unicode.cpp ./cpp/common/unicode.cpp
 cp ./$LLAMA_DIR/common/reasoning-budget.h ./cpp/common/reasoning-budget.h
 cp ./$LLAMA_DIR/common/reasoning-budget.cpp ./cpp/common/reasoning-budget.cpp
-cp ./$LLAMA_DIR/common/trie.h ./cpp/common/trie.h
-cp ./$LLAMA_DIR/common/trie.cpp ./cpp/common/trie.cpp
+if [ -f ./$LLAMA_DIR/common/trie.h ]; then
+  cp ./$LLAMA_DIR/common/trie.h ./cpp/common/trie.h
+fi
+if [ -f ./$LLAMA_DIR/common/trie.cpp ]; then
+  cp ./$LLAMA_DIR/common/trie.cpp ./cpp/common/trie.cpp
+fi
 cp ./$LLAMA_DIR/common/fit.h ./cpp/common/fit.h
 cp ./$LLAMA_DIR/common/fit.cpp ./cpp/common/fit.cpp
 cp ./$LLAMA_DIR/common/build-info.h ./cpp/common/build-info.h
@@ -412,11 +417,13 @@ normalize_lm_prefixes() {
     sed -i '' -E 's/(lm_)+gguf_/lm_gguf_/g' "$file"
     sed -i '' -E 's/(LM)+GGMLMetalClass/LMGGMLMetalClass/g' "$file"
   else
-    sed -i -E 's/(LM_)+GGML_/LM_GGML_/g' "$file"
-    sed -i -E 's/(lm_)+ggml_/lm_ggml_/g' "$file"
-    sed -i -E 's/(LM_)+GGUF_/LM_GGUF_/g' "$file"
-    sed -i -E 's/(lm_)+gguf_/lm_gguf_/g' "$file"
-    sed -i -E 's/(LM)+GGMLMetalClass/LMGGMLMetalClass/g' "$file"
+    sed -i -E \
+      -e 's/(LM_)+GGML_/LM_GGML_/g' \
+      -e 's/(lm_)+ggml_/lm_ggml_/g' \
+      -e 's/(LM_)+GGUF_/LM_GGUF_/g' \
+      -e 's/(lm_)+gguf_/lm_gguf_/g' \
+      -e 's/(LM)+GGMLMetalClass/LMGGMLMetalClass/g' \
+      "$file"
   fi
 }
 
@@ -445,11 +452,13 @@ for file in "${files_add_lm_prefix[@]}"; do
     # <nlohmann/json_fwd.hpp> -> "nlohmann/json_fwd.hpp"
     sed -i '' 's/<nlohmann\/json_fwd.hpp>/"nlohmann\/json_fwd.hpp"/g' $file
   else
-    sed -i 's/GGML_/LM_GGML_/g' $file
-    sed -i 's/ggml_/lm_ggml_/g' $file
-    sed -i 's/GGUF_/LM_GGUF_/g' $file
-    sed -i 's/gguf_/lm_gguf_/g' $file
-    sed -i 's/GGMLMetalClass/LMGGMLMetalClass/g' $file
+    sed -i \
+      -e 's/GGML_/LM_GGML_/g' \
+      -e 's/ggml_/lm_ggml_/g' \
+      -e 's/GGUF_/LM_GGUF_/g' \
+      -e 's/gguf_/lm_gguf_/g' \
+      -e 's/GGMLMetalClass/LMGGMLMetalClass/g' \
+      $file
 
     # <nlohmann/json.hpp> -> "nlohmann/json.hpp"
     sed -i 's/<nlohmann\/json.hpp>/"nlohmann\/json.hpp"/g' $file
@@ -511,12 +520,23 @@ echo "ggml-metal-embed.s generated ($(wc -l < "$EMBED_ASM") lines)"
 
 echo "Replacement completed successfully!"
 
-cd example && npm install && cd ..
+if [ "${LLAMA_RN_SKIP_EXAMPLE_INSTALL:-0}" = "1" ]; then
+  echo "Skipping example npm install (LLAMA_RN_SKIP_EXAMPLE_INSTALL=1)"
+else
+  cd example && npm install && cd ..
+fi
 
 # Apply patch
 # List ./scripts/patches/ and patch it
 for patch_file in ./scripts/patches/*.patch; do
-  patch -p0 -d ./cpp < "$patch_file"
+  if patch --dry-run --forward --batch -p0 -d ./cpp < "$patch_file" >/dev/null 2>&1; then
+    patch -p0 -d ./cpp < "$patch_file"
+  elif patch --dry-run --reverse --batch -p0 -d ./cpp < "$patch_file" >/dev/null 2>&1; then
+    echo "Skipping already-present patch: $patch_file"
+  else
+    echo "Patch does not apply cleanly: $patch_file" >&2
+    exit 1
+  fi
 done
 
 rm -rf ./cpp/*.orig

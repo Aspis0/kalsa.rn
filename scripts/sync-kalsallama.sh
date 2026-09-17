@@ -688,15 +688,15 @@ cmd_pin() {
 }
 
 cmd_bump() {
-    if [ -n "${KALSALLAMA_SRC:-}" ]; then
-        die "bump resolves origin/<branch> from the clone cache; unset KALSALLAMA_SRC"
-    fi
-    read_pin
-    resolve_git_dir
-    local full
-    full=$(git -C "$GIT_DIR" rev-parse --verify "origin/${PIN_BRANCH}^{commit}") \
-        || die "origin/${PIN_BRANCH} not found in $GIT_DIR after fetch"
-    regen_cpp "$full"
+  if [ -n "${KALSALLAMA_SRC:-}" ]; then
+    die "bump resolves origin/<branch> from the clone cache; unset KALSALLAMA_SRC"
+  fi
+  read_pin
+  resolve_git_dir
+  local full
+  full=$(git -C "$GIT_DIR" rev-parse --verify "origin/${PIN_BRANCH}^{commit}") \
+    || die "origin/${PIN_BRANCH} not found in $GIT_DIR after fetch"
+  regen_cpp "$full"
 }
 
 cmd_verify() {

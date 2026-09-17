@@ -27,6 +27,6 @@ runs:
         npm ci
       shell: bash
 
-    - name: Install & Build
-      run: npm install && npm run build
+    - name: Build
+      run: npm run build
       shell: bash

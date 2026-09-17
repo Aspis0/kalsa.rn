@@ -45,12 +45,15 @@ KNOWN_ABSENT = {
     "sheredom/subprocess.h",    # mtmd-helper.cpp, behind #ifdef MTMD_VIDEO
     "windows.h",                # ggml-cpu.c, behind #if defined(_WIN32)
     "unistd.h",                 # quoted POSIX header, ggml-hexagon/htp-drv.h
-    "htp-ops.h", "htp_iface.h",  # Hexagon SDK headers (HTP builds use Docker)
+    "htp_iface.h",              # generated from the Hexagon IDL
     "kleidiai/kleidiai.h",      # optional CPU backend, build-flag guarded
     "llamafile/sgemm.h",        # optional CPU backend, build-flag guarded
     "spacemit/ime.h",           # optional CPU backend, build-flag guarded
+    "half.hpp",                 # ggml-opencl.cpp, #ifdef __cplusplus; the
+                                # OpenCL SDK provides it
 }
-SEARCH = ["", "common", "common/jinja", "ggml-cpu", "tools/mtmd", "nlohmann"]
+SEARCH = ["", "common", "common/jinja", "ggml-cpu", "ggml-hexagon/htp",
+          "tools/mtmd", "nlohmann"]
 
 files = []
 for pat in ("*.h", "*.cpp",
@@ -59,6 +62,7 @@ for pat in ("*.h", "*.cpp",
             "models/*.cpp", "models/*.h",
             "ggml-cpu/*.c", "ggml-cpu/*.cpp", "ggml-cpu/*.h", "ggml-cpu/*/*.cpp",
             "ggml-metal/*", "ggml-hexagon/*.cpp", "ggml-hexagon/*.h",
+            "ggml-opencl/*.cpp", "ggml-opencl/*.h",
             "jsi/*.h", "jsi/*.cpp",
             "tools/mtmd/*.h", "tools/mtmd/*.cpp",
             "tools/mtmd/models/*.cpp"):
@@ -72,6 +76,8 @@ for f in files:
         inc = m.group(1)
         if inc in KNOWN_ABSENT:
             continue
+        if inc.endswith(".cl.h"):
+            continue    # generated from kernels/*.cl by kernels/embed_kernel.py
         here = os.path.join(os.path.dirname(f), inc)
         if os.path.exists(here) or any(os.path.exists(os.path.join(d, inc)) for d in SEARCH):
             continue
@@ -92,13 +98,22 @@ PY
 # point KALSA_BMOE_DIR at them to bring the rn-owned sources into the syntax
 # pass. Without it (or without clang++) the pass runs PARTIAL and the gate
 # only succeeds with KALSA_ALLOW_PARTIAL_GATE=1.
+#
+# ggml-opencl.cpp is NOT in the syntax pass on purpose: it hosts OpenCL-C
+# kernel sources via include gadgets that host clang rejects in every
+# configuration (the NDK build is authoritative). The include scan above
+# still resolves its headers; *.cl.h are build-generated (kernels/embed_kernel.py).
+
+SYNTAX_LOG="$(mktemp -t kalsa-syntax)"
+trap 'rm -f "$SYNTAX_LOG"' EXIT
+
 syntax_check() {
   local f="$1" extra="${2:-}"
   clang++ -std=c++17 -fsyntax-only \
     -I "$CPP" -I "$CPP/common" -I "$CPP/common/jinja" \
     -I "$CPP/ggml-cpu" -I "$CPP/tools/mtmd" \
     ${extra:+-I "$extra"} \
-    "$f" > /tmp/kalsa-syntax.log 2>&1
+    "$f" > "$SYNTAX_LOG" 2>&1
 }
 
 partial=""
@@ -119,7 +134,7 @@ parse_group() {  # parse_group <extra-include-or-empty> <files...>
     [ -f "$f" ] || continue
     if ! syntax_check "$f" "$extra"; then
       echo "[includes] SYNTAX FAIL: $(basename "$f")"
-      grep -E "error:" /tmp/kalsa-syntax.log | head -3 | sed 's/^/    /' || true
+      grep -E "error:" "$SYNTAX_LOG" | head -3 | sed 's/^/    /' || true
       fails=$((fails + 1))
       continue
     fi

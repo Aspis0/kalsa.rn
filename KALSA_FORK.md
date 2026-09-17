@@ -17,10 +17,18 @@ edit to pin-derived engine code must live as a patch under
 
 ## Commands
 
-    scripts/sync-kalsallama.sh pin <sha>  # re-point the pin, regenerate cpp/
-    scripts/sync-kalsallama.sh bump       # pin to origin/<branch> of the pin
-    scripts/sync-kalsallama.sh verify     # regenerate into a temp copy and
-                                          # check it against cpp/
+    KALSA_BMOE_DIR=<app repo>/native/bmoe/rn \
+      scripts/sync-kalsallama.sh pin <sha>  # re-point the pin, regenerate cpp/
+    KALSA_BMOE_DIR=<app repo>/native/bmoe/rn \
+      scripts/sync-kalsallama.sh bump       # pin to origin/<branch> of the pin
+    KALSA_BMOE_DIR=<app repo>/native/bmoe/rn \
+      scripts/sync-kalsallama.sh verify     # regenerate into a temp copy and
+                                            # check it against cpp/
+
+All three run the include+syntax gate, which needs
+`KALSA_BMOE_DIR=<app repo>/native/bmoe/rn` to parse the rn-owned sources;
+without it (or without clang++) the gate runs PARTIAL and fails unless
+`KALSA_ALLOW_PARTIAL_GATE=1`, which accepts what it cannot see.
 
 `pin`/`bump` flatten the pinned commit, apply the patches to the flattened
 tree, assert the kalsa post-image, run the include+syntax gate on the

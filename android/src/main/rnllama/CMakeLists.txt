@@ -248,175 +248,21 @@ function(build_rnllama_library target_name arch cpu_flags)
     if (ENABLE_OPENCL)
         include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../../../../third_party/OpenCL-Headers)
 
-        # Derived from the kalsallama overlay, NOT hand-maintained. This is exactly the set of
-        # <name>.cl.h that cpp/ggml-opencl/ggml-opencl.cpp #includes, which is exactly the set of
-        # cpp/ggml-opencl/kernels/*.cl the fork ships (156 of each, verified equal). llama.rn's
-        # own list named 17 kernels the fork dropped and missed the four Adreno q2_k/q3_k ones.
-        # Regenerate after any overlay bump by listing those #includes; a name with no matching
-        # .cl file fails embed_kernel.py at configure time.
-        set(GGML_OPENCL_KERNELS
-            add
-            add_id
-            argsort
-            clamp
-            concat
-            conv2d
-            conv2d_f16_f32
-            cpy
-            cumsum
-            cvt
-            diag
-            diag_mask_inf
-            div
-            exp
-            expm1
-            fill
-            flash_attn_f16
-            flash_attn_f32
-            flash_attn_f32_f16
-            flash_attn_f32_q4_0
-            flash_attn_f32_q8_0
-            flash_attn_pre_f16
-            gated_delta_net
-            gelu
-            gemm_moe_mxfp4_f32
-            gemm_moe_mxfp4_f32_ns
-            gemm_moe_q2_k_f32_ns
-            gemm_moe_q3_k_f32_ns
-            gemm_moe_q4_0_f32_ns
-            gemm_moe_q4_1_f32_ns
-            gemm_moe_q4_k_f32_ns
-            gemm_moe_q5_0_f32_ns
-            gemm_moe_q5_1_f32_ns
-            gemm_moe_q5_k_f32_ns
-            gemm_moe_q6_k_f32_ns
-            gemm_noshuffle_iq4_nl_f32
-            gemm_noshuffle_q1_0_f32
-            gemm_noshuffle_q4_0_f32
-            gemm_noshuffle_q4_1_f32
-            gemm_noshuffle_q4_k_f32
-            gemm_noshuffle_q5_0_f32
-            gemm_noshuffle_q5_1_f32
-            gemm_noshuffle_q5_k_f32
-            gemm_noshuffle_q6_k_f32
-            gemm_noshuffle_q8_0_f32
-            gemm_xmem_f16_f32_os8
-            gemv_moe_mxfp4_f32
-            gemv_moe_mxfp4_f32_ns
-            gemv_moe_q2_k_f32_ns
-            gemv_moe_q3_k_f32_ns
-            gemv_moe_q4_0_f32_ns
-            gemv_moe_q4_1_f32_ns
-            gemv_moe_q4_k_f32_ns
-            gemv_moe_q5_0_f32_ns
-            gemv_moe_q5_1_f32_ns
-            gemv_moe_q5_k_f32_ns
-            gemv_moe_q6_k_f32_ns
-            gemv_noshuffle_iq4_nl_f32
-            gemv_noshuffle_q1_0_f32
-            gemv_noshuffle_q4_0_f32
-            gemv_noshuffle_q4_0_f32_spec
-            gemv_noshuffle_q4_1_f32
-            gemv_noshuffle_q4_k_f32
-            gemv_noshuffle_q5_0_f32
-            gemv_noshuffle_q5_1_f32
-            gemv_noshuffle_q5_k_f32
-            gemv_noshuffle_q6_k_f32
-            gemv_noshuffle_q8_0_f32
-            get_rows
-            glu
-            group_norm
-            im2col_f16
-            im2col_f32
-            l2_norm
-            mean
-            moe_reorder_b
-            moe_sort_by_expert
-            mul
-            mul_mat_f16_f32
-            mul_mm_f16_f32_kq_kqv
-            mul_mm_f16_f32_l4_lm
-            mul_mm_f32_f32_l4_lm
-            mul_mm_iq4_nl_f32_l4_lm
-            mul_mm_q1_0_f32_l4_lm
-            mul_mm_q4_0_f32_l4_lm
-            mul_mm_q4_1_f32_l4_lm
-            mul_mm_q4_k_f32_l4_lm
-            mul_mm_q5_0_f32_l4_lm
-            mul_mm_q5_1_f32_l4_lm
-            mul_mm_q5_k_f32_l4_lm
-            mul_mm_q6_k_f32_l4_lm
-            mul_mm_q8_0_f32_l4_lm
-            mul_mv_f16_f16
-            mul_mv_f16_f32
-            mul_mv_f16_f32_1row
-            mul_mv_f16_f32_l4
-            mul_mv_f32_f32
-            mul_mv_id_mxfp4_f32
-            mul_mv_id_mxfp4_f32_flat
-            mul_mv_id_q4_0_f32_8x_flat
-            mul_mv_id_q8_0_f32
-            mul_mv_id_q8_0_f32_flat
-            mul_mv_iq4_nl_f32
-            mul_mv_iq4_nl_f32_flat
-            mul_mv_mxfp4_f32
-            mul_mv_mxfp4_f32_flat
-            mul_mv_q1_0_f32
-            mul_mv_q1_0_f32_flat
-            mul_mv_q4_0_f32
-            mul_mv_q4_0_f32_1d_16x_flat
-            mul_mv_q4_0_f32_1d_8x_flat
-            mul_mv_q4_0_f32_8x_flat
-            mul_mv_q4_0_f32_v
-            mul_mv_q4_1_f32
-            mul_mv_q4_1_f32_flat
-            mul_mv_q4_k_f32
-            mul_mv_q4_k_f32_flat
-            mul_mv_q5_0_f32
-            mul_mv_q5_0_f32_flat
-            mul_mv_q5_1_f32
-            mul_mv_q5_1_f32_flat
-            mul_mv_q5_k_f32
-            mul_mv_q5_k_f32_flat
-            mul_mv_q6_k_f32
-            mul_mv_q6_k_f32_flat
-            mul_mv_q8_0_f32
-            mul_mv_q8_0_f32_flat
-            neg
-            norm
-            oracle_consumer_q4_0_gemm
-            oracle_consumer_q4_0_gemv
-            pad
-            relu
-            repeat
-            rms_norm
-            rope
-            scale
-            set_rows
-            sigmoid
-            silu
-            softmax_4_f16
-            softmax_4_f32
-            softmax_f16
-            softmax_f32
-            softplus
-            solve_tri
-            sqr
-            sqrt
-            ssm_conv
-            sub
-            sum_rows
-            tanh
-            transpose
-            tri
-            tsembd
-            upscale
-        )
-        set(GGML_OPENCL_KERNEL_DIR ${RNLLAMA_LIB_DIR}/ggml-opencl/kernels)
+        # Exactly the set of kernels the fork ships, by construction: file(GLOB)
+        # over cpp/ggml-opencl/kernels/*.cl, embedded via embed_kernel.py into the
+        # <name>.cl.h files ggml-opencl.cpp #includes (181 .cl files at this pin;
+        # its 183 #include lines hit two of them -- gemm_moe_q4_0_f32_ns,
+        # gemv_moe_q4_0_f32_ns -- twice). The previous hand-written list named 156
+        # and drifted 25 names behind the overlay, so the arm64 OpenCL target
+        # failed at build time; the glob cannot drift, and a .cl.h include with no
+        # matching .cl file is the include scan's failure, not configure's.
+        file(GLOB GGML_OPENCL_KERNELS CONFIGURE_DEPENDS
+            ${RNLLAMA_LIB_DIR}/ggml-opencl/kernels/*.cl)
         set(GGML_OPENCL_KERNEL_HEADERS "")
 
-        foreach(kernel ${GGML_OPENCL_KERNELS})
-            set(input_file ${GGML_OPENCL_KERNEL_DIR}/${kernel}.cl)
+        foreach(kernel_path ${GGML_OPENCL_KERNELS})
+            get_filename_component(kernel ${kernel_path} NAME_WE)
+            set(input_file ${kernel_path})
             set(output_file ${CMAKE_CURRENT_BINARY_DIR}/${kernel}.cl.h)
             message(STATUS "opencl: embedding kernel ${kernel}")
             add_custom_command(
@@ -446,8 +292,10 @@ function(build_rnllama_library target_name arch cpu_flags)
         target_include_directories(${target_name} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
         target_sources(${target_name} PRIVATE
             ${RNLLAMA_LIB_DIR}/ggml-opencl/ggml-opencl.cpp
-            # cl-program-cache.{cpp,h} is llama.rn-era only: the kalsallama overlay does not ship it
-            # and the fork's ggml-opencl.cpp never references it. Naming it here fails configure.
+            # cl-program-cache.cpp backs the program cache ggml-opencl.cpp uses
+            # (cl_program_cache_state program_cache, cl_program_cache_init /
+            # try_load / try_save); leaving it out is a link-time failure.
+            ${RNLLAMA_LIB_DIR}/ggml-opencl/cl-program-cache.cpp
             ${GGML_OPENCL_KERNEL_HEADERS}
         )
         target_compile_options(${target_name} PRIVATE

@@ -435,6 +435,9 @@ std::string common_params_get_system_info(const common_params & params) {
     os << " / " << std::thread::hardware_concurrency() << " | " << llama_print_system_info();
 #endif
 
+    // Compiled into librnllama.so (the jniLibs binary). RNLlamaJSI.cpp is the
+    // JNI wrapper — always built from source — and cannot prove this .so is ours.
+    os << " | kalsa-native-patches";
     return os.str();
 }
 

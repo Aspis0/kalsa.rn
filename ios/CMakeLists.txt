@@ -113,6 +113,8 @@ add_library(rnllama SHARED
 
     # React Native llama APIs
     ${SOURCE_DIR}/rn-llama.cpp
+    ${SOURCE_DIR}/rn-governor.cpp
+    ${SOURCE_DIR}/rn-governor-params.cpp
     ${SOURCE_DIR}/rn-completion.cpp
     ${SOURCE_DIR}/rn-slot.cpp
     ${SOURCE_DIR}/rn-slot-manager.cpp

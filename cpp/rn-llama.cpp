@@ -1,8 +1,11 @@
 #include "rn-llama.h"
+#include "bmoe_stream.h"
 #include "ggml-cpu.h"
 #include "rn-tts.h"
 #include "rn-mtmd.hpp"
 #include "rn-completion.h"
+#include "rn-governor.h"
+#include "rn-governor-params.h"
 #include "rn-slot-manager.h"
 #include "rn-common.hpp"
 
@@ -15,6 +18,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <fstream>
+#include <stdexcept>
 
 namespace rnllama {
 
@@ -44,6 +48,100 @@ void clear_init_lora_ownership(common_init_result_ptr &llama_init) {
 
 bool has_speculative_type(const common_params_speculative &speculative, common_speculative_type type) {
     return std::find(speculative.types.begin(), speculative.types.end(), type) != speculative.types.end();
+}
+
+bool has_speculative_mode(const common_params & params) {
+    return std::any_of(params.speculative.types.begin(), params.speculative.types.end(), [](auto type) {
+        return type != COMMON_SPECULATIVE_TYPE_NONE;
+    });
+}
+
+void log_governor_fallback(const char * stage, int models_loaded,
+                           const std::string & reason,
+                           llama_governor_fit gpu_fit, bool profile_valid) {
+    LOG_ERROR(
+        "KALSA_GOVERNOR_FALLBACK {stage:\"%s\", models_loaded:%d, reason:\"%s\", gpu_fit:%d, profile_valid:%d}",
+        stage, models_loaded, reason.c_str(), (int) gpu_fit, (int) profile_valid);
+}
+
+bool load_governor_models(llama_rn_context & owner,
+                          const llama_governor_params & governor_params,
+                          const llama_governor_thermo_profile & governor_thermo) {
+    common_params prefill_params = owner.params;
+    common_params decode_params = owner.params;
+    prefill_params.n_gpu_layers = 99;
+    decode_params.n_gpu_layers = 0;
+    prefill_params.n_parallel = 1;
+    decode_params.n_parallel = 1;
+
+    const bool profile_valid = governor_thermo_profile_is_valid(governor_thermo);
+    auto cleanup = [&owner]() {
+        owner.governor.reset();
+        owner.governor_decode_init.reset();
+        owner.governor_prefill_init.reset();
+        owner.model = nullptr;
+        owner.ctx = nullptr;
+    };
+    auto fail = [&](const char * stage, int models_loaded,
+                    const std::string & reason) {
+        log_governor_fallback(stage, models_loaded, reason,
+                              governor_params.gpu_fit, profile_valid);
+        cleanup();
+        return false;
+    };
+
+    try {
+        owner.governor_prefill_init = common_init_from_params(prefill_params, true);
+    } catch (const std::exception & error) {
+        return fail("accelerator_model_load", 0, error.what());
+    }
+    if (owner.governor_prefill_init == nullptr || owner.governor_prefill_init->model() == nullptr) {
+        return fail("accelerator_model_load", 0, "accelerator model load failed");
+    }
+
+    try {
+        owner.governor_decode_init = common_init_from_params(decode_params, true);
+    } catch (const std::exception & error) {
+        return fail("cpu_model_load", 1, error.what());
+    }
+    if (owner.governor_decode_init == nullptr || owner.governor_decode_init->model() == nullptr) {
+        return fail("cpu_model_load", 1, "CPU model load failed");
+    }
+
+    bool runtime_profile_valid = profile_valid;
+    try {
+        const auto prefill_context_params = common_context_params_to_llama(prefill_params);
+        const auto decode_context_params = common_context_params_to_llama(decode_params);
+        owner.governor = std::make_unique<rn_governor>(
+            owner.governor_prefill_init->model(), owner.governor_decode_init->model(),
+            prefill_context_params, decode_context_params, governor_params);
+        if (!owner.governor->set_thermo_profile(governor_thermo)) {
+            runtime_profile_valid = false;
+            throw std::runtime_error("governor: thermo profile invalid");
+        }
+    } catch (const std::exception & error) {
+        const std::string reason = error.what();
+        const bool route_rejected = reason.find("route") != std::string::npos ||
+                                    reason.find("Route") != std::string::npos;
+        log_governor_fallback(route_rejected ? "route_reject" : "init", 2, reason,
+                              governor_params.gpu_fit, runtime_profile_valid);
+        // CPU retry belongs to LlamaService/S4. Native owns only cleanup and
+        // returns failure so that retry can recreate the single-context path.
+        cleanup();
+        return false;
+    }
+
+    owner.model = owner.governor_prefill_init->model();
+    owner.ctx = owner.governor->prefill_ctx();
+    owner.params.n_gpu_layers = 99;
+    if (owner.model == nullptr || owner.ctx == nullptr) {
+        log_governor_fallback("init", 2,
+                              "governor initialized without an active context",
+                              governor_params.gpu_fit, profile_valid);
+        cleanup();
+        return false;
+    }
+    return true;
 }
 
 } // namespace
@@ -389,6 +487,9 @@ void llama_rn_context::cleanupThreadpools() {
 }
 
 bool llama_rn_context::attachThreadpoolsIfAvailable() {
+    if (governor) {
+        return false;
+    }
     if (ctx == nullptr) {
         return false;
     }
@@ -442,11 +543,21 @@ bool llama_rn_context::attachThreadpoolsIfAvailable() {
     return true;
 }
 
+llama_rn_context::llama_rn_context() = default;
+
 llama_rn_context::~llama_rn_context() {
+    if (moe_stream) moe_stream->shutdown();
+
     // Disable parallel mode first (cleans up slot_manager)
     disableParallelMode();
 
-    removeLoraAdapters();
+    if (governor) {
+        lora.clear();
+        clear_init_lora_ownership(llama_init);
+        owned_lora.clear();
+    } else {
+        removeLoraAdapters();
+    }
     cleanupThreadpools();
 
     if (completion != nullptr) {
@@ -458,63 +569,188 @@ llama_rn_context::~llama_rn_context() {
     releaseVocoder();
 }
 
-bool llama_rn_context::loadModel(common_params &params_)
+llama_context * llama_rn_context::active_ctx() const {
+    return governor ? governor->active_ctx() : ctx;
+}
+
+int32_t llama_rn_context::decode(llama_batch batch) {
+    if (!governor) {
+        return llama_decode(ctx, batch);
+    }
+
+    const bool was_failed = governor->failed();
+    const int32_t result = governor->decode(batch);
+    if (result != 0 && result != -2 && !was_failed) {
+        const std::string & reason = governor->failure_reason();
+        const bool route_rejected = reason.find("route Reject") != std::string::npos;
+        LOG_ERROR(
+            "KALSA_GOVERNOR_FALLBACK {stage:\"%s\", models_loaded:2, reason:\"%s\", gpu_fit:%d, profile_valid:%d}",
+            route_rejected ? "route_reject" : "decode",
+            reason.c_str(), (int) governor->gpu_fit(), (int) governor->profile_valid());
+    }
+    return result;
+}
+
+bool llama_rn_context::hasGovernor() const {
+    return governor != nullptr;
+}
+
+bool llama_rn_context::governorFailed() const {
+    return governor != nullptr && governor->failed();
+}
+
+std::string llama_rn_context::governorFailureReason() const {
+    return governor == nullptr ? "" : governor->failure_reason();
+}
+
+void llama_rn_context::resetGovernorPrefillStats() {
+    if (governor != nullptr) {
+        governor->reset_prefill_stats();
+    }
+}
+
+bool llama_rn_context::setThermoProfile(const llama_governor_thermo_profile & profile) {
+    return governor != nullptr && governor->set_thermo_profile(profile);
+}
+
+llama_governor_stats llama_rn_context::governorStats() const {
+    return governor == nullptr ? llama_governor_stats{} : governor->stats();
+}
+
+bool llama_rn_context::loadModel(
+    common_params &params_,
+    const llama_governor_params * governor_params,
+    const llama_governor_thermo_profile * governor_thermo)
 {
-    removeLoraAdapters();
+    const bool governor_enabled = governor_params != nullptr;
+    // Do not return after the two-model load. Both modes converge here so the
+    // context has templates, n_ctx, adapter metadata, n_seq logging, completion,
+    // and the same ctx_shift setup before the first completion.
+    if (governor_enabled) {
+        if (governor_thermo == nullptr || !governor_thermo_profile_is_valid(*governor_thermo)) {
+            throw std::runtime_error("governor: thermo profile invalid");
+        }
+        if (params_.n_parallel > 1) {
+            throw std::runtime_error("Governor mode supports sequence 0 only; parallel slots are disabled");
+        }
+        if (has_speculative_mode(params_)) {
+            log_governor_fallback(
+                "params", 0,
+                "Governor mode does not support speculative or MTP decoding",
+                governor_params->gpu_fit,
+                governor_thermo != nullptr &&
+                    governor_thermo_profile_is_valid(*governor_thermo));
+            throw std::runtime_error("Governor mode does not support speculative or MTP decoding");
+        }
+        if (params_.kalsa_moe.enabled) {
+            throw std::runtime_error("Governor mode does not support moe_stream");
+        }
+        if (!params_.lora_adapters.empty()) {
+            throw std::runtime_error("Governor mode does not support LoRA adapters");
+        }
+    }
+
+    if (!governor) {
+        removeLoraAdapters();
+    }
     draft_model.reset();
     params = params_;
 
     // Ensure n_parallel is set to a reasonable default for parallel decoding support
     // This sets n_seq_max in the context, which cannot be changed later
-    if (params.n_parallel < 1) {
+    if (governor_enabled) {
+        params.n_parallel = 1;
+    } else if (params.n_parallel < 1) {
         params.n_parallel = 8; // Default to support up to 8 parallel slots
         LOG_INFO("Setting n_parallel to default: %d (enables up to %d parallel slots)", params.n_parallel, params.n_parallel);
     } else {
         LOG_INFO("Using n_parallel: %d (enables up to %d parallel slots)", params.n_parallel, params.n_parallel);
     }
 
-    llama_init = common_init_from_params(params);
-    model = llama_init != nullptr ? llama_init->model() : nullptr;
-    ctx = llama_init != nullptr ? llama_init->context() : nullptr;
+    // Source buffers back the expert tensors: shut the streamer, then drop the old
+    // context, then the hook. Inverse of this order dangling-cb_eval or UAF on reload.
+    if (moe_stream) moe_stream->shutdown();
+    moe_stream.reset();
+    governor.reset();
+    governor_decode_init.reset();
+    governor_prefill_init.reset();
+    llama_init.reset();
+    model = nullptr;
+    ctx = nullptr;
 
-    // common_init_from_params() can fail after loading the model but before
-    // constructing the context, so both pointers must be validated here.
-    if (model == nullptr || ctx == nullptr) {
-        if (model == nullptr) {
-            LOG_ERROR("unable to load model: %s", params_.model.path.c_str());
-        } else {
-            LOG_ERROR("unable to initialize context for model: %s", params_.model.path.c_str());
-        }
-        return false;
-    }
-
-    if (params.speculative.has_dft() &&
-        has_speculative_type(params.speculative, COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) {
-        const auto & draft_params = params.speculative.draft;
-        common_params params_dft = params;
-        params_dft.devices = draft_params.devices;
-        params_dft.model = draft_params.mparams;
-        params_dft.n_gpu_layers = draft_params.n_gpu_layers;
-        params_dft.cache_type_k = draft_params.cache_type_k;
-        params_dft.cache_type_v = draft_params.cache_type_v;
-        params_dft.tensor_buft_overrides = draft_params.tensor_buft_overrides;
-
-        if (draft_params.cpuparams.n_threads > 0) {
-            params_dft.cpuparams.n_threads = draft_params.cpuparams.n_threads;
-            params_dft.cpuparams_batch.n_threads = draft_params.cpuparams_batch.n_threads;
-        }
-
-        auto mparams_dft = common_model_params_to_llama(params_dft);
-        LOG_INFO("Loading MTP draft model: %s", params_dft.model.path.c_str());
-        draft_model.reset(llama_model_load_from_file(params_dft.model.path.c_str(), mparams_dft));
-        if (draft_model == nullptr) {
-            LOG_ERROR("unable to load MTP draft model: %s", params_dft.model.path.c_str());
+    if (governor_enabled) {
+        if (!load_governor_models(*this, *governor_params, *governor_thermo)) {
             return false;
         }
+    } else {
+        moe_stream = std::make_unique<kalsa::MoeStream>();
+        {
+            std::string moe_err;
+            if (!moe_stream->arm(params, moe_err)) {
+                LOG_INFO("kalsa moe stream: %s", moe_err.c_str());
+            }
+        }
+
+        llama_init = common_init_from_params(params);
+        model = llama_init != nullptr ? llama_init->model() : nullptr;
+        ctx = llama_init != nullptr ? llama_init->context() : nullptr;
+
+        // common_init_from_params() can fail after loading the model but before
+        // constructing the context, so both pointers must be validated here.
+        if (model == nullptr || ctx == nullptr) {
+            if (model == nullptr) {
+                LOG_ERROR("unable to load model: %s", params_.model.path.c_str());
+            } else {
+                LOG_ERROR("unable to initialize context for model: %s", params_.model.path.c_str());
+            }
+            return false;
+        }
+
+        if (moe_stream->armed()) {
+            std::string moe_err;
+            if (!moe_stream->bind(ctx, moe_err)) {
+                LOG_INFO("kalsa moe stream: %s", moe_err.c_str());
+            }
+        }
+
+        // Kalsa patch: DFlash needs the standalone draft model too — upstream gated
+        // the loader on MTP only, so a pure ["draft-dflash"] config silently ran
+        // without a draft (common_speculative_init requires ctx_dft for DFLASH).
+        if (params.speculative.has_dft() &&
+            (has_speculative_type(params.speculative, COMMON_SPECULATIVE_TYPE_DRAFT_MTP) ||
+             has_speculative_type(params.speculative, COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH))) {
+            const auto & draft_params = params.speculative.draft;
+            common_params params_dft = params;
+            params_dft.devices = draft_params.devices;
+            params_dft.model = draft_params.mparams;
+            params_dft.n_gpu_layers = draft_params.n_gpu_layers;
+            params_dft.cache_type_k = draft_params.cache_type_k;
+            params_dft.cache_type_v = draft_params.cache_type_v;
+            params_dft.tensor_buft_overrides = draft_params.tensor_buft_overrides;
+
+            if (draft_params.cpuparams.n_threads > 0) {
+                params_dft.cpuparams.n_threads = draft_params.cpuparams.n_threads;
+                params_dft.cpuparams_batch.n_threads = draft_params.cpuparams_batch.n_threads;
+            }
+
+            auto mparams_dft = common_model_params_to_llama(params_dft);
+            LOG_INFO("Loading MTP draft model: %s", params_dft.model.path.c_str());
+            draft_model.reset(llama_model_load_from_file(params_dft.model.path.c_str(), mparams_dft));
+            if (draft_model == nullptr) {
+                LOG_ERROR("unable to load MTP draft model: %s", params_dft.model.path.c_str());
+                return false;
+            }
+        }
     }
 
-    templates = common_chat_templates_init(model, params.chat_template);
-    n_ctx = llama_n_ctx(ctx);
+    if (governor_enabled) {
+        templates = common_chat_templates_init(
+            governor_decode_init->model(), params.chat_template);
+        n_ctx = llama_n_ctx(active_ctx());
+    } else {
+        templates = common_chat_templates_init(model, params.chat_template);
+        n_ctx = llama_n_ctx(ctx);
+    }
 
     // Init-time adapters are already loaded and applied by common_init_from_params().
     // Mirror the resulting adapter metadata so getLoadedLoraAdapters() reflects reality
@@ -526,7 +762,9 @@ bool llama_rn_context::loadModel(common_params &params_)
     }
 
     // Log the actual n_seq_max that was set
-    uint32_t n_seq_max = llama_n_seq_max(ctx);
+    uint32_t n_seq_max = governor_enabled
+        ? llama_n_seq_max(active_ctx())
+        : llama_n_seq_max(ctx);
     LOG_INFO("Context initialized with n_seq_max = %u", n_seq_max);
 
     // Initialize completion context
@@ -553,13 +791,22 @@ llama_model * llama_rn_context::getMTPDraftModel() const {
 }
 
 llama_context * llama_rn_context::createMTPDraftContext(const common_params &params_for_context) const {
+    if (hasGovernor()) {
+        throw std::runtime_error(
+            "Governor mode does not support MTP or speculative decoding");
+    }
     llama_model * model_dft = getMTPDraftModel();
     if (model_dft == nullptr || ctx == nullptr) {
         return nullptr;
     }
 
     auto cparams = common_context_params_to_llama(params_for_context);
-    cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    // Kalsa patch: a MTP-type context on a model without nextn layers returns
+    // nullptr (llama-context.cpp init guard). Standalone drafts (DFlash) may
+    // lack them — fall back to a default context for those.
+    cparams.ctx_type = llama_model_n_layer_nextn(model_dft) > 0
+        ? LLAMA_CONTEXT_TYPE_MTP
+        : LLAMA_CONTEXT_TYPE_DEFAULT;
     cparams.n_rs_seq = 0;
     cparams.type_k = params_for_context.speculative.draft.cache_type_k;
     cparams.type_v = params_for_context.speculative.draft.cache_type_v;
@@ -666,7 +913,7 @@ llama_rn_tokenize_result llama_rn_context::tokenize(const std::string &text, con
       return tokenize_result;
   }
   std::vector<llama_token> text_tokens;
-  text_tokens = common_tokenize(ctx, text, /* add_special= */ false, /* parse_special= */ true);
+  text_tokens = common_tokenize(active_ctx(), text, /* add_special= */ false, /* parse_special= */ true);
   llama_rn_tokenize_result tokenize_result;
   tokenize_result.tokens = text_tokens;
   tokenize_result.has_media = false;
@@ -677,6 +924,10 @@ llama_rn_tokenize_result llama_rn_context::tokenize(const std::string &text, con
 }
 
 void llama_rn_context::applyLoraAdapters(std::vector<common_adapter_lora_info> lora) {
+    if (hasGovernor()) {
+        throw std::runtime_error(
+            "Governor mode does not support runtime LoRA adapters");
+    }
     if (model == nullptr || ctx == nullptr) {
         throw std::runtime_error("Cannot apply LoRA adapters: context is not initialized");
     }
@@ -705,6 +956,10 @@ void llama_rn_context::applyLoraAdapters(std::vector<common_adapter_lora_info> l
 }
 
 void llama_rn_context::removeLoraAdapters() {
+    if (hasGovernor()) {
+        throw std::runtime_error(
+            "Governor mode does not support runtime LoRA adapters");
+    }
     if (ctx != nullptr) {
         std::vector<common_adapter_lora_info> empty_lora;
         common_set_adapter_lora(ctx, empty_lora); // apply empty list
@@ -720,6 +975,10 @@ std::vector<common_adapter_lora_info> llama_rn_context::getLoadedLoraAdapters() 
 }
 
 bool llama_rn_context::initMultimodal(const std::string &mmproj_path, bool use_gpu, int image_min_tokens, int image_max_tokens) {
+    if (hasGovernor()) {
+        throw std::runtime_error(
+            "Governor mode does not support multimodal initialization");
+    }
     try {
         mtmd_wrapper = new llama_rn_context_mtmd(mmproj_path, use_gpu, model, ctx, params, has_multimodal, params, image_min_tokens, image_max_tokens);
         return true;
@@ -787,6 +1046,10 @@ void llama_rn_context::releaseVocoder() {
 
 // Enable parallel decoding mode
 void llama_rn_context::enableParallelMode(int32_t n_parallel, int32_t n_batch) {
+    if (governor != nullptr) {
+        LOG_ERROR("Governor mode does not support parallel slots");
+        throw std::runtime_error("Governor mode does not support parallel slots");
+    }
     if (ctx == nullptr) {
         LOG_ERROR("Cannot enable parallel mode: context not initialized");
         throw std::runtime_error("Cannot enable parallel mode: context not initialized");
@@ -856,7 +1119,37 @@ void llama_rn_context::disableParallelMode() {
     LOG_INFO("Parallel mode disabled");
 }
 
+/**
+ * Empty the live KV. The one snapshot that survives is the stable prefix.
+ *
+ * Callers are all in JS (the only binding is llamaClearCache), and what JS is
+ * clearing is a CONVERSATION: a window slide, a reconcile, a chat switch. The
+ * system prompt it also destroys is byte-identical in whatever comes next, so
+ * throwing that snapshot away only buys a cold prefill of it -- 1832 tokens,
+ * 40 s on an S23. Keeping it is ~12 MB of RAM against that.
+ *
+ * JS is not told, and must not be. It decides WHAT prompt to send; the native
+ * side decides how much of it still has to be computed, and only after
+ * verifying the snapshot's tokens really are a prefix of that prompt
+ * (findStateCheckpoint) and that the memory really came back where the label
+ * says (recoverStateCheckpoint's pos_max + 1 == k). A JS flag asserting the
+ * state of the native KV is the desync this project has hit three times.
+ *
+ * A model switch destroys the whole context, and with it the snapshot, so a
+ * checkpoint can never outlive the tokenizer that produced its token ids.
+ */
 void llama_rn_context::clearCache(bool clear_data) {
+    if (hasGovernor()) {
+        governor->clear_cache(clear_data);
+        if (completion != nullptr) {
+            completion->embd.clear();
+            completion->n_past = 0;
+            completion->keepOnlyStablePrefixCheckpoint();
+        }
+        LOG_INFO("Governor caches cleared and completion state reset (clear_data=%s)",
+                 clear_data ? "true" : "false");
+        return;
+    }
     if (ctx == nullptr) {
         LOG_WARNING("Cannot clear cache: context not initialized");
         return;
@@ -873,7 +1166,7 @@ void llama_rn_context::clearCache(bool clear_data) {
     if (completion != nullptr) {
         completion->embd.clear();
         completion->n_past = 0;
-        completion->clearStateCheckpoints();
+        completion->keepOnlyStablePrefixCheckpoint();
         LOG_INFO("Cache cleared and completion state reset (clear_data=%s)", clear_data ? "true" : "false");
     } else {
         LOG_INFO("Cache cleared (clear_data=%s)", clear_data ? "true" : "false");

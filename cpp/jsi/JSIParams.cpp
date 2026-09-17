@@ -300,9 +300,11 @@ namespace rnllama_jsi {
 
         applySpeculativeTypeNames(cparams.speculative, typeNames);
 
-        if (hasSpeculativeType(cparams.speculative, COMMON_SPECULATIVE_TYPE_DRAFT_MTP) &&
+        // Kalsa patch: DFLASH shares the draft machinery — same n_max requirement.
+        if ((hasSpeculativeType(cparams.speculative, COMMON_SPECULATIVE_TYPE_DRAFT_MTP) ||
+             hasSpeculativeType(cparams.speculative, COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)) &&
             cparams.speculative.draft.n_max <= 0) {
-            throw std::invalid_argument("MTP requires spec_draft_n_max > 0");
+            throw std::invalid_argument("MTP/DFlash requires spec_draft_n_max > 0");
         }
     }
 
@@ -311,24 +313,20 @@ namespace rnllama_jsi {
 
         // Model path
         cparams.model.path = getPropertyAsString(runtime, params, "model");
-        cparams.vocab_only = getPropertyAsBool(runtime, params, "vocab_only", false);
-        if (cparams.vocab_only) {
-            cparams.warmup = false;
+        // Kalsa: kalsallama's common_params has no vocab_only; vocab-only loads are not
+        // supported by this engine. Fail fast rather than silently loading full weights.
+        if (getPropertyAsBool(runtime, params, "vocab_only", false)) {
+            throw std::invalid_argument("vocab_only is not supported by this llama.cpp build");
         }
 
         cparams.n_ctx = getPropertyAsInt(runtime, params, "n_ctx", cparams.n_ctx);
-
-        // For vocab_only models, ensure n_ctx is set because:
-        // 1. vocab_only models have n_ctx_train = 0 (no tensors loaded)
-        // 2. Context creation fails if both n_ctx and n_ctx_train are 0
-        // Use 512 as a minimal default - sufficient for tokenization
-        if (cparams.vocab_only && cparams.n_ctx == 0) {
-            cparams.n_ctx = 512;
-        }
         cparams.n_batch = getPropertyAsInt(runtime, params, "n_batch", cparams.n_batch);
         cparams.n_ubatch = getPropertyAsInt(runtime, params, "n_ubatch", cparams.n_ubatch);
         cparams.n_parallel = getPropertyAsInt(runtime, params, "n_parallel", cparams.n_parallel);
         cparams.cpuparams.n_threads = getPropertyAsInt(runtime, params, "n_threads", cparams.cpuparams.n_threads);
+        // Kalsa: prefill/batch threads (llama.cpp cpuparams_batch). Decode affinity
+        // (set_best_cores below) stays on cpuparams only — batch is used verbatim.
+        cparams.cpuparams_batch.n_threads = getPropertyAsInt(runtime, params, "n_threads_batch", cparams.cpuparams_batch.n_threads);
 
         std::string cpuMask = getPropertyAsString(runtime, params, "cpu_mask");
 #if defined(__ANDROID__)
@@ -355,22 +353,50 @@ namespace rnllama_jsi {
             cparams.chat_template = chatTemplate;
         }
 
-        bool useMmap = cparams.load_mode == LLAMA_LOAD_MODE_MMAP ||
-            cparams.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
-        bool useMlock = cparams.load_mode == LLAMA_LOAD_MODE_MLOCK ||
-            cparams.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
-        useMlock = getPropertyAsBool(runtime, params, "use_mlock", useMlock);
-        useMmap = getPropertyAsBool(runtime, params, "use_mmap", useMmap);
-        if (useMmap && useMlock) {
-            cparams.load_mode = LLAMA_LOAD_MODE_MMAP_MLOCK;
-        } else if (useMmap) {
-            cparams.load_mode = LLAMA_LOAD_MODE_MMAP;
-        } else if (useMlock) {
-            cparams.load_mode = LLAMA_LOAD_MODE_MLOCK;
-        } else {
-            cparams.load_mode = LLAMA_LOAD_MODE_NONE;
-        }
+        // Kalsa: kalsallama predates load_mode/LLAMA_LOAD_MODE_*; it exposes the
+        // equivalent boolean pair use_mmap/use_mlock instead.
+        cparams.use_mmap = getPropertyAsBool(runtime, params, "use_mmap", cparams.use_mmap);
+        cparams.use_mlock = getPropertyAsBool(runtime, params, "use_mlock", cparams.use_mlock);
         cparams.no_extra_bufts = getPropertyAsBool(runtime, params, "no_extra_bufts", cparams.no_extra_bufts);
+
+        if (params.hasProperty(runtime, "moe_stream")) {
+            auto moeValue = params.getProperty(runtime, "moe_stream");
+            if (moeValue.isObject()) {
+                const auto moe = moeValue.asObject(runtime);
+                cparams.kalsa_moe.enabled = getPropertyAsBool(
+                    runtime, moe, "enabled", cparams.kalsa_moe.enabled);
+                cparams.kalsa_moe.cache_mb = getPropertyAsInt(
+                    runtime, moe, "cache_mb", cparams.kalsa_moe.cache_mb);
+                cparams.kalsa_moe.cache_auto = getPropertyAsBool(
+                    runtime, moe, "cache_auto", cparams.kalsa_moe.cache_auto);
+                cparams.kalsa_moe.cache_floor_mb = getPropertyAsInt(
+                    runtime, moe, "cache_floor_mb", cparams.kalsa_moe.cache_floor_mb);
+                cparams.kalsa_moe.cache_ceil_mb = getPropertyAsInt(
+                    runtime, moe, "cache_ceil_mb", cparams.kalsa_moe.cache_ceil_mb);
+                cparams.kalsa_moe.io_threads = getPropertyAsInt(
+                    runtime, moe, "io_threads", cparams.kalsa_moe.io_threads);
+                cparams.kalsa_moe.overlap = getPropertyAsBool(
+                    runtime, moe, "overlap", cparams.kalsa_moe.overlap);
+                const std::string denseWeights = getPropertyAsString(
+                    runtime, moe, "dense_weights", cparams.kalsa_moe.dense_weights);
+                const size_t denseWeightsLength = std::min(
+                    denseWeights.size(), sizeof(cparams.kalsa_moe.dense_weights) - 1);
+                std::fill(
+                    std::begin(cparams.kalsa_moe.dense_weights),
+                    std::end(cparams.kalsa_moe.dense_weights),
+                    '\0');
+                std::copy_n(
+                    denseWeights.data(),
+                    denseWeightsLength,
+                    cparams.kalsa_moe.dense_weights);
+                cparams.kalsa_moe.n_expert_used = getPropertyAsInt(
+                    runtime, moe, "n_expert_used", cparams.kalsa_moe.n_expert_used);
+                cparams.kalsa_moe.drop_cold_frac = getPropertyAsFloat(
+                    runtime, moe, "drop_cold_frac", cparams.kalsa_moe.drop_cold_frac);
+                cparams.kalsa_moe.drop_no_renorm = getPropertyAsBool(
+                    runtime, moe, "drop_no_renorm", cparams.kalsa_moe.drop_no_renorm);
+            }
+        }
 
         if (params.hasProperty(runtime, "flash_attn")) {
             bool fa = getPropertyAsBool(runtime, params, "flash_attn", false);
@@ -505,10 +531,54 @@ namespace rnllama_jsi {
         // Grammar
         sparams.grammar = {};
         sparams.generation_prompt.clear();
+        ctx->completion->bench_raw_probs =
+            std::max(0, getPropertyAsInt(runtime, params, "bench_raw_probs", 0));
+        ctx->completion->bench_force_ids.clear();
+        ctx->completion->bench_force_index = 0;
+        ctx->completion->bench_force_ids_enabled = false;
+        if (params.hasProperty(runtime, "bench_force_ids")) {
+            const auto forceValue = params.getProperty(runtime, "bench_force_ids");
+            bool valid = forceValue.isObject();
+            if (valid) {
+                const auto forceObject = forceValue.asObject(runtime);
+                valid = forceObject.isArray(runtime);
+                if (valid) {
+                    const auto forceIds = forceObject.asArray(runtime);
+                    const llama_model * model = ctx->model;
+                    const llama_vocab * vocab = model != nullptr
+                        ? llama_model_get_vocab(model) : nullptr;
+                    const int32_t n_vocab = vocab != nullptr
+                        ? llama_vocab_n_tokens(vocab) : 0;
+                    valid = n_vocab > 0;
+                    for (size_t i = 0; valid && i < forceIds.size(runtime); ++i) {
+                        const auto value = forceIds.getValueAtIndex(runtime, i);
+                        if (!value.isNumber()) {
+                            valid = false;
+                            break;
+                        }
+                        const double id = value.asNumber();
+                        if (!std::isfinite(id) || std::floor(id) != id || id < 0 ||
+                            id >= (double)n_vocab) {
+                            valid = false;
+                            break;
+                        }
+                        ctx->completion->bench_force_ids.push_back((llama_token)id);
+                    }
+                }
+            }
+            // Keep a malformed or empty list in the forced state so the
+            // pre-registered exhaustion behavior stops this completion cleanly.
+            ctx->completion->bench_force_ids_enabled = true;
+            if (!valid) {
+                ctx->completion->bench_force_ids.clear();
+            }
+        }
         sparams.grammar_triggers.clear();
         sparams.preserved_tokens.clear();
         sparams.reasoning_budget_tokens = -1;
-        sparams.reasoning_budget_activate_immediately = false;
+        // Kalsa: kalsallama has no reasoning_budget_activate_immediately; reasoning_control
+        // is its boolean knob to activate the budget sampler regardless of token budget.
+        sparams.reasoning_control = false;
         sparams.reasoning_budget_start.clear();
         sparams.reasoning_budget_end.clear();
         sparams.reasoning_budget_forced.clear();
@@ -534,19 +604,21 @@ namespace rnllama_jsi {
 
                 if (!thinkingStartTag.empty()) {
                     sparams.reasoning_budget_start = common_tokenize(
-                        ctx->ctx, thinkingStartTag, /* add_special= */ false, /* parse_special= */ true);
+                        ctx->active_ctx(), thinkingStartTag, /* add_special= */ false, /* parse_special= */ true);
                 }
                 auto reasoningBudgetEnd = common_tokenize(
-                    ctx->ctx, thinkingEndTag, /* add_special= */ false, /* parse_special= */ true);
+                        ctx->active_ctx(), thinkingEndTag, /* add_special= */ false, /* parse_special= */ true);
                 if (!reasoningBudgetEnd.empty()) {
-                    sparams.reasoning_budget_end.push_back(std::move(reasoningBudgetEnd));
+                    // Kalsa: reasoning_budget_end is a flat token vector in kalsallama.
+                    sparams.reasoning_budget_end.insert(sparams.reasoning_budget_end.end(),
+                        reasoningBudgetEnd.begin(), reasoningBudgetEnd.end());
                 }
                 sparams.reasoning_budget_forced = common_tokenize(
-                    ctx->ctx, thinkingBudgetMessage + thinkingEndTag, /* add_special= */ false, /* parse_special= */ true);
+                        ctx->active_ctx(), thinkingBudgetMessage + thinkingEndTag, /* add_special= */ false, /* parse_special= */ true);
 
                 if (!sparams.reasoning_budget_end.empty() && !sparams.reasoning_budget_forced.empty()) {
                     sparams.reasoning_budget_tokens = thinkingBudgetTokens;
-                    sparams.reasoning_budget_activate_immediately = getPropertyAsBool(
+                    sparams.reasoning_control = getPropertyAsBool(
                         runtime, params, "thinking_forced_open", false);
                 } else {
                     sparams.reasoning_budget_start.clear();
@@ -568,7 +640,7 @@ namespace rnllama_jsi {
                         continue;
                     }
                     std::string tokenStr = tokenVal.asString(runtime).utf8(runtime);
-                    auto ids = common_tokenize(ctx->ctx, tokenStr.c_str(), /* add_special= */ false, /* parse_special= */ true);
+                    auto ids = common_tokenize(ctx->active_ctx(), tokenStr.c_str(), /* add_special= */ false, /* parse_special= */ true);
                     if (ids.size() == 1) {
                         sparams.preserved_tokens.insert(ids[0]);
                     }
@@ -593,7 +665,7 @@ namespace rnllama_jsi {
                     }
 
                     if (type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD) {
-                        auto ids = common_tokenize(ctx->ctx, word.c_str(), /* add_special= */ false, /* parse_special= */ true);
+                            auto ids = common_tokenize(ctx->active_ctx(), word.c_str(), /* add_special= */ false, /* parse_special= */ true);
                         if (ids.size() == 1) {
                             const llama_token token = ids[0];
                             if (sparams.preserved_tokens.find(token) == sparams.preserved_tokens.end()) {
@@ -622,7 +694,7 @@ namespace rnllama_jsi {
 
         // Logit bias
         sparams.logit_bias.clear();
-        const llama_model * model = llama_get_model(ctx->ctx);
+        const llama_model * model = llama_get_model(ctx->active_ctx());
         const llama_vocab * vocab = llama_model_get_vocab(model);
 
         if (ctx->params.sampling.ignore_eos) {
@@ -666,5 +738,9 @@ namespace rnllama_jsi {
             ctx->params.cpuparams.n_threads = nThreads > 0 ? nThreads : defaultNThreads;
         }
 #endif
+        // Kalsa: completion-path re-read of prefill/batch threads (verbatim).
+        if (params.hasProperty(runtime, "n_threads_batch")) {
+            ctx->params.cpuparams_batch.n_threads = getPropertyAsInt(runtime, params, "n_threads_batch", ctx->params.cpuparams_batch.n_threads);
+        }
     }
 }

@@ -1,10 +1,12 @@
-import type { NativeContextParams, NativeCompletionParams, NativeParallelCompletionParams, NativeCompletionResult, NativeTokenizeResult, NativeEmbeddingResult, NativeSessionLoadResult, NativeRerankResult, JinjaFormattedChatResult, ParallelStatus } from './types';
+import type { NativeContextParams, NativeCompletionParams, NativeParallelCompletionParams, NativeCompletionResult, NativeTokenizeResult, NativeEmbeddingResult, NativeSessionLoadResult, NativeRerankResult, JinjaFormattedChatResult, ParallelStatus, GovernorThermoProfile, GovernorStats } from './types';
 declare global {
     var llamaInitContext: (contextId: number, params: NativeContextParams, onProgress?: (progress: number) => void) => Promise<any>;
     var llamaReleaseContext: (contextId: number) => Promise<void>;
     var llamaReleaseAllContexts: () => Promise<void>;
     var llamaModelInfo: (path: string, skip: string[]) => Promise<object>;
     var llamaGetBackendDevicesInfo: () => Promise<string>;
+    var llamaSetGovernorThermo: (contextId: number, profile: GovernorThermoProfile) => Promise<boolean>;
+    var llamaGetGovernorStats: (contextId: number) => Promise<GovernorStats>;
     var llamaLoadSession: (contextId: number, path: string) => Promise<NativeSessionLoadResult>;
     var llamaSaveSession: (contextId: number, path: string, size: number) => Promise<number>;
     var llamaTokenize: (contextId: number, text: string, mediaPaths?: string[]) => Promise<NativeTokenizeResult>;

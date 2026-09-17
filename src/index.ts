@@ -11,6 +11,8 @@ import type {
   NativeTokenizeResult,
   NativeEmbeddingResult,
   NativeSessionLoadResult,
+  GovernorThermoProfile,
+  GovernorStats,
   NativeEmbeddingParams,
   NativeRerankParams,
   NativeRerankResult,
@@ -58,6 +60,8 @@ export type {
   NativeTokenizeResult,
   NativeEmbeddingResult,
   NativeSessionLoadResult,
+  GovernorThermoProfile,
+  GovernorStats,
   NativeEmbeddingParams,
   NativeRerankParams,
   NativeRerankResult,
@@ -87,6 +91,8 @@ const jsiBindingKeys = [
   'llamaReleaseAllContexts',
   'llamaModelInfo',
   'llamaGetBackendDevicesInfo',
+  'llamaSetGovernorThermo',
+  'llamaGetGovernorStats',
   'llamaLoadSession',
   'llamaSaveSession',
   'llamaTokenize',
@@ -182,6 +188,9 @@ export type ToolCall = {
 
 export type TokenData = {
   token: string
+  tok?: number
+  forced?: boolean
+  raw_probs?: Array<[number, number]>
   completion_probabilities?: Array<NativeCompletionTokenProb>
   // Parsed content from accumulated text
   content?: string
@@ -652,6 +661,16 @@ export class LlamaContext {
   ): Promise<number> {
     const { llamaSaveSession } = getJsi()
     return llamaSaveSession(this.id, filepath, options?.tokenSize || -1)
+  }
+
+  async setGovernorThermo(profile: GovernorThermoProfile): Promise<boolean> {
+    const { llamaSetGovernorThermo } = getJsi()
+    return llamaSetGovernorThermo(this.id, profile)
+  }
+
+  async getGovernorStats(): Promise<GovernorStats> {
+    const { llamaGetGovernorStats } = getJsi()
+    return llamaGetGovernorStats(this.id)
   }
 
   isLlamaChatSupported(): boolean {

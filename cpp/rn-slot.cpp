@@ -175,8 +175,8 @@ void llama_rn_slot::load_prompt(const std::vector<llama_token>& tokens) {
 
     // Check if model is recurrent/hybrid - needs special handling for state reuse
     bool is_recurrent_or_hybrid = false;
-    if (parent_ctx && parent_ctx->ctx) {
-        const llama_model * model = llama_get_model(parent_ctx->ctx);
+    if (parent_ctx && parent_ctx->active_ctx()) {
+        const llama_model * model = llama_get_model(parent_ctx->active_ctx());
         is_recurrent_or_hybrid = llama_model_is_recurrent(model) || llama_model_is_hybrid(model);
     }
 
@@ -243,8 +243,8 @@ void llama_rn_slot::load_prompt(const std::vector<llama_token>& tokens) {
             n_prompt_tokens_cache = 0;
 
             // Clear KV cache for this slot's sequence
-            if (parent_ctx && parent_ctx->ctx) {
-                auto * kv = llama_get_memory(parent_ctx->ctx);
+            if (parent_ctx && parent_ctx->active_ctx()) {
+                auto * kv = llama_get_memory(parent_ctx->active_ctx());
                 llama_memory_seq_rm(kv, id, 0, -1);
                 LOG_VERBOSE("Slot %d: Cleared KV cache for sequence", id);
             }
@@ -258,8 +258,8 @@ void llama_rn_slot::load_prompt(const std::vector<llama_token>& tokens) {
         n_prompt_tokens_cache = 0;
 
         // Clear KV cache for this slot's sequence to ensure clean state
-        if (parent_ctx && parent_ctx->ctx) {
-            auto * kv = llama_get_memory(parent_ctx->ctx);
+        if (parent_ctx && parent_ctx->active_ctx()) {
+            auto * kv = llama_get_memory(parent_ctx->active_ctx());
             llama_memory_seq_rm(kv, id, 0, -1);
             LOG_VERBOSE("Slot %d: Cleared KV cache for sequence", id);
         }
@@ -331,12 +331,18 @@ completion_token_output llama_rn_slot::get_next_token() {
 }
 
 bool llama_rn_slot::should_use_mtp() const {
+    if (parent_ctx != nullptr && parent_ctx->hasGovernor()) {
+        return false;
+    }
     if (params == nullptr || params->speculative.draft.n_max <= 0) {
         return false;
     }
 
+    // Kalsa patch: keep the slot path consistent with shouldUseMTP — DFLASH
+    // uses the same draft-speculative machinery as MTP.
     const auto & types = params->speculative.types;
-    return std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end();
+    return std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end() ||
+           std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != types.end();
 }
 
 void llama_rn_slot::reset_speculative() {
@@ -369,7 +375,7 @@ void llama_rn_slot::init_mtp() {
     if (!should_use_mtp() || spec != nullptr) {
         return;
     }
-    if (parent_ctx == nullptr || parent_ctx->ctx == nullptr || parent_ctx->model == nullptr) {
+    if (parent_ctx == nullptr || parent_ctx->active_ctx() == nullptr || parent_ctx->model == nullptr) {
         throw std::runtime_error("MTP speculative decoding requires an initialized context");
     }
     if (llama_model_has_encoder(parent_ctx->model)) {
@@ -387,7 +393,7 @@ void llama_rn_slot::init_mtp() {
 
     const auto n_mtp = params->speculative.draft.n_max;
     if ((llama_model_is_recurrent(parent_ctx->model) || llama_model_is_hybrid(parent_ctx->model)) &&
-        llama_n_rs_seq(parent_ctx->ctx) < (uint32_t) n_mtp) {
+        llama_n_rs_seq(parent_ctx->active_ctx()) < (uint32_t) n_mtp) {
         throw std::runtime_error(
             "MTP for recurrent or hybrid models must be enabled when loading the model "
             "with speculative.type='draft-mtp' and speculative.n_max/spec_draft_n_max set");
@@ -405,7 +411,7 @@ void llama_rn_slot::init_mtp() {
             throw std::runtime_error("failed to create MTP draft context");
         }
 
-        params->speculative.draft.ctx_tgt = parent_ctx->ctx;
+        params->speculative.draft.ctx_tgt = parent_ctx->active_ctx();
         params->speculative.draft.ctx_dft = spec_ctx;
 
         const uint32_t n_seq = std::max<uint32_t>(
@@ -417,10 +423,10 @@ void llama_rn_slot::init_mtp() {
         }
     }
 
-    spec_batch = llama_batch_init(llama_n_batch(parent_ctx->ctx), 0, 1);
+    spec_batch = llama_batch_init(llama_n_batch(parent_ctx->active_ctx()), 0, 1);
     spec_batch_initialized = true;
 
-    common_context_seq_rm(parent_ctx->ctx, id, -1, -1);
+    common_context_seq_rm(parent_ctx->active_ctx(), id, -1, -1);
     common_context_seq_rm(spec_ctx, id, -1, -1);
     n_past = 0;
 
@@ -446,7 +452,7 @@ void llama_rn_slot::eval_mtp_prompt() {
         spec_prompt.assign(prompt_tokens.begin(), prompt_tokens.end() - 1);
     }
 
-    const int32_t n_batch = std::max<int32_t>(1, llama_n_batch(parent_ctx->ctx));
+    const int32_t n_batch = std::max<int32_t>(1, llama_n_batch(parent_ctx->active_ctx()));
     size_t offset = 0;
 
     while (offset < spec_prompt.size()) {
@@ -459,7 +465,7 @@ void llama_rn_slot::eval_mtp_prompt() {
                              (llama_pos) (offset + i), { seq_id }, needs_logits);
         }
 
-        const int ret = llama_decode(parent_ctx->ctx, spec_batch);
+        const int ret = parent_ctx->decode(spec_batch);
         if (ret != 0) {
             throw std::runtime_error("failed to evaluate MTP prompt batch, ret=" + std::to_string(ret));
         }
@@ -501,7 +507,7 @@ bool llama_rn_slot::refill_mtp_tokens() {
         ? params->speculative.draft.n_max
         : std::max<int32_t>(0, remaining - 1);
     const int32_t n_draft_ctx = std::max<int32_t>(0, n_ctx - (int32_t) spec_n_past - 1);
-    const int32_t n_draft_batch = std::max<int32_t>(0, llama_n_batch(parent_ctx->ctx) - 1);
+    const int32_t n_draft_batch = std::max<int32_t>(0, llama_n_batch(parent_ctx->active_ctx()) - 1);
     const int32_t n_draft_limit = std::min<int32_t>(
         params->speculative.draft.n_max,
         std::min<int32_t>(n_draft_remaining, std::min<int32_t>(n_draft_ctx, n_draft_batch)));
@@ -534,7 +540,7 @@ bool llama_rn_slot::refill_mtp_tokens() {
                          spec_n_past + (llama_pos) i + 1, { seq_id }, true);
     }
 
-    const int ret = llama_decode(parent_ctx->ctx, spec_batch);
+        const int ret = parent_ctx->decode(spec_batch);
     if (ret != 0) {
         throw std::runtime_error("failed to evaluate MTP target batch, ret=" + std::to_string(ret));
     }
@@ -542,7 +548,7 @@ bool llama_rn_slot::refill_mtp_tokens() {
         throw std::runtime_error("failed to process MTP target batch");
     }
 
-    auto accepted = common_sampler_sample_and_accept_n(ctx_sampling, parent_ctx->ctx, spec_draft);
+    auto accepted = common_sampler_sample_and_accept_n(ctx_sampling, parent_ctx->active_ctx(), spec_draft);
     if (accepted.empty()) {
         return false;
     }
@@ -577,7 +583,7 @@ bool llama_rn_slot::refill_mtp_tokens() {
     spec_n_past += (llama_pos) accepted_count;
     n_past = spec_n_past;
 
-    common_context_seq_rm(parent_ctx->ctx, seq_id, spec_n_past, -1);
+    common_context_seq_rm(parent_ctx->active_ctx(), seq_id, spec_n_past, -1);
     common_context_seq_rm(spec_ctx, seq_id, spec_n_past, -1);
 
     if (saw_eos) {
@@ -601,7 +607,7 @@ completion_token_output llama_rn_slot::next_token_mtp() {
     }
 
     result.tok = spec_pending_tokens.front();
-    result.text = common_token_to_piece(parent_ctx->ctx, result.tok);
+    result.text = common_token_to_piece(parent_ctx->active_ctx(), result.tok);
     spec_pending_tokens.pop_front();
     result.request_id = request_id;
     num_tokens_predicted++;
@@ -657,18 +663,18 @@ slot_timings llama_rn_slot::get_timings() const {
 }
 
 llama_pos llama_rn_slot::reconcile_memory_to(llama_pos n_keep, bool tokens_have_media) {
-    if (!parent_ctx || !parent_ctx->ctx) {
+    if (!parent_ctx || !parent_ctx->active_ctx()) {
         return 0;
     }
 
-    auto * kv = llama_get_memory(parent_ctx->ctx);
+    auto * kv = llama_get_memory(parent_ctx->active_ctx());
 
     if (n_keep <= 0) {
         llama_memory_seq_rm(kv, id, 0, -1);
         return 0;
     }
 
-    const llama_model * mdl = llama_get_model(parent_ctx->ctx);
+    const llama_model * mdl = llama_get_model(parent_ctx->active_ctx());
     // M-RoPE media prefixes hold fewer time positions than placeholder tokens,
     // so the frontier may legitimately sit below n_keep - but only when the
     // token list actually holds media; for a text-only list a lagging frontier
@@ -741,13 +747,13 @@ llama_pos llama_rn_slot::reconcile_memory_to(llama_pos n_keep, bool tokens_have_
 
 // Load state into this slot's sequence
 bool llama_rn_slot::load_state() {
-    if (!parent_ctx || !parent_ctx->ctx) {
+    if (!parent_ctx || !parent_ctx->active_ctx()) {
         LOG_ERROR("Slot %d: Cannot load state - context not initialized", id);
         return false;
     }
 
 #ifdef LM_GGML_USE_OPENCL
-    const auto &model_devices = parent_ctx->llama_init->model()->devices;
+    const auto &model_devices = parent_ctx->model->devices;
     auto has_opencl = false;
     for (const auto &dev_info : model_devices) {
         auto dev = dev_info.dev;
@@ -780,7 +786,7 @@ bool llama_rn_slot::load_state() {
     // Start timing
     const int64_t t_load_start = lm_ggml_time_us();
 
-    const llama_model * model = llama_get_model(parent_ctx->ctx);
+    const llama_model * model = llama_get_model(parent_ctx->active_ctx());
     const bool is_recurrent_or_hybrid = llama_model_is_recurrent(model) || llama_model_is_hybrid(model);
 
     // Get size needed for token output buffer
@@ -788,7 +794,7 @@ bool llama_rn_slot::load_state() {
     size_t n_token_count_out = 0;
 
     size_t nread = llama_state_seq_load_file(
-        parent_ctx->ctx,
+        parent_ctx->active_ctx(),
         load_state_path.c_str(),
         id,
         state_tokens.data(),
@@ -853,13 +859,13 @@ bool llama_rn_slot::load_state() {
 
 // Save prompt checkpoint
 bool llama_rn_slot::save_prompt_state_checkpoint() {
-    if (!parent_ctx || !parent_ctx->ctx) {
+    if (!parent_ctx || !parent_ctx->active_ctx()) {
         LOG_ERROR("Slot %d: Cannot save prompt checkpoint - context not initialized", id);
         return false;
     }
 
 #ifdef LM_GGML_USE_OPENCL
-    const auto &model_devices = parent_ctx->llama_init->model()->devices;
+    const auto &model_devices = parent_ctx->model->devices;
     auto has_opencl = false;
     for (const auto &dev_info : model_devices) {
         auto dev = dev_info.dev;
@@ -920,8 +926,8 @@ bool llama_rn_slot::save_prompt_state_checkpoint() {
     const char * cache_v = lm_ggml_type_name(parent_ctx->params.cache_type_v);
     llama_pos pos_min = -1;
     llama_pos pos_max = -1;
-    if (parent_ctx && parent_ctx->ctx) {
-        auto * kv = llama_get_memory(parent_ctx->ctx);
+    if (parent_ctx && parent_ctx->active_ctx()) {
+        auto * kv = llama_get_memory(parent_ctx->active_ctx());
         if (kv != nullptr) {
             pos_min = llama_memory_seq_pos_min(kv, id);
             pos_max = llama_memory_seq_pos_max(kv, id);
@@ -944,7 +950,7 @@ bool llama_rn_slot::save_prompt_state_checkpoint() {
     write_state_meta(save_prompt_state_path, {});
 
     size_t nwrite = llama_state_seq_save_file(
-        parent_ctx->ctx,
+        parent_ctx->active_ctx(),
         save_prompt_state_path.c_str(),
         id,
         state_tokens.data(),
@@ -975,14 +981,14 @@ bool llama_rn_slot::save_prompt_state_checkpoint() {
 
 // Save state from this slot's sequence
 bool llama_rn_slot::save_state() {
-    if (!parent_ctx || !parent_ctx->ctx) {
+    if (!parent_ctx || !parent_ctx->active_ctx()) {
         LOG_ERROR("Slot %d: Cannot save state - context not initialized", id);
         return false;
     }
 
 
 #ifdef LM_GGML_USE_OPENCL
-    const auto &model_devices = parent_ctx->llama_init->model()->devices;
+    const auto &model_devices = parent_ctx->model->devices;
     auto has_opencl = false;
     for (const auto &dev_info : model_devices) {
         auto dev = dev_info.dev;
@@ -1016,7 +1022,7 @@ bool llama_rn_slot::save_state() {
     const int64_t t_save_start = lm_ggml_time_us();
 
     // Check if model is recurrent/hybrid for save behavior
-    const llama_model * model = llama_get_model(parent_ctx->ctx);
+    const llama_model * model = llama_get_model(parent_ctx->active_ctx());
     const bool is_recurrent_or_hybrid = llama_model_is_recurrent(model) || llama_model_is_hybrid(model);
 
     // Get tokens for this state (cache_tokens represents all processed tokens
@@ -1034,7 +1040,7 @@ bool llama_rn_slot::save_state() {
         std::find(state_tokens.begin(), state_tokens.end(),
                   LLAMA_TOKEN_NULL) != state_tokens.end();
     if (!mrope_media) {
-        auto * kv = llama_get_memory(parent_ctx->ctx);
+        auto * kv = llama_get_memory(parent_ctx->active_ctx());
         const size_t decoded_count =
             (size_t) std::max<llama_pos>(0, llama_memory_seq_pos_max(kv, id) + 1);
         if (state_tokens.size() > decoded_count) {
@@ -1082,7 +1088,7 @@ bool llama_rn_slot::save_state() {
     write_state_meta(save_state_path, {});
 
     size_t nwrite = llama_state_seq_save_file(
-        parent_ctx->ctx,
+        parent_ctx->active_ctx(),
         save_state_path.c_str(),
         id,
         state_tokens.data(),
@@ -1093,8 +1099,8 @@ bool llama_rn_slot::save_state() {
     const char * cache_v = lm_ggml_type_name(parent_ctx->params.cache_type_v);
     llama_pos pos_min = -1;
     llama_pos pos_max = -1;
-    if (parent_ctx && parent_ctx->ctx) {
-        auto * kv = llama_get_memory(parent_ctx->ctx);
+    if (parent_ctx && parent_ctx->active_ctx()) {
+        auto * kv = llama_get_memory(parent_ctx->active_ctx());
         if (kv != nullptr) {
             pos_min = llama_memory_seq_pos_min(kv, id);
             pos_max = llama_memory_seq_pos_max(kv, id);

@@ -9,6 +9,8 @@
 #include "JSIRequestManager.h"
 #include "JSITaskManager.h"
 #include "JSINativeHeaders.h"
+#include "rn-governor-params.h"
+#include "llama-ext.h"
 
 #include <algorithm>
 #include <atomic>
@@ -26,6 +28,48 @@
 
 using namespace facebook;
 using json = nlohmann::ordered_json;
+
+static llama_governor_thermo_profile governorThermoFromJsi(
+        jsi::Runtime & runtime, const jsi::Object & object) {
+    llama_governor_thermo_profile profile{};
+    profile.batt_temp_tenths_c = rnllama_jsi::getPropertyAsInt(
+        runtime, object, "batt_temp_tenths_c", 0);
+    profile.batt_level_pct = rnllama_jsi::getPropertyAsInt(
+        runtime, object, "batt_level_pct", 100);
+    profile.plugged = rnllama_jsi::getPropertyAsBool(runtime, object, "plugged", false);
+    profile.sensor_valid = rnllama_jsi::getPropertyAsBool(
+        runtime, object, "sensor_valid", false);
+    profile.t_idle_valid = rnllama_jsi::getPropertyAsBool(
+        runtime, object, "t_idle_valid", false);
+    profile.t_idle_c = rnllama_jsi::getPropertyAsFloat(
+        runtime, object, "t_idle_c", 0.0f);
+    profile.trend_c_per_min = rnllama_jsi::getPropertyAsFloat(
+        runtime, object, "trend_c_per_min", 0.0f);
+    return profile;
+}
+
+static const char * governorEngineName(llama_governor_engine engine) {
+    switch (engine) {
+        case llama_governor_engine::CPU: return "CPU";
+        case llama_governor_engine::GPU:
+        case llama_governor_engine::GPU_COOLMODE: return "GPU";
+        case llama_governor_engine::NPU: return "NPU";
+    }
+    return "Unknown";
+}
+
+static const char * governorThermalStateName(llama_governor_thermal_state state) {
+    switch (state) {
+        case llama_governor_thermal_state::Unknown: return "Unknown";
+        case llama_governor_thermal_state::FAST: return "FAST";
+        case llama_governor_thermal_state::WARM: return "WARM";
+        case llama_governor_thermal_state::COOLMODE: return "COOLMODE";
+        case llama_governor_thermal_state::CRITICAL: return "CRITICAL";
+        case llama_governor_thermal_state::LOWBAT: return "LOWBAT";
+        case llama_governor_thermal_state::Invalid: return "Invalid";
+    }
+    return "Unknown";
+}
 
 // Consolidated logging function
 enum class LogLevel { LOG_DEBUG, LOG_INFO, LOG_ERROR };
@@ -191,6 +235,62 @@ namespace rnllama_jsi {
         }
     }
 
+    static json jsiToGovernorJson(jsi::Runtime& runtime, const jsi::Value& value) {
+        if (value.isNull() || value.isUndefined()) {
+            return nullptr;
+        }
+        if (value.isBool()) {
+            return value.getBool();
+        }
+        if (value.isNumber()) {
+            return value.asNumber();
+        }
+        if (value.isString()) {
+            return value.asString(runtime).utf8(runtime);
+        }
+        if (!value.isObject()) {
+            throw std::invalid_argument("Governor values must be JSON-compatible");
+        }
+
+        const auto object = value.asObject(runtime);
+        if (object.isArray(runtime)) {
+            const auto array = object.asArray(runtime);
+            json result = json::array();
+            for (size_t i = 0; i < array.size(runtime); ++i) {
+                result.push_back(jsiToGovernorJson(runtime, array.getValueAtIndex(runtime, i)));
+            }
+            return result;
+        }
+
+        json result = json::object();
+        const auto names = object.getPropertyNames(runtime);
+        for (size_t i = 0; i < names.size(runtime); ++i) {
+            const auto name = names.getValueAtIndex(runtime, i).asString(runtime).utf8(runtime);
+            result[name] = jsiToGovernorJson(runtime, object.getProperty(runtime, name.c_str()));
+        }
+        return result;
+    }
+
+    static bool parseGovernorLoadParams(
+        jsi::Runtime& runtime, const jsi::Object& params,
+        llama_governor_params& result,
+        llama_governor_thermo_profile& thermo) {
+        if (!params.hasProperty(runtime, "governor")) {
+            return false;
+        }
+        const json governor = jsiToGovernorJson(runtime, params.getProperty(runtime, "governor"));
+        return rnllama::parse_governor_params(governor, result, thermo);
+    }
+
+    static llama_governor_thermo_profile parseGovernorThermo(
+        jsi::Runtime& runtime, const jsi::Object& params) {
+        if (!params.hasProperty(runtime, "governor_thermo")) {
+            throw std::invalid_argument("governor_thermo is required in governor mode");
+        }
+        return rnllama::parse_governor_thermo(jsiToGovernorJson(
+            runtime, params.getProperty(runtime, "governor_thermo")));
+    }
+
     static void ensureBackendInitialized() {
         std::call_once(backend_init_once, []() {
             llama_backend_init();
@@ -253,10 +353,9 @@ namespace rnllama_jsi {
             return false;
         }
 
-        for (const auto& endTag : chatParams.thinking_end_tags) {
-            if (endTag.empty()) {
-                continue;
-            }
+        // Kalsa: kalsallama's common_chat_params has a single thinking_end_tag, not a list.
+        const std::string& endTag = chatParams.thinking_end_tag;
+        if (!endTag.empty()) {
             const size_t lastEnd = chatParams.generation_prompt.rfind(endTag);
             if (lastEnd != std::string::npos && lastEnd >= lastStart) {
                 return false;
@@ -298,13 +397,22 @@ namespace rnllama_jsi {
         bool jinjaDefault = ctx->validateModelChatTemplate(true, nullptr);
         jinja.setProperty(runtime, "default", jinjaDefault);
 
+        // Kalsa: the kalsallama fork has no common_chat_templates_has_variant() and its
+        // common_chat_templates_get_caps() takes no variant argument: it returns a
+        // std::map<std::string, bool> with the caps of the most expressive template
+        // available (tool_use when present, else default) — the same template selection
+        // made at apply time for tool-enabled chats. Per-variant queries don't exist.
+        std::map<std::string, bool> capsMap;
+        if (ctx->templates) {
+            capsMap = common_chat_templates_get_caps(ctx->templates.get());
+        }
+
         jsi::Object defaultCaps(runtime);
-        if (ctx->templates && common_chat_templates_has_variant(ctx->templates.get(), "")) {
-            auto caps = common_chat_templates_get_caps(ctx->templates.get(), "");
-            defaultCaps.setProperty(runtime, "tools", caps.supports_tools);
-            defaultCaps.setProperty(runtime, "toolCalls", caps.supports_tool_calls);
-            defaultCaps.setProperty(runtime, "parallelToolCalls", caps.supports_parallel_tool_calls);
-            defaultCaps.setProperty(runtime, "systemRole", caps.supports_system_role);
+        if (ctx->templates) {
+            defaultCaps.setProperty(runtime, "tools", capsMap.at("supports_tools"));
+            defaultCaps.setProperty(runtime, "toolCalls", capsMap.at("supports_tool_calls"));
+            defaultCaps.setProperty(runtime, "parallelToolCalls", capsMap.at("supports_parallel_tool_calls"));
+            defaultCaps.setProperty(runtime, "systemRole", capsMap.at("supports_system_role"));
         } else {
             defaultCaps.setProperty(runtime, "tools", false);
             defaultCaps.setProperty(runtime, "toolCalls", false);
@@ -315,13 +423,15 @@ namespace rnllama_jsi {
 
         bool toolUseSupported = ctx->validateModelChatTemplate(true, "tool_use");
         jinja.setProperty(runtime, "toolUse", toolUseSupported);
-        if (ctx->templates && common_chat_templates_has_variant(ctx->templates.get(), "tool_use")) {
-            auto caps = common_chat_templates_get_caps(ctx->templates.get(), "tool_use");
+        // Kalsa: the fork exposes no per-variant caps. When a tool_use template validates,
+        // get_caps() already reports that variant's caps (it prefers it internally); report
+        // those effective caps here. Otherwise leave toolUseCaps absent (optional in types.ts).
+        if (ctx->templates && toolUseSupported) {
             jsi::Object toolUseCaps(runtime);
-            toolUseCaps.setProperty(runtime, "tools", caps.supports_tools);
-            toolUseCaps.setProperty(runtime, "toolCalls", caps.supports_tool_calls);
-            toolUseCaps.setProperty(runtime, "parallelToolCalls", caps.supports_parallel_tool_calls);
-            toolUseCaps.setProperty(runtime, "systemRole", caps.supports_system_role);
+            toolUseCaps.setProperty(runtime, "tools", capsMap.at("supports_tools"));
+            toolUseCaps.setProperty(runtime, "toolCalls", capsMap.at("supports_tool_calls"));
+            toolUseCaps.setProperty(runtime, "parallelToolCalls", capsMap.at("supports_parallel_tool_calls"));
+            toolUseCaps.setProperty(runtime, "systemRole", capsMap.at("supports_system_role"));
             jinja.setProperty(runtime, "toolUseCaps", toolUseCaps);
         }
 
@@ -516,6 +626,10 @@ namespace rnllama_jsi {
                     getPropertyAsInt(runtime, params, "state_cache_budget_mb", 160);
                 int stateCacheMaxCheckpoints =
                     getPropertyAsInt(runtime, params, "state_cache_max_checkpoints", 8);
+                llama_governor_params governorParams{};
+                llama_governor_thermo_profile governorThermo{};
+                const bool governorEnabled = parseGovernorLoadParams(
+                    runtime, params, governorParams, governorThermo);
 
                 return createPromiseTask(runtime, callInvoker, [
                     contextId,
@@ -526,7 +640,10 @@ namespace rnllama_jsi {
                     useProgressCallback,
                     progressData,
                     stateCacheBudgetMb,
-                    stateCacheMaxCheckpoints
+                    stateCacheMaxCheckpoints,
+                    governorEnabled,
+                    governorParams,
+                    governorThermo
                 ]() mutable -> PromiseResultGenerator {
                     if (isContextLimitReached()) {
                         throw std::runtime_error("Context limit reached");
@@ -551,41 +668,25 @@ namespace rnllama_jsi {
                         skipGpuDevices,
                         anyGpuAvailable
                     );
-
-                    if (useProgressCallback && progressData && progressData->callback) {
-                        cparams.progress_callback = [](float progress, void * user_data) {
-                            auto *data = static_cast<ProgressCallbackData *>(user_data);
-                            if (!data) {
-                                return true;
-                            }
-
-                            int percentage = (int) (progress * 100.0f);
-                            int last = data->lastProgress.load();
-                            if (percentage < 100 && percentage - last < data->progressEvery) {
-                                return true;
-                            }
-                            if (percentage <= last) {
-                                return true;
-                            }
-
-                            data->lastProgress.store(percentage);
-
-                            auto invoker = data->callInvoker.lock();
-                            auto cb = data->callback;
-                            auto runtime = data->runtime;
-                            if (invoker && cb && runtime) {
-                                invoker->invokeAsync([cb, percentage, runtime]() {
-                                    auto& rt = *runtime;
-                                    cb->call(rt, jsi::Value((double) percentage));
-                                });
-                            }
-
-                            return true;
-                        };
-                        cparams.progress_callback_user_data = progressData.get();
+                    if (governorEnabled && !anyGpuAvailable) {
+                        const bool profileValid =
+                            rnllama::governor_thermo_profile_is_valid(governorThermo);
+                        log(LogLevel::LOG_ERROR,
+                            "KALSA_GOVERNOR_FALLBACK {stage:\"accelerator_backend\", models_loaded:0, reason:\"no accelerator backend\", gpu_fit:%d, profile_valid:%d}",
+                            (int) governorParams.gpu_fit, (int) profileValid);
+                        throw std::runtime_error(
+                            "Governor mode requires an available accelerator backend");
                     }
 
-                    auto ctx = new rnllama::llama_rn_context();
+                    // Kalsa: kalsallama's common_params has no progress_callback, so this
+                    // engine cannot deliver load-progress events. Warn once instead of
+                    // wiring a callback that would never fire.
+                    if (useProgressCallback && progressData && progressData->callback) {
+                        log(LogLevel::LOG_INFO,
+                            "progress callbacks unsupported by this llama.cpp build; ignoring");
+                    }
+
+                    auto ctx = std::make_unique<rnllama::llama_rn_context>();
                     // Prompt state cache tuning (multi-turn KV reuse on
                     // recurrent/hybrid/SWA models). Budget in MiB; 0 disables it.
                     {
@@ -593,18 +694,20 @@ namespace rnllama_jsi {
                             stateCacheBudgetMb > 0 ? (size_t) stateCacheBudgetMb * 1024 * 1024 : 0;
                         ctx->state_cache_max_checkpoints = stateCacheMaxCheckpoints;
                     }
-                    if (ctx->loadModel(cparams)) {
+                    if (ctx->loadModel(
+                            cparams,
+                            governorEnabled ? &governorParams : nullptr,
+                            governorEnabled ? &governorThermo : nullptr)) {
                          ctx->attachThreadpoolsIfAvailable();
 
                          if (ctx->params.embedding && llama_model_has_encoder(ctx->model) && llama_model_has_decoder(ctx->model)) {
-                             delete ctx;
                              throw std::runtime_error("Embedding is not supported in encoder-decoder models");
                          }
 
                          std::vector<std::string> usedDevices;
                          bool gpuEnabled = false;
-                         if (ctx->llama_init->model() != nullptr) {
-                             for (const auto & dev_info : ctx->llama_init->model()->devices) {
+                         if (ctx->model != nullptr) {
+                             for (const auto & dev_info : ctx->model->devices) {
                                  auto dev = dev_info.dev;
                                  if (dev == nullptr) continue;
                                  const char* used_name = lm_ggml_backend_dev_name(dev);
@@ -636,9 +739,9 @@ namespace rnllama_jsi {
                              }
                          }
 
-                         addContext(contextId, (long)ctx);
-
                          std::string system_info = common_params_get_system_info(ctx->params);
+                         addContext(contextId, (long)ctx.get());
+                         ctx.release();
 
                          return [gpuEnabled, reasonNoGPU, system_info, usedDevices, contextId](jsi::Runtime& rt) {
                              jsi::Object result(rt);
@@ -663,7 +766,10 @@ namespace rnllama_jsi {
                              return result;
                          };
                     } else {
-                        delete ctx;
+                        if (governorEnabled) {
+                            throw std::runtime_error(
+                                "KALSA_GOVERNOR_FALLBACK: governor load failed; see native log");
+                        }
                         throw std::runtime_error("Failed to load model");
                     }
                 }, contextId);
@@ -710,6 +816,62 @@ namespace rnllama_jsi {
             }
         );
         runtime.global().setProperty(runtime, "llamaGetBackendDevicesInfo", getBackendDevicesInfo);
+
+        auto setGovernorThermo = jsi::Function::createFromHostFunction(runtime,
+            jsi::PropNameID::forAscii(runtime, "llamaSetGovernorThermo"),
+            2,
+            [callInvoker](jsi::Runtime& runtime, const jsi::Value&, const jsi::Value* arguments, size_t count) -> jsi::Value {
+                if (count < 2 || !arguments[1].isObject()) {
+                    throw std::invalid_argument("governor thermo profile is required");
+                }
+                const int contextId = (int) arguments[0].asNumber();
+                const auto profile = governorThermoFromJsi(
+                    runtime, arguments[1].asObject(runtime));
+                return createPromiseTask(runtime, callInvoker,
+                    [contextId, profile]() -> PromiseResultGenerator {
+                        auto ctx = getContextOrThrow(contextId);
+                        throwIfContextBusy(ctx);
+                        if (!ctx->hasGovernor()) {
+                            throw std::runtime_error("Governor mode is not enabled");
+                        }
+                        if (!ctx->setThermoProfile(profile)) {
+                            return [](jsi::Runtime&) { return jsi::Value(false); };
+                        }
+                        return [](jsi::Runtime&) { return jsi::Value(true); };
+                    }, contextId);
+            }
+        );
+        runtime.global().setProperty(runtime, "llamaSetGovernorThermo", setGovernorThermo);
+
+        auto getGovernorStats = jsi::Function::createFromHostFunction(runtime,
+            jsi::PropNameID::forAscii(runtime, "llamaGetGovernorStats"),
+            1,
+            [callInvoker](jsi::Runtime& runtime, const jsi::Value&, const jsi::Value* arguments, size_t) -> jsi::Value {
+                const int contextId = (int) arguments[0].asNumber();
+                return createPromiseTask(runtime, callInvoker,
+                    [contextId]() -> PromiseResultGenerator {
+                        auto ctx = getContextOrThrow(contextId);
+                        const auto stats = ctx->governorStats();
+                        const auto failure = ctx->governorFailureReason();
+                        const bool active = ctx->hasGovernor();
+                        return [stats, failure, active](jsi::Runtime& rt) {
+                            jsi::Object result(rt);
+                            result.setProperty(rt, "active", active);
+                            result.setProperty(rt, "engine_prefill", governorEngineName(stats.prefill_engine));
+                            result.setProperty(rt, "engine_decode", governorEngineName(stats.decode_engine));
+                            result.setProperty(rt, "commit_bytes", (double) stats.commit_bytes);
+                            result.setProperty(rt, "commit_ms", (double) stats.commit_us / 1000.0);
+                            result.setProperty(rt, "prefill_ms", (double) stats.prefill_us / 1000.0);
+                            result.setProperty(rt, "prefill_chunks", jsi::String::createFromUtf8(rt, stats.prefill_chunks));
+                            result.setProperty(rt, "prefill_ctx_ngl", (double) stats.prefill_ctx_ngl);
+                            result.setProperty(rt, "thermal_state", governorThermalStateName(stats.thermal_state));
+                            result.setProperty(rt, "failure_reason", jsi::String::createFromUtf8(rt, failure));
+                            return result;
+                        };
+                    }, contextId);
+            }
+        );
+        runtime.global().setProperty(runtime, "llamaGetGovernorStats", getGovernorStats);
 
         auto loadSession = jsi::Function::createFromHostFunction(runtime,
             jsi::PropNameID::forAscii(runtime, "llamaLoadSession"),
@@ -792,7 +954,7 @@ namespace rnllama_jsi {
 
                 return createPromiseTask(runtime, callInvoker, [contextId, tokens]() -> PromiseResultGenerator {
                     auto ctx = getContextOrThrow(contextId);
-                    std::string text = rnllama::tokens_to_str(ctx->ctx, tokens.cbegin(), tokens.cend());
+                    std::string text = rnllama::tokens_to_str(ctx->active_ctx(), tokens.cbegin(), tokens.cend());
                     return [text](jsi::Runtime& rt) {
                         return jsi::String::createFromUtf8(rt, text);
                     };
@@ -872,8 +1034,8 @@ namespace rnllama_jsi {
                               if (!chatParams.thinking_start_tag.empty()) {
                                   result.setProperty(rt, "thinking_start_tag", jsi::String::createFromUtf8(rt, chatParams.thinking_start_tag));
                               }
-                              if (!chatParams.thinking_end_tags.empty()) {
-                                  result.setProperty(rt, "thinking_end_tag", jsi::String::createFromUtf8(rt, chatParams.thinking_end_tags.front()));
+                              if (!chatParams.thinking_end_tag.empty()) {
+                                  result.setProperty(rt, "thinking_end_tag", jsi::String::createFromUtf8(rt, chatParams.thinking_end_tag));
                               }
 
                               // Preserve the same shape as legacy native bridge
@@ -1045,6 +1207,13 @@ namespace rnllama_jsi {
 
                 parseCompletionParams(runtime, params, ctx);
 
+                llama_governor_thermo_profile governorThermo{};
+                const bool governorThermoProvided =
+                    ctx->hasGovernor() && params.hasProperty(runtime, "governor_thermo");
+                if (governorThermoProvided) {
+                    governorThermo = parseGovernorThermo(runtime, params);
+                }
+
                 std::vector<std::string> mediaPaths;
                 if (params.hasProperty(runtime, "media_paths")) {
                     jsi::Array paths = params.getProperty(runtime, "media_paths").asObject(runtime).asArray(runtime);
@@ -1074,13 +1243,17 @@ namespace rnllama_jsi {
                     }
                 }
 
-                return createPromiseTask(runtime, callInvoker, [runtimePtr = std::shared_ptr<jsi::Runtime>(&runtime, [](jsi::Runtime*){}), contextId, onToken, emitPartial, mediaPaths, chat_format, reasoning_format, generation_prompt, chat_parser, prefill_text, guide_tokens, callInvoker]() -> PromiseResultGenerator {
+                return createPromiseTask(runtime, callInvoker, [runtimePtr = std::shared_ptr<jsi::Runtime>(&runtime, [](jsi::Runtime*){}), contextId, onToken, emitPartial, mediaPaths, chat_format, reasoning_format, generation_prompt, chat_parser, prefill_text, guide_tokens, governorThermo, governorThermoProvided, callInvoker]() -> PromiseResultGenerator {
                     auto ctx = getContextOrThrow(contextId);
 
                     if (ctx->completion == nullptr) {
                         throw std::runtime_error("Completion not initialized");
                     }
                     throwIfContextBusy(ctx);
+
+                    if (governorThermoProvided && !ctx->setThermoProfile(governorThermo)) {
+                        throw std::runtime_error("Invalid governor_thermo profile");
+                    }
 
                     if (!guide_tokens.empty() && ctx->tts_wrapper != nullptr) {
                         ctx->params.vocoder.use_guide_tokens = true;
@@ -1117,11 +1290,13 @@ namespace rnllama_jsi {
 
                     while (ctx->completion->has_next_token && !ctx->completion->is_interrupted) {
                         const rnllama::completion_token_output token_with_probs = ctx->completion->doCompletion();
-                        if (token_with_probs.tok == -1 || ctx->completion->incomplete) {
+                        if ((token_with_probs.tok == -1 && !token_with_probs.raw_probs_requested) ||
+                            (ctx->completion->incomplete && token_with_probs.tok != -1)) {
                             continue;
                         }
 
-                        const std::string token_text = common_token_to_piece(ctx->ctx, token_with_probs.tok);
+                        const std::string token_text = token_with_probs.tok == -1 ? "" :
+                            common_token_to_piece(ctx->active_ctx(), token_with_probs.tok);
                         size_t pos = std::min(sent_count, ctx->completion->generated_text.size());
                         const std::string str_test = ctx->completion->generated_text.substr(pos);
 
@@ -1176,9 +1351,14 @@ namespace rnllama_jsi {
                         }
                     }
 
-                    common_perf_print(ctx->ctx, ctx->completion->ctx_sampling);
-                    ctx->completion->endCompletion();
+                    if (ctx->governorFailed()) {
+                        ctx->completion->endCompletion();
+                        throw std::runtime_error(
+                            "Governor decode failed: " + ctx->governorFailureReason());
+                    }
 
+                    common_perf_print(ctx->active_ctx(), ctx->completion->ctx_sampling);
+                    ctx->completion->endCompletion();
                     return [contextId](jsi::Runtime& rt) -> jsi::Value {
                         // Check if context is still valid (may have been released during async callback)
                         long ctxPtr = g_llamaContexts.get(contextId);
@@ -1207,7 +1387,9 @@ namespace rnllama_jsi {
                 if (ctx->completion) {
                     ctx->completion->is_interrupted = true;
                 }
-                return jsi::Value::undefined();
+                return runtime.global().getPropertyAsObject(runtime, "Promise")
+                    .getPropertyAsFunction(runtime, "resolve")
+                    .call(runtime, jsi::Value::undefined());
             }
         );
         runtime.global().setProperty(runtime, "llamaStopCompletion", stopCompletion);
@@ -1387,7 +1569,7 @@ namespace rnllama_jsi {
                             auto timings = slot->get_timings();
                             auto token_probs = slot->generated_token_probs;
                             if (slot->parent_ctx && slot->ctx_sampling) {
-                                common_perf_print(slot->parent_ctx->ctx, slot->ctx_sampling);
+                                common_perf_print(slot->parent_ctx->active_ctx(), slot->ctx_sampling);
                             }
 
                             rnllama::completion_chat_output final_output;
@@ -1518,7 +1700,7 @@ namespace rnllama_jsi {
                     const llama_vocab* vocab = llama_model_get_vocab(ctx->model);
                     const bool add_bos = llama_vocab_get_add_bos(vocab);
                     const bool is_enc_dec = llama_model_has_encoder(ctx->model);
-                    std::vector<llama_token> tokens = common_tokenize(ctx->ctx, text, add_bos || is_enc_dec, true);
+                    std::vector<llama_token> tokens = common_tokenize(ctx->active_ctx(), text, add_bos || is_enc_dec, true);
 
                     auto resultCallback = [contextId, callInvoker, runtimePtr](int32_t requestId, const std::vector<float>& embedding) {
                         auto callbacks = RequestManager::getInstance().getRequest(contextId, requestId);

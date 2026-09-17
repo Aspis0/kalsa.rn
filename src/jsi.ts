@@ -7,6 +7,8 @@ import type {
   NativeTokenizeResult,
   NativeEmbeddingResult,
   NativeSessionLoadResult,
+  GovernorThermoProfile,
+  GovernorStats,
   NativeRerankResult,
   JinjaFormattedChatResult,
   ParallelStatus,
@@ -22,6 +24,11 @@ declare global {
   var llamaReleaseAllContexts: () => Promise<void>
   var llamaModelInfo: (path: string, skip: string[]) => Promise<object>
   var llamaGetBackendDevicesInfo: () => Promise<string>
+  var llamaSetGovernorThermo: (
+    contextId: number,
+    profile: GovernorThermoProfile,
+  ) => Promise<boolean>
+  var llamaGetGovernorStats: (contextId: number) => Promise<GovernorStats>
   var llamaLoadSession: (
     contextId: number,
     path: string,

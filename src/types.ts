@@ -133,6 +133,21 @@ export type NativeContextParams = {
    */
   no_extra_bufts?: boolean
 
+  /** Optional Kalsa MoE expert streaming settings; omitted means disabled. */
+  moe_stream?: {
+    enabled?: boolean
+    cache_mb?: number
+    cache_auto?: boolean
+    cache_floor_mb?: number
+    cache_ceil_mb?: number
+    io_threads?: number
+    overlap?: boolean
+    dense_weights?: string
+    n_expert_used?: number
+    drop_cold_frac?: number
+    drop_no_renorm?: boolean
+  }
+
   /**
    * Single LoRA adapter path
    */
@@ -202,6 +217,39 @@ export type NativeContextParams = {
   // Embedding params
   embedding?: boolean
   embd_normalize?: number
+  governor?: {
+    enabled: true
+    generation?: 'V73' | 'V75' | 'V79' | 'NoHTP' | 'Unknown'
+    model_kind?: 'Dense' | 'Hybrid' | 'MoE' | 'Unknown'
+    gpu_fit?: 'Fit' | 'NoFit' | 'NotFit' | 'Unknown'
+    bench_force_gpu_prefill?: boolean
+    npu_lane_enabled?: boolean
+    reload_budget_available?: boolean
+    thermo: GovernorThermoProfile
+  }
+}
+
+export type GovernorThermoProfile = {
+  batt_temp_tenths_c: number
+  batt_level_pct: number
+  plugged: boolean
+  sensor_valid: boolean
+  t_idle_valid?: boolean
+  t_idle_c?: number
+  trend_c_per_min?: number
+}
+
+export type GovernorStats = {
+  active: boolean
+  engine_prefill: string
+  engine_decode: string
+  commit_bytes: number
+  commit_ms: number
+  prefill_ms: number
+  prefill_chunks: string
+  prefill_ctx_ngl: number
+  thermal_state: string
+  failure_reason: string
 }
 
 export type NativeCompletionParams = {
@@ -286,6 +334,10 @@ export type NativeCompletionParams = {
    * Default: `0`
    */
   n_probs?: number
+  /** Bench-only raw pre-sampler top-N log probabilities. */
+  bench_raw_probs?: number
+  /** Bench-only forced token IDs; generation stops when exhausted. */
+  bench_force_ids?: Array<number>
   /**
    * Per-completion speculative decoding override. For MTP on recurrent/hybrid
    * models, load the model with matching MTP options first.
@@ -515,6 +567,7 @@ export type NativeCompletionResult = {
   timings: NativeCompletionResultTimings
 
   completion_probabilities?: Array<NativeCompletionTokenProb>
+  generated_token_ids?: Array<number>
   audio_tokens?: Array<number>
 }
 

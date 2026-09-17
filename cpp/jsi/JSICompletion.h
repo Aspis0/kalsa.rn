@@ -49,7 +49,7 @@ namespace rnllama_jsi {
         rnllama::llama_rn_context* ctx,
         const std::vector<rnllama::completion_token_output>& probs_vec
     ) {
-        if (ctx == nullptr || ctx->ctx == nullptr) {
+        if (ctx == nullptr || ctx->active_ctx() == nullptr) {
             // Return empty array if context is invalid
             return jsi::Array(runtime, 0);
         }
@@ -61,14 +61,14 @@ namespace rnllama_jsi {
             jsi::Array probsForToken(runtime, prob.probs.size());
             for (size_t j = 0; j < prob.probs.size(); ++j) {
                 jsi::Object p(runtime);
-                std::string tokStr = rnllama::tokens_to_output_formatted_string(ctx->ctx, prob.probs[j].tok);
+                std::string tokStr = rnllama::tokens_to_output_formatted_string(ctx->active_ctx(), prob.probs[j].tok);
                 if (tokStr.empty()) tokStr = "<UNKNOWN>";
                 p.setProperty(runtime, "tok_str", jsi::String::createFromUtf8(runtime, tokStr));
                 p.setProperty(runtime, "prob", (double)prob.probs[j].prob);
                 probsForToken.setValueAtIndex(runtime, j, p);
             }
 
-            std::string tokStr = rnllama::tokens_to_output_formatted_string(ctx->ctx, prob.tok);
+            std::string tokStr = rnllama::tokens_to_output_formatted_string(ctx->active_ctx(), prob.tok);
             if (tokStr.empty()) tokStr = "<UNKNOWN>";
 
             jsi::Object completionProb(runtime);
@@ -82,8 +82,8 @@ namespace rnllama_jsi {
 
     inline jsi::Object createTokenProb(jsi::Runtime& runtime, rnllama::llama_rn_context* ctx, const rnllama::completion_token_output::token_prob& p) {
         jsi::Object res(runtime);
-        std::string tokStr = (ctx != nullptr && ctx->ctx != nullptr)
-            ? rnllama::tokens_to_output_formatted_string(ctx->ctx, p.tok)
+        std::string tokStr = (ctx != nullptr && ctx->active_ctx() != nullptr)
+            ? rnllama::tokens_to_output_formatted_string(ctx->active_ctx(), p.tok)
             : "";
         if (tokStr.empty()) tokStr = "<UNKNOWN>";
         res.setProperty(runtime, "tok_str", jsi::String::createFromUtf8(runtime, tokStr));
@@ -95,6 +95,18 @@ namespace rnllama_jsi {
         jsi::Object res(runtime);
         res.setProperty(runtime, "token", jsi::String::createFromUtf8(runtime, token.text));
 
+        if (token.raw_probs_requested) {
+            res.setProperty(runtime, "tok", (int)token.tok);
+            res.setProperty(runtime, "forced", token.forced);
+            jsi::Array rawProbs(runtime, token.raw_probs.size());
+            for (size_t i = 0; i < token.raw_probs.size(); i++) {
+                jsi::Array pair(runtime, 2);
+                pair.setValueAtIndex(runtime, 0, (int)token.raw_probs[i].tok);
+                pair.setValueAtIndex(runtime, 1, (double)token.raw_probs[i].logprob);
+                rawProbs.setValueAtIndex(runtime, i, pair);
+            }
+            res.setProperty(runtime, "raw_probs", rawProbs);
+        }
         if (!token.probs.empty()) {
             jsi::Array probs(runtime, token.probs.size());
             for (size_t i = 0; i < token.probs.size(); i++) {
@@ -137,7 +149,7 @@ namespace rnllama_jsi {
         if (ctx->completion == nullptr) {
             throw std::runtime_error("RNLLAMA_NULL_COMPLETION");
         }
-        if (ctx->ctx == nullptr) {
+        if (ctx->active_ctx() == nullptr) {
             throw std::runtime_error("RNLLAMA_NULL_LLAMA_CONTEXT");
         }
 
@@ -161,6 +173,14 @@ namespace rnllama_jsi {
             "completion_probabilities",
             createCompletionProbabilities(runtime, ctx, ctx->completion->generated_token_probs)
         );
+        if (!ctx->completion->generated_token_ids.empty()) {
+            const size_t count = std::min<size_t>(32, ctx->completion->generated_token_ids.size());
+            jsi::Array ids(runtime, count);
+            for (size_t i = 0; i < count; ++i) {
+                ids.setValueAtIndex(runtime, i, (double)ctx->completion->generated_token_ids[i]);
+            }
+            res.setProperty(runtime, "generated_token_ids", ids);
+        }
         res.setProperty(runtime, "tokens_predicted", (double)ctx->completion->num_tokens_predicted);
         res.setProperty(runtime, "tokens_evaluated", (double)ctx->completion->num_prompt_tokens);
         res.setProperty(runtime, "draft_tokens", (double)ctx->completion->num_draft_tokens);
@@ -182,14 +202,25 @@ namespace rnllama_jsi {
             res.setProperty(runtime, "audio_tokens", audioTokens);
         }
 
-        const auto timings = llama_perf_context(ctx->ctx);
+        // Perf counters are folded in only on synchronize.
+        // A zero-token completion never fetches logits.
+        llama_synchronize(ctx->active_ctx());
+        const auto timings = llama_perf_context(ctx->active_ctx());
+        const auto governor_stats = ctx->governorStats();
+        const bool governor_prefill = ctx->hasGovernor() && governor_stats.prefill_n > 0;
+        const double prompt_n = governor_prefill
+            ? (double) governor_stats.prefill_n
+            : (double) timings.n_p_eval;
+        const double prompt_ms = governor_prefill
+            ? (double) governor_stats.prefill_us / 1000.0
+            : (double) timings.t_p_eval_ms;
 
         jsi::Object timingsObj(runtime);
         timingsObj.setProperty(runtime, "cache_n", (double)ctx->completion->n_past);
-        timingsObj.setProperty(runtime, "prompt_n", (double)timings.n_p_eval);
-        timingsObj.setProperty(runtime, "prompt_ms", (double)timings.t_p_eval_ms);
-        const double prompt_per_token_ms = timings.n_p_eval > 0 ? timings.t_p_eval_ms / timings.n_p_eval : 0.0;
-        const double prompt_per_second = timings.t_p_eval_ms > 0 ? 1e3 / timings.t_p_eval_ms * timings.n_p_eval : 0.0;
+        timingsObj.setProperty(runtime, "prompt_n", prompt_n);
+        timingsObj.setProperty(runtime, "prompt_ms", prompt_ms);
+        const double prompt_per_token_ms = prompt_n > 0 ? prompt_ms / prompt_n : 0.0;
+        const double prompt_per_second = prompt_ms > 0 ? 1e3 / prompt_ms * prompt_n : 0.0;
         timingsObj.setProperty(runtime, "prompt_per_token_ms", prompt_per_token_ms);
         timingsObj.setProperty(runtime, "prompt_per_second", prompt_per_second);
 

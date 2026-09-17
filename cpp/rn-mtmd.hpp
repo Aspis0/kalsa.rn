@@ -280,7 +280,8 @@ inline mtmd_tokenize_result tokenizeWithMedia(llama_rn_context_mtmd *mtmd_wrappe
 
     mtmd_input_text input_text{};
     input_text.text = prompt.data(); // Use the full prompt with media markers
-    input_text.text_len = prompt.size();
+    // Kalsa patch: the kalsallama fork's mtmd_input_text has no text_len (tools/mtmd/mtmd.h:68);
+    // mtmd.cpp:842 reads text->text as a NUL-terminated C string, and prompt.data() is one.
     input_text.add_special = true;  // Add BOS token if this is the first message
     input_text.parse_special = true;       // Parse special tokens like <__media__>
 

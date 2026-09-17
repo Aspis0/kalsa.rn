@@ -581,6 +581,24 @@ struct common_params {
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
+
+    // Kalsa patch (MoE streaming): the transport for native/bmoe/rn/bmoe_stream.h. Plain data,
+    // declared here rather than in that header so common.h keeps depending on nothing: this is
+    // the one struct both the JSI reader and the streamer agree on. Defaults are the recipe
+    // measured in moe-experiments (S23 -42.7%, W=0, p=0.000488) minus the two LOSSY knobs.
+    struct {
+        bool  enabled        = false; // off unless JS asks; a dense model declines anyway
+        int   cache_mb       = 0;     // explicit LRU budget in MiB; wins over cache_auto
+        bool  cache_auto     = true;  // size once from free RAM at init, then hold
+        int   cache_floor_mb = 1536;  // RAM left free for the rest of the system
+        int   cache_ceil_mb  = 0;     // 0 = cap only at the full expert-set size
+        int   io_threads     = 4;     // parallel read lanes
+        bool  overlap        = true;  // read a layer's experts while its matmuls run
+        char  dense_weights[16] = "anon"; // mmap | warm | anon | ahwb | anon-gpu
+        int   n_expert_used  = 0;     // top-k override, 0 = model default. LOSSY.
+        float drop_cold_frac = 0.0f;  // skip cold, barely-weighted experts. LOSSY.
+        bool  drop_no_renorm = false; // ~70% of the drop's quality cost is the renorm
+    } kalsa_moe;
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
 
     bool single_turn       = false; // single turn chat conversation

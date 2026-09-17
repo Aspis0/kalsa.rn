@@ -51,7 +51,16 @@ struct completion_token_output
         float prob;
     };
 
+    struct raw_token_prob
+    {
+        llama_token tok;
+        float logprob;
+    };
+
     std::vector<token_prob> probs;
+    std::vector<raw_token_prob> raw_probs;
+    bool raw_probs_requested = false;
+    bool forced = false;
     llama_token tok;
     std::string text;  // Token text (decoded)
     int32_t request_id = -1;  // Request ID for parallel processing
@@ -77,6 +86,11 @@ struct llama_rn_context_completion {
     std::string prefill_text;
     std::string generated_text;
     utf8_stream_gate utf8_gate;
+    std::vector<llama_token> generated_token_ids;
+    int32_t bench_raw_probs = 0;
+    std::vector<llama_token> bench_force_ids;
+    size_t bench_force_index = 0;
+    bool bench_force_ids_enabled = false;
     std::vector<completion_token_output> generated_token_probs;
     size_t num_draft_tokens = 0;
     size_t num_draft_tokens_accepted = 0;
@@ -164,12 +178,18 @@ struct llama_rn_context_completion {
     void captureStateCheckpoint(const std::vector<llama_token> &seq, size_t n);
     int  findStateCheckpoint(const std::vector<llama_token> &target, size_t max_len) const;
     bool restoreStateCheckpoint(size_t index);    // restore snapshot into seq 0
-    // Restore the longest snapshot prefixing `target` (length <= max_reuse,
-    // < total_tokens) and truncate the live prefix to it. Sets n_past_out.
+    // Restore the longest snapshot prefixing `target` (length <= max_reuse)
+    // and truncate the live prefix to it. Fails (and drops that snapshot) if
+    // seq_rm does not leave pos_max+1 == k. Sets n_past_out.
     bool recoverStateCheckpoint(const std::vector<llama_token> &target, size_t max_reuse,
                                 size_t total_tokens, llama_pos &n_past_out);
     void evictStateCheckpoints();                 // enforce count / byte bounds
     void clearStateCheckpoints();                 // drop all snapshots
+    // Drop every snapshot except the stable prefix (the lowest-position one,
+    // which evictStateCheckpoints already pins as the system-prompt end).
+    // A JS clearCache is about the CONVERSATION; the system prefix it also
+    // destroyed is byte-identical in the next one.
+    void keepOnlyStablePrefixCheckpoint();
     void eraseStateCheckpointAt(size_t n_tokens); // drop the snapshot at a boundary
     // Drop snapshots whose state includes tokens after this position. A
     // checkpoint exactly at n_tokens represents [0, n_tokens) and stays valid.

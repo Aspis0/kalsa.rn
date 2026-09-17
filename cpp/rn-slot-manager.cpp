@@ -73,7 +73,7 @@ bool llama_rn_slot_manager::init(int32_t n_parallel_, int32_t n_batch_, int32_t 
 }
 
 common_speculative* llama_rn_slot_manager::ensure_mtp_speculative(common_params& params) {
-    if (parent_ctx == nullptr || parent_ctx->ctx == nullptr) {
+    if (parent_ctx == nullptr || parent_ctx->active_ctx() == nullptr) {
         throw std::runtime_error("MTP speculative decoding requires an initialized context");
     }
 
@@ -90,7 +90,7 @@ common_speculative* llama_rn_slot_manager::ensure_mtp_speculative(common_params&
         mtp_spec_cache_type_v == draft.cache_type_v;
 
     if (compatible) {
-        params.speculative.draft.ctx_tgt = parent_ctx->ctx;
+        params.speculative.draft.ctx_tgt = parent_ctx->active_ctx();
         params.speculative.draft.ctx_dft = mtp_spec_ctx;
         return mtp_spec;
     }
@@ -109,7 +109,7 @@ common_speculative* llama_rn_slot_manager::ensure_mtp_speculative(common_params&
         throw std::runtime_error("failed to create MTP draft context");
     }
 
-    params.speculative.draft.ctx_tgt = parent_ctx->ctx;
+    params.speculative.draft.ctx_tgt = parent_ctx->active_ctx();
     params.speculative.draft.ctx_dft = mtp_spec_ctx;
 
     const uint32_t n_seq = std::max<int32_t>(1, n_parallel);
@@ -247,7 +247,7 @@ int32_t llama_rn_slot_manager::queue_embedding_request(
     int embd_normalize,
     std::function<void(int32_t, const std::vector<float>&)> on_result
 ) {
-    if (parent_ctx == nullptr || parent_ctx->model == nullptr || parent_ctx->ctx == nullptr) {
+    if (parent_ctx == nullptr || parent_ctx->model == nullptr || parent_ctx->active_ctx() == nullptr) {
         LOG_ERROR("Cannot queue embedding: context not initialized");
         return -1;
     }
@@ -298,14 +298,14 @@ int32_t llama_rn_slot_manager::queue_rerank_request(
     int normalize,
     std::function<void(int32_t, const std::vector<float>&)> on_results
 ) {
-    if (parent_ctx == nullptr || parent_ctx->model == nullptr || parent_ctx->ctx == nullptr) {
+    if (parent_ctx == nullptr || parent_ctx->model == nullptr || parent_ctx->active_ctx() == nullptr) {
         LOG_ERROR("Cannot queue rerank: context not initialized");
         return -1;
     }
 
     int32_t request_id = next_request_id++;
 
-    const enum llama_pooling_type pooling_type = llama_pooling_type(parent_ctx->ctx);
+    const enum llama_pooling_type pooling_type = llama_pooling_type(parent_ctx->active_ctx());
     if (pooling_type != LLAMA_POOLING_TYPE_RANK) {
         LOG_ERROR("Reranking not supported by current model (pooling_type=%d)", pooling_type);
         if (on_results) {
@@ -352,9 +352,9 @@ int32_t llama_rn_slot_manager::queue_rerank_request(
             std::vector<llama_token> rerank_tokens = format_rerank_tokens(vocab, query_tokens, doc_tokens);
 
             // Convert tokens back to text and re-tokenize using context-aware settings
-            std::string rerank_text = tokens_to_str(parent_ctx->ctx, rerank_tokens.begin(), rerank_tokens.end());
+            std::string rerank_text = tokens_to_str(parent_ctx->active_ctx(), rerank_tokens.begin(), rerank_tokens.end());
             std::vector<llama_token> prompt_tokens = common_tokenize(
-                parent_ctx->ctx,
+                parent_ctx->active_ctx(),
                 rerank_text,
                 add_bos || is_enc_dec,
                 true
@@ -650,10 +650,10 @@ void llama_rn_slot_manager::process_pending_queue() {
                 // Start timing (memory clear is part of the task, not overhead)
                 slot->t_start_process = lm_ggml_time_us();
 
-                if (parent_ctx && parent_ctx->ctx) {
+                if (parent_ctx && parent_ctx->active_ctx()) {
                     // Only this slot's sequence - a global clear would corrupt
                     // other slots' in-flight sequences
-                    llama_memory_seq_rm(llama_get_memory(parent_ctx->ctx), slot->id, 0, -1);
+                    llama_memory_seq_rm(llama_get_memory(parent_ctx->active_ctx()), slot->id, 0, -1);
                 }
                 if (request.rerank_prompt_tokens.empty()) {
                     LOG_WARNING("Rerank request %d has no documents to process", request.request_id);
@@ -751,13 +751,13 @@ void llama_rn_slot_manager::build_batch() {
                     // the memory itself. The history is only trustworthy where
                     // the memory backs it.
                     slot.embd = slot.cache_tokens;
-                    if (parent_ctx && parent_ctx->ctx) {
-                        auto * kv = llama_get_memory(parent_ctx->ctx);
+                    if (parent_ctx && parent_ctx->active_ctx()) {
+                        auto * kv = llama_get_memory(parent_ctx->active_ctx());
                         const llama_pos mem_len = llama_memory_seq_pos_max(kv, slot.id) + 1;
                         // M-RoPE media histories legitimately hold fewer time
                         // positions than placeholder tokens - leave them as-is
                         const bool mrope_media =
-                            model_uses_mrope(llama_get_model(parent_ctx->ctx)) &&
+                            model_uses_mrope(llama_get_model(parent_ctx->active_ctx())) &&
                             std::find(slot.embd.begin(), slot.embd.end(),
                                       LLAMA_TOKEN_NULL) != slot.embd.end();
                         if ((llama_pos) slot.embd.size() > mem_len && !mrope_media) {
@@ -785,7 +785,7 @@ void llama_rn_slot_manager::build_batch() {
                     // short text tail is simply re-decoded on reload.
                     bool prompt_ckpt_written = false;
                     mtmd_state_capture_fn capture = nullptr;
-                    const llama_model * mdl = llama_get_model(parent_ctx->ctx);
+                    const llama_model * mdl = llama_get_model(parent_ctx->active_ctx());
                     if ((llama_model_is_recurrent(mdl) || llama_model_is_hybrid(mdl)) &&
                         slot.save_prompt_state_pending && !slot.save_prompt_state_path.empty()) {
                         // The capture overwrites the state file mid-eval; drop
@@ -801,7 +801,7 @@ void llama_rn_slot_manager::build_batch() {
                             }
                             std::vector<llama_token> prefix(toks.begin(), toks.begin() + n);
                             const size_t nwrite = llama_state_seq_save_file(
-                                parent_ctx->ctx, slot_ptr->save_prompt_state_path.c_str(),
+                                parent_ctx->active_ctx(), slot_ptr->save_prompt_state_path.c_str(),
                                 slot_ptr->id, prefix.data(), prefix.size());
                             if (nwrite > 0) {
                                 prompt_ckpt_written = true;
@@ -815,7 +815,7 @@ void llama_rn_slot_manager::build_batch() {
                     }
 
                     parent_ctx->mtmd_wrapper->processMedia(
-                        parent_ctx->ctx,
+                        parent_ctx->active_ctx(),
                         slot.prompt_text,
                         slot.media_paths,
                         parent_ctx->n_ctx,
@@ -891,7 +891,7 @@ void llama_rn_slot_manager::build_batch() {
                         // slots' tokens before sample_and_callback runs
                         if (slot.ctx_sampling != nullptr) {
                             slot.media_pending_token =
-                                common_sampler_sample(slot.ctx_sampling, parent_ctx->ctx, -1);
+                                common_sampler_sample(slot.ctx_sampling, parent_ctx->active_ctx(), -1);
                         }
 
                         LOG_INFO("Slot %d: Media processed, transitioned to GENERATING state, n_past=%d, num_prompt_tokens=%zu",
@@ -907,8 +907,8 @@ void llama_rn_slot_manager::build_batch() {
                     // sync with the cached history - drop both
                     slot.cache_tokens.clear();
                     slot.bitmap_past_hashes.clear();
-                    if (parent_ctx && parent_ctx->ctx) {
-                        llama_memory_seq_rm(llama_get_memory(parent_ctx->ctx), slot.id, 0, -1);
+                    if (parent_ctx && parent_ctx->active_ctx()) {
+                        llama_memory_seq_rm(llama_get_memory(parent_ctx->active_ctx()), slot.id, 0, -1);
                     }
                     slot.incomplete = true;
                     complete_slot(slot);
@@ -982,13 +982,13 @@ bool llama_rn_slot_manager::process_batch() {
         return true;
     }
 
-    if (parent_ctx == nullptr || parent_ctx->ctx == nullptr) {
+    if (parent_ctx == nullptr || parent_ctx->active_ctx() == nullptr) {
         LOG_ERROR("Cannot process batch: context is null");
         return false;
     }
 
     // Call llama_decode with the unified batch
-    int ret = llama_decode(parent_ctx->ctx, batch);
+    int ret = parent_ctx->decode(batch);
 
     if (ret != 0) {
         // Decode failed
@@ -1009,7 +1009,7 @@ bool llama_rn_slot_manager::process_batch() {
 
     // Synchronize to ensure GPU work completes before timing measurements
     // This is critical for accurate performance metrics when using Metal/GPU
-    llama_synchronize(parent_ctx->ctx);
+    llama_synchronize(parent_ctx->active_ctx());
 
     LOG_VERBOSE("Batch processed successfully");
     return true;
@@ -1024,7 +1024,7 @@ void llama_rn_slot_manager::complete_slot(llama_rn_slot & slot) {
 }
 
 void llama_rn_slot_manager::sample_and_callback() {
-    if (parent_ctx == nullptr || parent_ctx->ctx == nullptr) {
+    if (parent_ctx == nullptr || parent_ctx->active_ctx() == nullptr) {
         return;
     }
 
@@ -1032,18 +1032,18 @@ void llama_rn_slot_manager::sample_and_callback() {
     const int n_embd = llama_model_n_embd(parent_ctx->model);
 
     auto get_embedding_ptr = [&](llama_rn_slot& slot) -> const float* {
-        const float* data = llama_get_embeddings_seq(parent_ctx->ctx, slot.id);
+        const float* data = llama_get_embeddings_seq(parent_ctx->active_ctx(), slot.id);
         if (data == nullptr) {
             int idx = slot.i_batch;
             if (idx < 0 || idx >= batch.n_tokens) {
                 idx = batch.n_tokens - 1;
             }
             if (idx >= 0) {
-                data = llama_get_embeddings_ith(parent_ctx->ctx, idx);
+                data = llama_get_embeddings_ith(parent_ctx->active_ctx(), idx);
             }
         }
         if (data == nullptr) {
-            data = llama_get_embeddings(parent_ctx->ctx);
+            data = llama_get_embeddings(parent_ctx->active_ctx());
         }
         return data;
     };
@@ -1079,7 +1079,7 @@ void llama_rn_slot_manager::sample_and_callback() {
 
                     auto emit_token = [&](completion_token_output token_output) -> bool {
                         if (token_output.text.empty()) {
-                            token_output.text = common_token_to_piece(parent_ctx->ctx, token_output.tok);
+                            token_output.text = common_token_to_piece(parent_ctx->active_ctx(), token_output.tok);
                         }
                         token_output.request_id = slot.request_id;
 
@@ -1182,7 +1182,7 @@ void llama_rn_slot_manager::sample_and_callback() {
                     new_token_id = slot.media_pending_token;
                     slot.media_pending_token = LLAMA_TOKEN_NULL;
                 } else {
-                    new_token_id = common_sampler_sample(slot.ctx_sampling, parent_ctx->ctx, slot.i_batch);
+                    new_token_id = common_sampler_sample(slot.ctx_sampling, parent_ctx->active_ctx(), slot.i_batch);
                 }
                 common_sampler_accept(slot.ctx_sampling, new_token_id, true);
 
@@ -1199,7 +1199,7 @@ void llama_rn_slot_manager::sample_and_callback() {
                     continue;
                 }
 
-                std::string token_text = common_token_to_piece(parent_ctx->ctx, new_token_id);
+                std::string token_text = common_token_to_piece(parent_ctx->active_ctx(), new_token_id);
                 token_text = slot.utf8_gate.feed(token_text);
                 slot.generated_text += token_text;
 
@@ -1326,10 +1326,10 @@ void llama_rn_slot_manager::sample_and_callback() {
                 slot.rerank_current_index++;
 
                 if (slot.rerank_current_index < slot.rerank_prompt_tokens.size()) {
-                    if (parent_ctx && parent_ctx->ctx) {
+                    if (parent_ctx && parent_ctx->active_ctx()) {
                         // Only this slot's sequence - a global clear would
                         // corrupt other slots' in-flight sequences
-                        llama_memory_seq_rm(llama_get_memory(parent_ctx->ctx), slot.id, 0, -1);
+                        llama_memory_seq_rm(llama_get_memory(parent_ctx->active_ctx()), slot.id, 0, -1);
                     }
                     slot.load_prompt(slot.rerank_prompt_tokens[slot.rerank_current_index]);
                     slot.state = SLOT_STATE_PROCESSING_PROMPT;
@@ -1341,8 +1341,8 @@ void llama_rn_slot_manager::sample_and_callback() {
                     slot.on_rerank_callback(slot.request_id, slot.rerank_scores);
                 }
 
-                if (parent_ctx && parent_ctx->ctx) {
-                    llama_memory_seq_rm(llama_get_memory(parent_ctx->ctx), slot.id, 0, -1);
+                if (parent_ctx && parent_ctx->active_ctx()) {
+                    llama_memory_seq_rm(llama_get_memory(parent_ctx->active_ctx()), slot.id, 0, -1);
                 }
 
                 slot.state = SLOT_STATE_DONE;

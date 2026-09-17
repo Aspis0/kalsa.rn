@@ -11,6 +11,7 @@
 #include "ggml-cpu.h"
 #include "gguf.h"
 #include "llama.h"
+#include "llama-ext.h"
 #include "llama-model.h"
 #include "llama-impl.h"
 #include "sampling.h"
@@ -22,7 +23,11 @@
 
 using json = nlohmann::ordered_json;
 
+namespace kalsa { class MoeStream; }
+
 namespace rnllama {
+
+class rn_governor;
 
 // Display form of a raw token piece: a lone high-bit byte is hex-escaped,
 // any other ill-formed piece is sanitized (JSI strings require well-formed UTF-8)
@@ -111,6 +116,12 @@ struct llama_rn_context {
     float loading_progress = 0;
     bool is_load_interrupted = false;
     common_params params;
+    // Declared before llama_init so it is destroyed after the context: the eval
+    // callback and rebound expert tensors must outlive llama_free.
+    std::unique_ptr<kalsa::MoeStream> moe_stream;
+    common_init_result_ptr governor_prefill_init;
+    common_init_result_ptr governor_decode_init;
+    std::unique_ptr<rn_governor> governor;
     common_init_result_ptr llama_init;
     llama_context *ctx = nullptr;
     common_chat_templates_ptr templates;
@@ -131,9 +142,24 @@ struct llama_rn_context {
     lm_ggml_threadpool *threadpool = nullptr;
     lm_ggml_threadpool *threadpool_batch = nullptr;
 
+    // Defined out-of-line in rn-llama.cpp: the implicit default ctor would have to
+    // emit a destructor for moe_stream on its unwind path, and kalsa::MoeStream is
+    // only forward-declared here (RNLlamaJSI.cpp does `new llama_rn_context()`).
+    llama_rn_context();
     ~llama_rn_context();
 
-    bool loadModel(common_params &params_);
+    bool loadModel(
+        common_params &params_,
+        const llama_governor_params * governor_params = nullptr,
+        const llama_governor_thermo_profile * governor_thermo = nullptr);
+    llama_context * active_ctx() const;
+    int32_t decode(llama_batch batch);
+    bool hasGovernor() const;
+    bool governorFailed() const;
+    std::string governorFailureReason() const;
+    void resetGovernorPrefillStats();
+    bool setThermoProfile(const llama_governor_thermo_profile & profile);
+    llama_governor_stats governorStats() const;
     bool hasDraftModel() const;
     llama_model * getMTPDraftModel() const;
     llama_context * createMTPDraftContext(const common_params &params_for_context) const;

@@ -29,6 +29,30 @@ file(GLOB MTMD_MODEL_FILES CONFIGURE_DEPENDS ${RNLLAMA_LIB_DIR}/tools/mtmd/model
 file(GLOB COMMON_FILES CONFIGURE_DEPENDS ${RNLLAMA_LIB_DIR}/common/*.cpp)
 file(GLOB JINJA_FILES CONFIGURE_DEPENDS ${RNLLAMA_LIB_DIR}/common/jinja/*.cpp)
 
+# Kalsa's MoE streamer is optional so llama.rn can still be consumed from npm alone.
+get_filename_component(BMOE_ROOT "${RNLLAMA_LIB_DIR}/../../../native/bmoe" ABSOLUTE)
+set(BMOE_SOURCE_FILES)
+if (EXISTS "${BMOE_ROOT}")
+    file(GLOB BMOE_IO_FILES CONFIGURE_DEPENDS "${BMOE_ROOT}/src/io/*.cpp")
+    file(GLOB BMOE_MOE_FILES CONFIGURE_DEPENDS "${BMOE_ROOT}/src/moe/*.cpp")
+    file(GLOB BMOE_RN_FILES CONFIGURE_DEPENDS "${BMOE_ROOT}/rn/bmoe_stream.cpp")
+    set(BMOE_SOURCE_FILES
+        ${BMOE_ROOT}/src/config.cpp
+        ${BMOE_IO_FILES}
+        ${BMOE_MOE_FILES}
+        ${BMOE_RN_FILES}
+    )
+
+    # The vendored engine uses upstream ggml names while llama.rn exports lm_* symbols.
+    set(BMOE_COMPAT_HEADER "${BMOE_ROOT}/bmoe_lmggml_compat.h")
+    set_source_files_properties(
+        ${BMOE_SOURCE_FILES}
+        PROPERTIES
+        COMPILE_OPTIONS "-include;${BMOE_COMPAT_HEADER}"
+        COMPILE_DEFINITIONS BMOE_HAVE_EXPERT_READY_HOOK
+    )
+endif()
+
 # Source files for rnllama library (excluding jni.cpp and jni-utils)
 set(
     RNLLAMA_SOURCE_FILES
@@ -68,6 +92,8 @@ set(
 
     # React Native llama APIs
     ${RNLLAMA_LIB_DIR}/rn-llama.cpp
+    ${RNLLAMA_LIB_DIR}/rn-governor.cpp
+    ${RNLLAMA_LIB_DIR}/rn-governor-params.cpp
     ${RNLLAMA_LIB_DIR}/rn-completion.cpp
     ${RNLLAMA_LIB_DIR}/rn-tts.cpp
     ${RNLLAMA_LIB_DIR}/rn-slot.cpp
@@ -75,6 +101,9 @@ set(
 
     # Model implementations (globbed)
     ${MODEL_FILES}
+
+    # Kalsa MoE expert streaming (optional, outside node_modules)
+    ${BMOE_SOURCE_FILES}
 )
 
 find_library(LOG_LIB log)
@@ -113,6 +142,14 @@ function(build_rnllama_library target_name arch cpu_flags)
         ${RNLLAMA_SOURCE_FILES}
         ${SOURCE_FILES_ARCH}
     )
+
+    if (BMOE_SOURCE_FILES)
+        target_include_directories(${target_name} PRIVATE
+            ${BMOE_ROOT}/include
+            ${BMOE_ROOT}/src
+            ${BMOE_ROOT}/rn
+        )
+    endif()
 
     target_link_libraries(${target_name} PRIVATE ${LOG_LIB} android)
 
@@ -211,36 +248,126 @@ function(build_rnllama_library target_name arch cpu_flags)
     if (ENABLE_OPENCL)
         include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../../../../third_party/OpenCL-Headers)
 
+        # Derived from the kalsallama overlay, NOT hand-maintained. This is exactly the set of
+        # <name>.cl.h that cpp/ggml-opencl/ggml-opencl.cpp #includes, which is exactly the set of
+        # cpp/ggml-opencl/kernels/*.cl the fork ships (156 of each, verified equal). llama.rn's
+        # own list named 17 kernels the fork dropped and missed the four Adreno q2_k/q3_k ones.
+        # Regenerate after any overlay bump by listing those #includes; a name with no matching
+        # .cl file fails embed_kernel.py at configure time.
         set(GGML_OPENCL_KERNELS
             add
             add_id
             argsort
-            tri
-            fill
             clamp
+            concat
+            conv2d
+            conv2d_f16_f32
             cpy
+            cumsum
             cvt
-            diag_mask_inf
             diag
+            diag_mask_inf
             div
+            exp
+            expm1
+            fill
+            flash_attn_f16
+            flash_attn_f32
+            flash_attn_f32_f16
+            flash_attn_f32_q4_0
+            flash_attn_f32_q8_0
+            flash_attn_pre_f16
+            gated_delta_net
             gelu
+            gemm_moe_mxfp4_f32
+            gemm_moe_mxfp4_f32_ns
+            gemm_moe_q2_k_f32_ns
+            gemm_moe_q3_k_f32_ns
+            gemm_moe_q4_0_f32_ns
+            gemm_moe_q4_1_f32_ns
+            gemm_moe_q4_k_f32_ns
+            gemm_moe_q5_0_f32_ns
+            gemm_moe_q5_1_f32_ns
+            gemm_moe_q5_k_f32_ns
+            gemm_moe_q6_k_f32_ns
+            gemm_noshuffle_iq4_nl_f32
+            gemm_noshuffle_q1_0_f32
+            gemm_noshuffle_q4_0_f32
+            gemm_noshuffle_q4_1_f32
+            gemm_noshuffle_q4_k_f32
+            gemm_noshuffle_q5_0_f32
+            gemm_noshuffle_q5_1_f32
+            gemm_noshuffle_q5_k_f32
+            gemm_noshuffle_q6_k_f32
+            gemm_noshuffle_q8_0_f32
+            gemm_xmem_f16_f32_os8
+            gemv_moe_mxfp4_f32
+            gemv_moe_mxfp4_f32_ns
+            gemv_moe_q2_k_f32_ns
+            gemv_moe_q3_k_f32_ns
+            gemv_moe_q4_0_f32_ns
+            gemv_moe_q4_1_f32_ns
+            gemv_moe_q4_k_f32_ns
+            gemv_moe_q5_0_f32_ns
+            gemv_moe_q5_1_f32_ns
+            gemv_moe_q5_k_f32_ns
+            gemv_moe_q6_k_f32_ns
+            gemv_noshuffle_iq4_nl_f32
+            gemv_noshuffle_q1_0_f32
+            gemv_noshuffle_q4_0_f32
+            gemv_noshuffle_q4_0_f32_spec
+            gemv_noshuffle_q4_1_f32
+            gemv_noshuffle_q4_k_f32
+            gemv_noshuffle_q5_0_f32
+            gemv_noshuffle_q5_1_f32
+            gemv_noshuffle_q5_k_f32
+            gemv_noshuffle_q6_k_f32
+            gemv_noshuffle_q8_0_f32
             get_rows
             glu
             group_norm
-            solve_tri
-            im2col_f32
             im2col_f16
+            im2col_f32
+            l2_norm
             mean
+            moe_reorder_b
+            moe_sort_by_expert
+            mul
+            mul_mat_f16_f32
+            mul_mm_f16_f32_kq_kqv
+            mul_mm_f16_f32_l4_lm
+            mul_mm_f32_f32_l4_lm
+            mul_mm_iq4_nl_f32_l4_lm
+            mul_mm_q1_0_f32_l4_lm
+            mul_mm_q4_0_f32_l4_lm
+            mul_mm_q4_1_f32_l4_lm
+            mul_mm_q4_k_f32_l4_lm
+            mul_mm_q5_0_f32_l4_lm
+            mul_mm_q5_1_f32_l4_lm
+            mul_mm_q5_k_f32_l4_lm
+            mul_mm_q6_k_f32_l4_lm
+            mul_mm_q8_0_f32_l4_lm
             mul_mv_f16_f16
+            mul_mv_f16_f32
             mul_mv_f16_f32_1row
             mul_mv_f16_f32_l4
-            mul_mv_f16_f32
             mul_mv_f32_f32
+            mul_mv_id_mxfp4_f32
+            mul_mv_id_mxfp4_f32_flat
+            mul_mv_id_q4_0_f32_8x_flat
+            mul_mv_id_q8_0_f32
+            mul_mv_id_q8_0_f32_flat
+            mul_mv_iq4_nl_f32
+            mul_mv_iq4_nl_f32_flat
+            mul_mv_mxfp4_f32
+            mul_mv_mxfp4_f32_flat
+            mul_mv_q1_0_f32
+            mul_mv_q1_0_f32_flat
             mul_mv_q4_0_f32
-            mul_mv_q4_0_f32_v
-            mul_mv_q4_0_f32_8x_flat
-            mul_mv_q4_0_f32_1d_8x_flat
             mul_mv_q4_0_f32_1d_16x_flat
+            mul_mv_q4_0_f32_1d_8x_flat
+            mul_mv_q4_0_f32_8x_flat
+            mul_mv_q4_0_f32_v
             mul_mv_q4_1_f32
             mul_mv_q4_1_f32_flat
             mul_mv_q4_k_f32
@@ -255,130 +382,35 @@ function(build_rnllama_library target_name arch cpu_flags)
             mul_mv_q6_k_f32_flat
             mul_mv_q8_0_f32
             mul_mv_q8_0_f32_flat
-            mul_mv_q1_0_f32
-            mul_mv_q1_0_f32_flat
-            mul_mv_iq4_nl_f32
-            mul_mv_iq4_nl_f32_flat
-            mul_mv_mxfp4_f32
-            mul_mv_mxfp4_f32_flat
-            mul_mv_id_q4_0_f32_8x_flat
-            mul_mv_id_q8_0_f32
-            mul_mv_id_q8_0_f32_flat
-            mul_mv_id_mxfp4_f32
-            mul_mv_id_mxfp4_f32_flat
-            gemm_moe_q4_0_f32_ns
-            gemm_moe_q4_0_q8_1_dp4a
-            gemv_moe_q4_0_f32_ns
-            gemm_moe_q8_0_f32_ns
-            gemm_moe_q4_1_f32_ns
-            gemv_moe_q4_1_f32_ns
-            gemm_moe_q5_0_f32_ns
-            gemv_moe_q5_0_f32_ns
-            gemm_moe_q5_1_f32_ns
-            gemv_moe_q5_1_f32_ns
-            gemm_moe_q4_k_f32_ns
-            gemm_moe_q4_k_q8_1_dp4a
-            gemm_moe_q6_k_q8_1_dp4a
-            gemm_moe_q8_1_dp4a
-            moe_reorder_quant_a_q8_1
-            gemm_noshuffle_q4_k_q8_1_dp4a
-            gemm_noshuffle_q5_k_q8_1_dp4a
-            gemm_noshuffle_q6_k_q8_1_dp4a
-            gemm_noshuffle_q8_0_q8_1_dp4a
-            gemm_noshuffle_q5_0_q8_1_dp4a
-            gemm_noshuffle_iq4_nl_q8_1_dp4a
-            gemm_noshuffle_q4_0_q8_1_dp4a
-            quant_a_q8_1
-            gemv_moe_q4_k_f32_ns
-            gemm_moe_q5_k_f32_ns
-            gemv_moe_q5_k_f32_ns
-            gemm_moe_q6_k_f32_ns
-            gemv_moe_q6_k_f32_ns
-            gemm_moe_mxfp4_f32
-            gemv_moe_mxfp4_f32
-            gemm_moe_mxfp4_f32_ns
-            gemm_moe_mxfp4_q8_1_dp4a
-            gemv_moe_mxfp4_f32_ns
-            moe_reorder_b
-            moe_combine
-            moe_sort_by_expert
-            mul_mm_f32_f32_l4_lm
-            mul_mm_f16_f32_l4_lm
-            mul_mm_q4_0_f32_l4_lm
-            mul_mm_q4_1_f32_l4_lm
-            mul_mm_q5_0_f32_l4_lm
-            mul_mm_q5_1_f32_l4_lm
-            mul_mm_q8_0_f32_l4_lm
-            mul_mm_q1_0_f32_l4_lm
-            mul_mm_iq4_nl_f32_l4_lm
-            mul_mm_q4_k_f32_l4_lm
-            mul_mm_q5_k_f32_l4_lm
-            mul_mm_q6_k_f32_l4_lm
-            gemv_noshuffle_q4_0_f32
-            gemv_noshuffle_q4_0_f32_spec
-            gemm_noshuffle_q4_0_f32
-            gemv_noshuffle_q4_1_f32
-            gemm_noshuffle_q4_1_f32
-            gemv_noshuffle_iq4_nl_f32
-            gemm_noshuffle_iq4_nl_f32
-            gemv_noshuffle_q5_0_f32
-            gemm_noshuffle_q5_0_f32
-            gemv_noshuffle_q5_1_f32
-            gemm_noshuffle_q5_1_f32
-            gemv_noshuffle_q8_0_f32
-            gemm_noshuffle_q8_0_f32
-            gemv_noshuffle_q1_0_f32
-            gemm_noshuffle_q1_0_f32
-            gemv_noshuffle_q4_k_f32
-            gemm_noshuffle_q4_k_f32
-            gemv_noshuffle_q6_k_f32
-            gemm_noshuffle_q6_k_f32
-            gemv_noshuffle_q5_k_f32
-            gemm_noshuffle_q5_k_f32
-            mul
             neg
             norm
+            oracle_consumer_q4_0_gemm
+            oracle_consumer_q4_0_gemv
+            pad
             relu
-            l2_norm
+            repeat
             rms_norm
             rope
             scale
             set_rows
             sigmoid
             silu
-            softmax_4_f32
             softmax_4_f16
-            softmax_f32
+            softmax_4_f32
             softmax_f16
+            softmax_f32
+            softplus
+            solve_tri
             sqr
             sqrt
             ssm_conv
-            gated_delta_net
             sub
             sum_rows
-            cumsum
+            tanh
             transpose
-            concat
+            tri
             tsembd
             upscale
-            tanh
-            exp
-            expm1
-            abs
-            softplus
-            pad
-            repeat
-            mul_mat_f16_f32
-            mul_mm_f16_f32_kq_kqv
-            conv2d
-            conv2d_f16_f32
-            flash_attn_f32_f16
-            flash_attn_f16
-            flash_attn_f32
-            flash_attn_pre_f16
-            flash_attn_f32_q8_0
-            flash_attn_f32_q4_0
-            gemm_xmem_f16_f32_os8
         )
         set(GGML_OPENCL_KERNEL_DIR ${RNLLAMA_LIB_DIR}/ggml-opencl/kernels)
         set(GGML_OPENCL_KERNEL_HEADERS "")
@@ -414,7 +446,8 @@ function(build_rnllama_library target_name arch cpu_flags)
         target_include_directories(${target_name} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
         target_sources(${target_name} PRIVATE
             ${RNLLAMA_LIB_DIR}/ggml-opencl/ggml-opencl.cpp
-            ${RNLLAMA_LIB_DIR}/ggml-opencl/cl-program-cache.cpp
+            # cl-program-cache.{cpp,h} is llama.rn-era only: the kalsallama overlay does not ship it
+            # and the fork's ggml-opencl.cpp never references it. Naming it here fails configure.
             ${GGML_OPENCL_KERNEL_HEADERS}
         )
         target_compile_options(${target_name} PRIVATE

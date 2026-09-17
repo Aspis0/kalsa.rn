@@ -1,5 +1,5 @@
 import './jsi';
-import type { NativeContextParams, NativeLlamaContext, NativeCompletionParams, NativeParallelCompletionParams, NativeCompletionTokenProb, NativeCompletionResult, NativeTokenizeResult, NativeEmbeddingResult, NativeSessionLoadResult, NativeEmbeddingParams, NativeRerankParams, NativeRerankResult, NativeCompletionTokenProbItem, NativeCompletionResultTimings, JinjaFormattedChatResult, FormattedChatResult, NativeImageProcessingResult, NativeBackendDeviceInfo, NativeSpeculativeConfig, NativeSpeculativeParams, NativeSpeculativeType, ParallelStatus, ParallelRequestStatus } from './types';
+import type { NativeContextParams, NativeLlamaContext, NativeCompletionParams, NativeParallelCompletionParams, NativeCompletionTokenProb, NativeCompletionResult, NativeTokenizeResult, NativeEmbeddingResult, NativeSessionLoadResult, GovernorThermoProfile, GovernorStats, NativeEmbeddingParams, NativeRerankParams, NativeRerankResult, NativeCompletionTokenProbItem, NativeCompletionResultTimings, JinjaFormattedChatResult, FormattedChatResult, NativeImageProcessingResult, NativeBackendDeviceInfo, NativeSpeculativeConfig, NativeSpeculativeParams, NativeSpeculativeType, ParallelStatus, ParallelRequestStatus } from './types';
 export type RNLlamaMessagePart = {
     type: string;
     text?: string;
@@ -17,7 +17,7 @@ export type RNLlamaOAICompatibleMessage = {
     content?: string | RNLlamaMessagePart[];
     reasoning_content?: string;
 };
-export type { NativeContextParams, NativeLlamaContext, NativeCompletionParams, NativeParallelCompletionParams, NativeCompletionTokenProb, NativeCompletionResult, NativeTokenizeResult, NativeEmbeddingResult, NativeSessionLoadResult, NativeEmbeddingParams, NativeRerankParams, NativeRerankResult, NativeCompletionTokenProbItem, NativeCompletionResultTimings, FormattedChatResult, JinjaFormattedChatResult, NativeImageProcessingResult, NativeBackendDeviceInfo, NativeSpeculativeConfig, NativeSpeculativeParams, NativeSpeculativeType, ParallelStatus, ParallelRequestStatus, };
+export type { NativeContextParams, NativeLlamaContext, NativeCompletionParams, NativeParallelCompletionParams, NativeCompletionTokenProb, NativeCompletionResult, NativeTokenizeResult, NativeEmbeddingResult, NativeSessionLoadResult, GovernorThermoProfile, GovernorStats, NativeEmbeddingParams, NativeRerankParams, NativeRerankResult, NativeCompletionTokenProbItem, NativeCompletionResultTimings, FormattedChatResult, JinjaFormattedChatResult, NativeImageProcessingResult, NativeBackendDeviceInfo, NativeSpeculativeConfig, NativeSpeculativeParams, NativeSpeculativeType, ParallelStatus, ParallelRequestStatus, };
 export declare const RNLLAMA_MTMD_DEFAULT_MEDIA_MARKER = "<__media__>";
 export declare const installJsi: () => Promise<void>;
 export type ToolCall = {
@@ -30,6 +30,9 @@ export type ToolCall = {
 };
 export type TokenData = {
     token: string;
+    tok?: number;
+    forced?: boolean;
+    raw_probs?: Array<[number, number]>;
     completion_probabilities?: Array<NativeCompletionTokenProb>;
     content?: string;
     reasoning_content?: string;
@@ -186,6 +189,8 @@ export declare class LlamaContext {
     saveSession(filepath: string, options?: {
         tokenSize: number;
     }): Promise<number>;
+    setGovernorThermo(profile: GovernorThermoProfile): Promise<boolean>;
+    getGovernorStats(): Promise<GovernorStats>;
     isLlamaChatSupported(): boolean;
     isJinjaSupported(): boolean;
     getFormattedChat(messages: RNLlamaOAICompatibleMessage[], template?: string | null, params?: {

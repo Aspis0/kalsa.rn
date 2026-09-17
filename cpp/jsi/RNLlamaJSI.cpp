@@ -353,9 +353,13 @@ namespace rnllama_jsi {
             return false;
         }
 
-        // Kalsa: kalsallama's common_chat_params has a single thinking_end_tag, not a list.
-        const std::string& endTag = chatParams.thinking_end_tag;
-        if (!endTag.empty()) {
+        // Kalsa: pin 134a35cf2 replaced the single thinking_end_tag with the vector
+        // thinking_end_tags. Forced-open means NONE of the end tags appears at or
+        // after the start tag; a one-element vector behaves exactly as before.
+        for (const auto & endTag : chatParams.thinking_end_tags) {
+            if (endTag.empty()) {
+                continue;
+            }
             const size_t lastEnd = chatParams.generation_prompt.rfind(endTag);
             if (lastEnd != std::string::npos && lastEnd >= lastStart) {
                 return false;
@@ -1034,8 +1038,12 @@ namespace rnllama_jsi {
                               if (!chatParams.thinking_start_tag.empty()) {
                                   result.setProperty(rt, "thinking_start_tag", jsi::String::createFromUtf8(rt, chatParams.thinking_start_tag));
                               }
-                              if (!chatParams.thinking_end_tag.empty()) {
-                                  result.setProperty(rt, "thinking_end_tag", jsi::String::createFromUtf8(rt, chatParams.thinking_end_tag));
+                              // Kalsa: thinking_end_tag became the vector thinking_end_tags at
+                              // pin 134a35cf2. The JS contract keeps a single string, so expose
+                              // the first tag; extra end tags of multi-tag templates are dropped
+                              // on this surface (all tags still apply in isThinkingForcedOpen).
+                              if (!chatParams.thinking_end_tags.empty()) {
+                                  result.setProperty(rt, "thinking_end_tag", jsi::String::createFromUtf8(rt, chatParams.thinking_end_tags.front()));
                               }
 
                               // Preserve the same shape as legacy native bridge
@@ -1256,7 +1264,10 @@ namespace rnllama_jsi {
                     }
 
                     if (!guide_tokens.empty() && ctx->tts_wrapper != nullptr) {
-                        ctx->params.vocoder.use_guide_tokens = true;
+                        // Kalsa: pin 134a35cf2 removed common_params::vocoder (and its
+                        // use_guide_tokens flag) entirely. Guide tokens live only in the tts
+                        // wrapper now; rn-completion.cpp consumes them through
+                        // next_token_uses_guide_token, which defaults to true there.
                         ctx->tts_wrapper->setGuideTokens(guide_tokens);
                     }
 

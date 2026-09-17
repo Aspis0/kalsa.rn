@@ -353,10 +353,18 @@ namespace rnllama_jsi {
             cparams.chat_template = chatTemplate;
         }
 
-        // Kalsa: kalsallama predates load_mode/LLAMA_LOAD_MODE_*; it exposes the
-        // equivalent boolean pair use_mmap/use_mlock instead.
-        cparams.use_mmap = getPropertyAsBool(runtime, params, "use_mmap", cparams.use_mmap);
-        cparams.use_mlock = getPropertyAsBool(runtime, params, "use_mlock", cparams.use_mlock);
+        // Kalsa: pin 134a35cf2 dropped use_mmap/use_mlock from common_params; the loader
+        // derives both from load_mode (llama-model-loader.cpp: mmap on for
+        // MMAP/MMAP_MLOCK/AUTO, llama-model.cpp: mlock on for MLOCK/MMAP_MLOCK). Translate
+        // the pair only when the JS params mention one, so the engine default AUTO stays;
+        // the true/false fallbacks are the removed fields' defaults.
+        if (params.hasProperty(runtime, "use_mmap") || params.hasProperty(runtime, "use_mlock")) {
+            const bool useMmap = getPropertyAsBool(runtime, params, "use_mmap", true);
+            const bool useMlock = getPropertyAsBool(runtime, params, "use_mlock", false);
+            cparams.load_mode = useMmap
+                ? (useMlock ? LLAMA_LOAD_MODE_MMAP_MLOCK : LLAMA_LOAD_MODE_MMAP)
+                : (useMlock ? LLAMA_LOAD_MODE_MLOCK : LLAMA_LOAD_MODE_NONE);
+        }
         cparams.no_extra_bufts = getPropertyAsBool(runtime, params, "no_extra_bufts", cparams.no_extra_bufts);
 
         if (params.hasProperty(runtime, "moe_stream")) {
@@ -590,7 +598,9 @@ namespace rnllama_jsi {
 
         std::string jsonSchema = getPropertyAsString(runtime, params, "json_schema");
         if (!jsonSchema.empty() && sparams.grammar.empty()) {
-            sparams.grammar = {COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT, json_schema_to_grammar(json::parse(jsonSchema))};
+            // Kalsa: json_schema_to_grammar takes common_json at pin 134a35cf2 -- same
+            // drift commit bff76818 fixed in rn-llama.cpp with common_json::parse.
+            sparams.grammar = {COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT, json_schema_to_grammar(common_json::parse(jsonSchema))};
         }
 
         sparams.generation_prompt = getPropertyAsString(runtime, params, "generation_prompt");

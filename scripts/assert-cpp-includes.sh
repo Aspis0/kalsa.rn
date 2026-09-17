@@ -114,7 +114,12 @@ PY
 #       file(GLOB ...) sets: common/*.cpp, common/jinja/*.cpp, models/*.cpp,
 #       tools/mtmd/*.cpp + models/*.cpp, llama*.cpp, unicode*.cpp,
 #       ggml-backend*.cpp, ggml-opt.cpp, ggml-threading.cpp,
-#       ggml-cpu/*.cpp + amx/*.cpp + arch/{arm,x86}/repack.cpp, rn-*.cpp.
+#       ggml-cpu/*.cpp + amx/*.cpp + arch/{arm,x86}/repack.cpp, rn-*.cpp,
+#       plus BMOE_SOURCE_FILES from the app repo (native/bmoe/{src/config.cpp,
+#       src/io/*.cpp,src/moe/*.cpp,rn/bmoe_stream.cpp}) with the bmoe compile
+#       shape: -I {include,src,rn}, -include bmoe_lmggml_compat.h and
+#       -DBMOE_HAVE_EXPERT_READY_HOOK; the bmoe root is derived from
+#       KALSA_BMOE_DIR (= <app>/native/bmoe/rn).
 #
 # Known non-parsed TUs (never silently): ggml-opencl.cpp hosts OpenCL-C kernel
 # sources via include gadgets that host clang rejects in every configuration
@@ -140,15 +145,13 @@ cat > "$SHIM_DIR/llama-version.h" <<'EOF'
 #define LLAMA_COMMIT  ""
 EOF
 
-syntax_check() {  # syntax_check <file> [extra-include-dir...]
+syntax_check() {  # syntax_check <file> [extra-compiler-arg...]
   local f="$1"; shift
-  local incs=() d
-  for d in "$@"; do incs+=(-I "$d"); done
   clang++ -std=c++17 -fsyntax-only \
     -I "$SHIM_DIR" \
     -I "$CPP" -I "$CPP/common" -I "$CPP/common/jinja" \
     -I "$CPP/ggml-cpu" -I "$CPP/tools/mtmd" \
-    ${incs[@]+"${incs[@]}"} \
+    ${@+"$@"} \
     "$f" > "$SYNTAX_LOG" 2>&1
 }
 
@@ -156,12 +159,14 @@ partial=""
 if ! command -v clang++ >/dev/null 2>&1; then
   partial="no clang++"
 elif [ -z "${KALSA_BMOE_DIR:-}" ]; then
-  partial="KALSA_BMOE_DIR not set (rn-*.cpp and jsi TUs skipped)"
+  partial="KALSA_BMOE_DIR not set (rn-*.cpp, jsi and bmoe TUs skipped)"
 fi
 
 # The react-native checkout of the app repo KALSA_BMOE_DIR points into
-# (kalsa/native/bmoe/rn -> kalsa/node_modules/react-native).
+# (kalsa/native/bmoe/rn -> kalsa/node_modules/react-native); the same
+# derivation gives the bmoe root <app>/native/bmoe.
 RN_JSI_INCS=()
+BMOE_ROOT=""
 if [ -z "$partial" ]; then
   APP_ROOT="$(cd "$KALSA_BMOE_DIR/../../.." && pwd)"
   RN_DIR="$APP_ROOT/node_modules/react-native"
@@ -171,19 +176,24 @@ if [ -z "$partial" ]; then
   else
     partial="react-native headers not found under $APP_ROOT (jsi TUs skipped)"
   fi
+  BMOE_ROOT="$(cd "$KALSA_BMOE_DIR/.." && pwd)"
+  if [ ! -f "$BMOE_ROOT/bmoe_lmggml_compat.h" ]; then
+    partial="bmoe sources not found next to KALSA_BMOE_DIR (bmoe TUs skipped)"
+    BMOE_ROOT=""
+  fi
 fi
 if [ -n "$partial" ]; then
   echo "[includes] NOTE: partial syntax pass ($partial)"
 fi
 
 # C++ TUs only; the ggml C sources are covered by the include scan.
-parse_group() {  # parse_group [extra-include-dir...] -- <files...>
-  local dirs=() f d
-  while [ "${1:-}" != "--" ]; do dirs+=("$1"); shift; done
+parse_group() {  # parse_group [extra-compiler-arg...] -- <files...>
+  local args=() f
+  while [ "${1:-}" != "--" ]; do args+=("$1"); shift; done
   shift
   for f in "$@"; do
     [ -f "$f" ] || continue
-    if ! syntax_check "$f" "${dirs[@]+${dirs[@]}}"; then
+    if ! syntax_check "$f" ${args[@]+"${args[@]}"}; then
       echo "[includes] SYNTAX FAIL: $(basename "$f")"
       grep -E "error:" "$SYNTAX_LOG" | head -3 | sed 's/^/    /' || true
       fails=$((fails + 1))
@@ -197,12 +207,15 @@ parse_group() {  # parse_group [extra-include-dir...] -- <files...>
       "$CPP"/ggml-cpu/*) c_cpu=$((c_cpu + 1)) ;;
       "$CPP"/rn-*) c_rn=$((c_rn + 1)) ;;
       "$CPP"/*.cpp) c_core=$((c_core + 1)) ;;
+      # last: with BMOE_ROOT empty the pattern degrades to "/*", which must
+      # never win over a $CPP arm
+      "$BMOE_ROOT"/*) c_bmoe=$((c_bmoe + 1)) ;;
     esac
   done
 }
 
 fails=0
-c_common=0; c_mtmd=0; c_models=0; c_rn=0; c_jsi=0; c_core=0; c_cpu=0
+c_common=0; c_mtmd=0; c_models=0; c_rn=0; c_jsi=0; c_core=0; c_cpu=0; c_bmoe=0
 parse_group -- "$CPP"/common/*.cpp "$CPP"/tools/mtmd/*.cpp \
   "$CPP"/models/*.cpp "$CPP"/tools/mtmd/models/*.cpp
 parse_group -- "$CPP"/llama*.cpp "$CPP"/unicode.cpp "$CPP"/unicode-data.cpp \
@@ -211,10 +224,19 @@ parse_group -- "$CPP"/llama*.cpp "$CPP"/unicode.cpp "$CPP"/unicode-data.cpp \
 parse_group -- "$CPP"/ggml-cpu/*.cpp "$CPP"/ggml-cpu/amx/*.cpp \
   "$CPP"/ggml-cpu/arch/arm/repack.cpp "$CPP"/ggml-cpu/arch/x86/repack.cpp
 if [ ${#RN_JSI_INCS[@]} -gt 0 ]; then
-  parse_group "${RN_JSI_INCS[@]}" -- "$CPP"/jsi/*.cpp
+  parse_group -I "${RN_JSI_INCS[0]}" -I "${RN_JSI_INCS[1]}" -- "$CPP"/jsi/*.cpp
+fi
+if [ -n "$BMOE_ROOT" ]; then
+  # The bmoe TUs the rnllama target compiles (android/src/main/rnllama/CMakeLists.txt
+  # BMOE_SOURCE_FILES), with the same compile shape: include dirs {include,src,rn}
+  # (:146-150), the forced compat header and -DBMOE_HAVE_EXPERT_READY_HOOK (:47-52).
+  parse_group -I "$BMOE_ROOT/include" -I "$BMOE_ROOT/src" -I "$BMOE_ROOT/rn" \
+    -DBMOE_HAVE_EXPERT_READY_HOOK -include "$BMOE_ROOT/bmoe_lmggml_compat.h" -- \
+    "$BMOE_ROOT"/src/config.cpp "$BMOE_ROOT"/src/io/*.cpp "$BMOE_ROOT"/src/moe/*.cpp \
+    "$BMOE_ROOT"/rn/bmoe_stream.cpp
 fi
 if [ -z "$partial" ]; then
-  parse_group "$KALSA_BMOE_DIR" -- "$CPP"/rn-*.cpp
+  parse_group -I "$KALSA_BMOE_DIR" -- "$CPP"/rn-*.cpp
 fi
 
 for t in "$CPP"/ggml-opencl/ggml-opencl.cpp \
@@ -240,7 +262,7 @@ if [ -n "$partial" ] && [ "${KALSA_ALLOW_PARTIAL_GATE:-}" != "1" ]; then
   exit 1
 fi
 if [ -n "$partial" ]; then
-  echo "[includes] OK (PARTIAL: $partial): $c_common common + $c_mtmd mtmd + $c_models models + $c_rn rn + $c_jsi jsi + $c_core core + $c_cpu cpu TUs parse"
+  echo "[includes] OK (PARTIAL: $partial): $c_common common + $c_mtmd mtmd + $c_models models + $c_rn rn + $c_jsi jsi + $c_core core + $c_cpu cpu + $c_bmoe bmoe TUs parse"
 else
-  echo "[includes] OK: $c_common common + $c_mtmd mtmd + $c_models models + $c_rn rn + $c_jsi jsi + $c_core core + $c_cpu cpu TUs parse"
+  echo "[includes] OK: $c_common common + $c_mtmd mtmd + $c_models models + $c_rn rn + $c_jsi jsi + $c_core core + $c_cpu cpu + $c_bmoe bmoe TUs parse"
 fi

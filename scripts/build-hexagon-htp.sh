@@ -67,7 +67,7 @@ else
             echo "SDK not found at: $HEXAGON_INSTALL_DIR/$HEXAGON_SDK_VERSION"
             echo ""
             echo "Solutions:"
-            echo "  1. Run 'npm run bootstrap' to download and install the SDK"
+            echo "  1. Download and install the Hexagon SDK (6.4.0.2) manually"
             echo "  2. Or set HEXAGON_INSTALL_DIR to your SDK location"
             echo "  3. Or use Docker: ./scripts/build-android-docker.sh"
             exit 1

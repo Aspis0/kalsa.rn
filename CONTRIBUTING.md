@@ -10,7 +10,6 @@ To get started with the project, run `npm install` in the root directory to inst
 
 ```sh
 npm install
-npm run bootstrap
 ```
 
 While developing, you can run the [example app](/example/) to test your changes. Any changes you make in your library's JavaScript code will be reflected in the example app without a rebuild. If you change any native code, then you'll need to rebuild the example app.
@@ -71,7 +70,6 @@ npm run release
 
 The `package.json` file contains various scripts for common tasks:
 
-- `npm run bootstrap`: setup project by installing all dependencies.
 - `npm run typecheck`: type-check files with TypeScript.
 - `npm run lint`: lint files with ESLint.
 - `npm test`: run unit tests with Jest.

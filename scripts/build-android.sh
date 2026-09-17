@@ -116,7 +116,7 @@ else
   echo "Hexagon backend will be skipped"
   echo ""
   echo "To enable Hexagon:"
-  echo "  1. Run 'npm run bootstrap' to install SDK"
+  echo "  1. Install the Hexagon SDK manually (6.4.0.2)"
   echo "  2. Or set HEXAGON_INSTALL_DIR=/path/to/sdk"
   if [ "$OS_TYPE" = "Darwin" ]; then
     echo "  3. Note: HTP libraries must be built in Docker first"

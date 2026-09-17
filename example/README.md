@@ -25,7 +25,7 @@ Used models are listed in [src/utils/constants.ts](src/utils/constants.ts).
 Please back to the root directory and run the following command:
 
 ```bash
-npm install && npm run bootstrap
+npm install
 ```
 
 ## iOS

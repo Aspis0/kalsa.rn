@@ -23,21 +23,31 @@ edit to pin-derived engine code must live as a patch under
                                           # check it against cpp/
 
 `pin`/`bump` flatten the pinned commit, apply the patches to the flattened
-tree, assert the kalsa post-image, rsync it over `cpp/` (`--delete`, minus
-the excludes above), run the include gate, and rewrite `kalsallama.pin`
-LAST -- a failing check leaves `cpp/` and the pin untouched.
-`KALSALLAMA_SRC=/path/to/kalsallama` flattens from a local checkout
-read-only (never fetched or pruned) for pins that are not pushed yet.
+tree, assert the kalsa post-image, run the include+syntax gate on the
+regenerated tree, rsync it over `cpp/` (`--delete`, minus the excludes
+above) and rewrite `kalsallama.pin` LAST -- a failing check leaves `cpp/`
+and the pin untouched. `bump` refuses to run with `KALSALLAMA_SRC` set:
+it resolves `origin/<branch>` from the clone cache, which the escape hatch
+never fetches. `KALSALLAMA_SRC=/path/to/kalsallama` flattens from a local
+checkout read-only (never fetched or pruned) for pins that are not pushed
+yet.
 
 `verify` touches nothing under `cpp/` and exits 0 only when all of these
 hold: `cpp/KALSALLAMA_SHA` equals the pin; the regenerated tree with the
 patches applied diffs clean against `cpp/` (excluding the llama.rn-owned
 files); the kalsa post-image markers are present; and every local
-`#include "..."` in `cpp/` resolves (`scripts/assert-cpp-includes.sh`).
-What verify cannot catch: the copy lists do not learn, so a fork file that
-should be in `cpp/` but was never copied diffs clean in both trees -- that
-class is caught only by the include check, and only if something in the
-tree already includes it. Run verify after any manual touch of `cpp/`.
+`#include "..."` in `cpp/` resolves plus every C++ TU parses
+(`scripts/assert-cpp-includes.sh [dir]`, run against `cpp/`). What verify
+cannot catch: the copy lists do not learn, so a fork file that should be
+in `cpp/` but was never copied diffs clean in both trees -- that class is
+caught only by the include check, and only if something in the tree
+already includes it. Run verify after any manual touch of `cpp/`.
+
+The gate parses `common/`, `tools/mtmd/` and `models/` unconditionally;
+the rn-owned sources need the app repo's bmoe headers, so run it locally
+as `KALSA_BMOE_DIR=<app repo>/native/bmoe/rn scripts/assert-cpp-includes.sh`.
+Without `KALSA_BMOE_DIR` (or without clang++) the gate runs PARTIAL and
+exits 1 unless `KALSA_ALLOW_PARTIAL_GATE=1`.
 
 ## Consuming from the app
 

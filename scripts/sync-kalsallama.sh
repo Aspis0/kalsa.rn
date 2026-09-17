@@ -664,14 +664,15 @@ assert_installed_sha() {
 }
 
 # write_pin LAST: cpp/ is only rewritten -- and the pin only re-pointed --
-# after flatten, patches and post-image checks have all succeeded.
+# after flatten, patches, the post-image check and the include gate have all
+# succeeded on the regenerated tree.
 regen_cpp() {
   local full="$1"
   flatten_and_prefix "$full"
   apply_kalsa_patches "$FLATTEN_TMP"
   assert_kalsa_post_image "$FLATTEN_TMP"
+  "$ROOT/scripts/assert-cpp-includes.sh" "$FLATTEN_TMP/cpp"
   install_cpp_tree
-  "$ROOT/scripts/assert-cpp-includes.sh"
   write_pin "$PIN_REPO" "$PIN_BRANCH" "$full"
 }
 
@@ -687,12 +688,15 @@ cmd_pin() {
 }
 
 cmd_bump() {
-  read_pin
-  resolve_git_dir
-  local full
-  full=$(git -C "$GIT_DIR" rev-parse --verify "origin/${PIN_BRANCH}^{commit}") \
-    || die "origin/${PIN_BRANCH} not found after fetch"
-  regen_cpp "$full"
+    if [ -n "${KALSALLAMA_SRC:-}" ]; then
+        die "bump resolves origin/<branch> from the clone cache; unset KALSALLAMA_SRC"
+    fi
+    read_pin
+    resolve_git_dir
+    local full
+    full=$(git -C "$GIT_DIR" rev-parse --verify "origin/${PIN_BRANCH}^{commit}") \
+        || die "origin/${PIN_BRANCH} not found in $GIT_DIR after fetch"
+    regen_cpp "$full"
 }
 
 cmd_verify() {
@@ -707,13 +711,14 @@ cmd_verify() {
   done
   local diff_out
   if diff_out=$(diff -r "${diff_args[@]}" "$FLATTEN_TMP/cpp" "$CPP_DIR"); then
-    echo "verify: cpp/ == kalsallama@$PIN_COMMIT + scripts/kalsa-patches"
+    :
   else
     echo "verify: cpp/ does not match kalsallama@$PIN_COMMIT + scripts/kalsa-patches:" >&2
     printf '%s\n' "$diff_out" >&2
     exit 1
   fi
-  "$ROOT/scripts/assert-cpp-includes.sh"
+  "$ROOT/scripts/assert-cpp-includes.sh" "$CPP_DIR"
+  echo "verify: cpp/ == kalsallama@$PIN_COMMIT + scripts/kalsa-patches"
 }
 
 [ -f "$PIN_FILE" ] || die "missing pin file $PIN_FILE"

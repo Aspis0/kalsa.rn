@@ -27,6 +27,6 @@ runs:
         npm ci
       shell: bash
 
-    - name: Bootstrap & Build
-      run: npm run bootstrap && npm run build
+    - name: Install & Build
+      run: npm install && npm run build
       shell: bash

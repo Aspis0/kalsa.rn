@@ -43,16 +43,19 @@
 
 ## Build System
 
-### Bootstrap Process (`scripts/bootstrap.sh`)
+### Engine Sync (`scripts/sync-kalsallama.sh`)
 
-1. Updates llama.cpp submodule (`third_party/llama.cpp`)
-2. Copies source files to `cpp/` directory
-3. Renames symbols with `LM_` prefix to prevent conflicts
-4. Applies patches from `scripts/patches/`
-5. Inlines `ggml-common.h` / `ggml-metal-impl.h` into `ggml-metal.metal` and emits `ggml-metal-embed.s` so the merged Metal source is embedded into the framework binary (avoids `.metallib` distribution and runtime `.metal` file loading; see #348)
-6. Generates version info from llama.cpp git history
+`cpp/` is regenerated, never hand-edited: it is the flattened, `LM_`-prefixed
+kalsallama tree at the commit recorded in `kalsallama.pin`, plus the patches
+under `scripts/kalsa-patches/`. The 36 llama.rn-owned files (`rn-*`, `jsi/`,
+`ggml-ext.h`, `anyascii.*`) are the only hand-maintained sources under
+`cpp/` (see KALSA_FORK.md).
 
-**Always run `npm run bootstrap` after updating the llama.cpp submodule.**
+1. `scripts/sync-kalsallama.sh pin <sha>` — re-point the pin and regenerate `cpp/`
+2. `scripts/sync-kalsallama.sh bump` — pin to `origin/<branch>` of the pin
+3. `scripts/sync-kalsallama.sh verify` — regenerate into a temp copy and check `cpp/` against pin + patches + gate
+
+Run `verify` after touching anything under `cpp/` or the patches.
 
 ### Platform Builds
 
@@ -64,7 +67,6 @@
 
 ```bash
 npm install
-npm run bootstrap              # Required after cloning or updating llama.cpp submodule
 npm run typecheck              # TypeScript type checking
 npm run lint                   # Run ESLint
 npm run lint -- --fix          # Fix ESLint errors
@@ -82,15 +84,14 @@ npm run build:android          # Build Android example app
 ## Development Workflow
 
 - **TypeScript layer:** Edit `src/index.ts`, `src/types.ts`, `src/jsi.ts`, and `src/grammar.ts`. `NativeRNLlama.install()` only installs JSI; all APIs are invoked via JSI bindings. Run `npm run typecheck` and `npm run lint` before committing.
-- **C++ core:** Edit files in `cpp/`. The example app builds from source, so `npm run build:ios` / `npm run build:android` will compile your C++ changes directly. If you update llama.cpp itself, change `third_party/llama.cpp` and rerun `npm run bootstrap`. For releasing pre-built frameworks/libs, run `npm run build:ios-frameworks` / `npm run build:android-libs`.
+- **C++ core:** Edit files in `cpp/`. The example app builds from source, so `npm run build:ios` / `npm run build:android` will compile your C++ changes directly. If you update the engine, bump the pin with `scripts/sync-kalsallama.sh bump` (see KALSA_FORK.md). For releasing pre-built frameworks/libs, run `npm run build:ios-frameworks` / `npm run build:android-libs`.
 - **JSI bridge/platform glue:** Implement binding logic in `cpp/jsi/*`. iOS installs live in `ios/RNLlama.mm` + `ios/RNLlamaJSI.mm`; Android uses `android/src/main/java/com/rnllama/RNLlama.java` (native loader), `android/src/main/java/com/rnllama/RNLlamaModuleShared.java`, and `android/src/main/RNLlamaJSI.cpp`.
 
 ### Adding Patches
 
-If llama.cpp sources need modifications:
-1. Edit files in `cpp/`
-2. Create patch: `diff -u original.cpp modified.cpp > scripts/patches/filename.patch`
-3. Add patch application to `scripts/bootstrap.sh`
+- rn-owned files (`rn-*`, `jsi/`, `ggml-ext.h`, `anyascii.*`): edit in `cpp/` directly.
+- kalsallama-derived sources: edit the patch under `scripts/kalsa-patches/`,
+  then `scripts/sync-kalsallama.sh pin <sha>` and run `verify`.
 
 ## Important Conventions
 

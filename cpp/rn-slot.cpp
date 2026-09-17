@@ -341,14 +341,11 @@ bool llama_rn_slot::should_use_mtp() const {
     if (params == nullptr || params->speculative.draft.n_max <= 0) {
         return false;
     }
-    // spec_n_past == -1 latches a slot whose draft memory failed to roll
-    // back mid-generation: the handoff invariant is memory [0, n_past) ==
-    // history minus its last token (spec_id_last is undecoded), so
-    // build_batch re-decodes generated_tokens.back() == spec_id_last at
-    // n_past exactly as the plain path does. Pending drains first; once it
-    // is empty the plain path takes over until reset() re-arms the latch.
+    // spec_n_past == -1 latches a slot whose MTP init failed: the plain path
+    // serves the request (see the catch in init_mtp) until reset() re-arms
+    // the latch.
     if (spec_n_past == -1) {
-        return !spec_pending_tokens.empty();
+        return false;
     }
     if (llama_model_has_encoder(parent_ctx->model)) {
         if (!mtp_capability_logged) {
@@ -389,7 +386,7 @@ void llama_rn_slot::reset_speculative() {
         spec_ctx = nullptr;
     }
     spec_is_shared = false;
-    mtp_draft_mem_shared = false;
+    draft_rollback_fenced = false;
     if (spec_batch_initialized) {
         llama_batch_free(spec_batch);
         spec_batch = {};
@@ -452,9 +449,15 @@ void llama_rn_slot::init_mtp() {
         }
         reset_speculative();
         spec_n_past = -1;
+        if (generated_tokens.empty()) {
+            // build_batch's MTP branch moved this slot to GENERATING with
+            // i_batch = -1 and no prompt rows, expecting init_mtp to ingest
+            // the prompt; re-queue it so the plain PROCESSING_PROMPT loop
+            // decodes prompt_tokens from n_past == 0.
+            state = SLOT_STATE_PROCESSING_PROMPT;
+        }
         return;
     }
-    mtp_draft_mem_shared = llama_get_ctx_other(spec_ctx) == parent_ctx->active_ctx();
 
     spec_batch = llama_batch_init(llama_n_batch(parent_ctx->active_ctx()), 0, 1);
     spec_batch_initialized = true;
@@ -463,7 +466,9 @@ void llama_rn_slot::init_mtp() {
         throw std::runtime_error("MTP: failed to clear sequence " + std::to_string(id));
     }
     if (!rn_seq_rm(spec_ctx, id, -1, -1)) {
-        throw std::runtime_error("MTP: failed to clear sequence " + std::to_string(id));
+        // The draft's KV refuses rollbacks (shared with the target): mark it
+        // fenced instead of failing -- the rollback is advisory.
+        draft_rollback_fenced = true;
     }
     n_past = 0;
 
@@ -564,30 +569,14 @@ bool llama_rn_slot::refill_mtp_tokens() {
             spec_draft.resize(n_draft_limit);
         }
 
-        // A mem-shared draft (ctx_other == target) refuses seq_rm outright,
-        // which is fine: shared cells are the target's, there is nothing to
-        // roll back.
-        if (!mtp_draft_mem_shared && !rn_seq_rm(spec_ctx, seq_id, spec_n_past, -1)) {
-            // Handoff: keep everything the target already holds and let the
-            // accepted tokens drain. Memory [0, n_past) == history minus its
-            // last token, so build_batch re-decodes
-            // generated_tokens.back() == spec_id_last at n_past once the
-            // drain is done (see the latch in should_use_mtp()).
-            LOG_ERROR("MTP: draft memory cannot roll back to pos %d, speculative decoding disabled for this generation",
-                      (int) spec_n_past);
-            if (generated_tokens.empty()) {
-                // build_batch has nothing to feed and the last prompt token
-                // was consumed by eval_mtp_prompt: plain cannot take over.
-                // After the mem-shared skip above this is reachable only for
-                // a non-shared draft failing on its very first rollback.
-                throw std::runtime_error("MTP: non-shared draft failed to roll back before the first token; this is a bug, retry without speculative decoding");
-            }
-            n_past = spec_prompt.size();
-            auto pending = std::move(spec_pending_tokens);
-            reset_speculative();
-            spec_pending_tokens = std::move(pending);
-            spec_n_past = -1;
-            return false;
+        // Draft-side removal is advisory: every proposal is verified by the
+        // target sampler, so a failure here never corrupts output. On a
+        // shared cache seq_rm is refused by design -- stop asking after the
+        // first refusal to keep logcat quiet; on hybrid targets it succeeds
+        // and keeps the draft trimmed.
+        if (!draft_rollback_fenced && !rn_seq_rm(spec_ctx, seq_id, spec_n_past, -1)) {
+            draft_rollback_fenced = true;
+            LOG_INFO("MTP: draft memory refuses rollbacks (shared KV cache); proposals stay verified by the target");
         }
     }
 
@@ -648,17 +637,12 @@ bool llama_rn_slot::refill_mtp_tokens() {
         throw std::runtime_error("MTP: failed to truncate sequence " + std::to_string(seq_id) +
                                  " to pos " + std::to_string(spec_n_past) + " in the target context");
     }
-    if (!mtp_draft_mem_shared && !rn_seq_rm(spec_ctx, seq_id, spec_n_past, -1)) {
-        // Handoff: keep everything the target already holds and let the
-        // accepted tokens drain; fall through to the saw_eos / n_remaining
-        // tail below (see the latch in should_use_mtp()).
-        LOG_ERROR("MTP: draft memory cannot roll back to pos %d, speculative decoding disabled for this generation",
-                  (int) spec_n_past);
-        n_past = spec_prompt.size();
-        auto pending = std::move(spec_pending_tokens);
-        reset_speculative();
-        spec_pending_tokens = std::move(pending);
-        spec_n_past = -1;
+    if (!draft_rollback_fenced && !rn_seq_rm(spec_ctx, seq_id, spec_n_past, -1)) {
+        // Draft-side removal is advisory (see the first rollback site in
+        // refill_mtp_tokens); fall through to the saw_eos / n_remaining tail
+        // below.
+        draft_rollback_fenced = true;
+        LOG_INFO("MTP: draft memory refuses rollbacks (shared KV cache); proposals stay verified by the target");
     }
 
     if (saw_eos) {

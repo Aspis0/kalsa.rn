@@ -153,6 +153,9 @@ struct llama_rn_context_completion {
     llama_pos spec_n_past = 0;
     llama_tokens spec_draft;
     std::deque<completion_token_output> spec_pending_tokens;
+    // Set when the draft's KV refuses seq_rm (shared with the target): the
+    // rollback is advisory, so we stop asking instead of logging per refill.
+    bool draft_rollback_fenced = false;
     // Logged once per context when the gate rejects MTP on capability grounds.
     mutable bool mtp_capability_logged = false;
     // Number of prompt tokens the last MTP prompt eval actually decoded (vs.

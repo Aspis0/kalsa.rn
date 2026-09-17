@@ -118,9 +118,9 @@ struct llama_rn_slot {
     common_speculative *spec = nullptr;
     llama_context *spec_ctx = nullptr;
     bool spec_is_shared = false;
-    // The draft's KV is shared with the target (ctx_other == target): its
-    // seq_rm refuses unconditionally, so the rollback step is skipped.
-    bool mtp_draft_mem_shared = false;
+    // Set when the draft's KV refuses seq_rm (shared with the target): the
+    // rollback is advisory, so we stop asking instead of logging per refill.
+    bool draft_rollback_fenced = false;
     llama_batch spec_batch = {};
     bool spec_batch_initialized = false;
     llama_tokens spec_prompt;

@@ -811,14 +811,11 @@ bool llama_rn_context_completion::shouldUseMTP() const {
     if (parent_ctx->hasGovernor()) {
         return false;
     }
-    // spec_n_past == -1 latches a context whose draft memory failed to roll
-    // back mid-generation: the handoff invariant is memory [0, n_past) ==
-    // history minus its last token (spec_id_last is undecoded), so
-    // nextToken's plain while-loop re-decodes embd.back() == spec_id_last
-    // at n_past. Pending drains first; once it is empty the plain path
-    // takes over until rewind() re-arms the latch.
+    // spec_n_past == -1 latches a context whose MTP init failed: the plain
+    // path serves the request from loadPrompt's embd/n_past (see the catch
+    // in initMTP) until rewind() re-arms the latch.
     if (spec_n_past == -1) {
-        return !spec_pending_tokens.empty();
+        return false;
     }
     // Kalsa patch: DFLASH rides the same draft-speculative init/decode path as
     // MTP (common_speculative dispatches per-type); without this the whole
@@ -866,6 +863,7 @@ void llama_rn_context_completion::resetSpeculative() {
     spec_n_past = 0;
     spec_draft.clear();
     spec_pending_tokens.clear();
+    draft_rollback_fenced = false;
 }
 
 void llama_rn_context_completion::initMTP() {
@@ -1048,27 +1046,14 @@ bool llama_rn_context_completion::refillMTPTokens() {
             spec_draft.resize(n_draft_limit);
         }
 
-        // A mem-shared draft (ctx_other == target) refuses seq_rm outright,
-        // which is fine: shared cells are the target's, there is nothing to
-        // roll back.
-        if (!mtp_draft_mem_shared && !rn_seq_rm(spec_ctx.get(), seq_id, spec_n_past, -1)) {
-            // Handoff: keep everything the target already holds and let the
-            // accepted tokens drain. embd becomes the full history (memory
-            // [0, n_past) == history minus its last token), so nextToken's
-            // plain while-loop re-decodes embd.back() == spec_id_last at
-            // n_past once the drain is done (see the latch in shouldUseMTP()).
-            // No first-token corner: the plain loop decodes embd.back() itself.
-            LOG_ERROR("MTP: draft memory cannot roll back to pos %d, speculative decoding disabled for this generation",
-                      (int) spec_n_past);
-            embd = spec_prompt;
-            embd.push_back(spec_id_last);
-            n_past = spec_prompt.size();
-            auto pending = std::move(spec_pending_tokens);
-            resetSpeculative();
-            spec_pending_tokens = std::move(pending);
-            spec_n_past = -1;
-            has_next_token = !stopped_eos && !stopped_limit && !context_full;
-            return false;
+        // Draft-side removal is advisory: every proposal is verified by the
+        // target sampler, so a failure here never corrupts output. On a
+        // shared cache seq_rm is refused by design -- stop asking after the
+        // first refusal to keep logcat quiet; on hybrid targets it succeeds
+        // and keeps the draft trimmed.
+        if (!draft_rollback_fenced && !rn_seq_rm(spec_ctx.get(), seq_id, spec_n_past, -1)) {
+            draft_rollback_fenced = true;
+            LOG_INFO("MTP: draft memory refuses rollbacks (shared KV cache); proposals stay verified by the target");
         }
     }
 
@@ -1132,19 +1117,12 @@ bool llama_rn_context_completion::refillMTPTokens() {
         throw std::runtime_error("MTP: failed to truncate sequence " + std::to_string(seq_id) +
                                  " to pos " + std::to_string(spec_n_past) + " in the target context");
     }
-    if (!mtp_draft_mem_shared && !rn_seq_rm(spec_ctx.get(), seq_id, spec_n_past, -1)) {
-        // Handoff: keep everything the target already holds and let the
-        // accepted tokens drain; fall through to the saw_eos / n_predict
-        // tail below (see the latch in shouldUseMTP()).
-        LOG_ERROR("MTP: draft memory cannot roll back to pos %d, speculative decoding disabled for this generation",
-                  (int) spec_n_past);
-        embd = spec_prompt;
-        embd.push_back(spec_id_last);
-        n_past = spec_prompt.size();
-        auto pending = std::move(spec_pending_tokens);
-        resetSpeculative();
-        spec_pending_tokens = std::move(pending);
-        spec_n_past = -1;
+    if (!draft_rollback_fenced && !rn_seq_rm(spec_ctx.get(), seq_id, spec_n_past, -1)) {
+        // Draft-side removal is advisory (see the first rollback site in
+        // refillMTPTokens); fall through to the saw_eos / n_predict tail
+        // below.
+        draft_rollback_fenced = true;
+        LOG_INFO("MTP: draft memory refuses rollbacks (shared KV cache); proposals stay verified by the target");
     }
 
     if (saw_eos) {

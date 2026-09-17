@@ -3,7 +3,8 @@
 #include "rn-tts.h"
 #include "rn-mtmd.hpp"
 #include "rn-common.hpp"
-#include "llama-ext.h"  // llama_get_ctx_other (mem-shared MTP draft detection)
+#include "llama-ext.h"  // llama_get_ctx_other, llama_set_embeddings_nextn
+                        // (mem-shared MTP draft detection / fallback)
 
 #include <algorithm>
 #include <cstring>
@@ -874,7 +875,13 @@ void llama_rn_context_completion::fallBackToPlain(const char * why) {
         mtp_capability_logged = true;
         LOG_ERROR("%s", why);
     }
+    // common/speculative.cpp:1414 arms nextn output on the target and no
+    // engine-side reset exists -- turn it off for the plain path.
+    llama_set_embeddings_nextn(parent_ctx->active_ctx(), false, false);
     resetSpeculative();
+    // drop this init's draft pointers before the freed context rots them
+    parent_ctx->params.speculative.draft.ctx_tgt = nullptr;
+    parent_ctx->params.speculative.draft.ctx_dft = nullptr;
     spec_n_past = -1;
 }
 

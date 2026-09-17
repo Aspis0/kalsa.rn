@@ -399,15 +399,26 @@ void llama_rn_slot::reset_speculative() {
     spec_pending_tokens.clear();
 }
 
-// One error line, then plain. The target is untouched at every call site, so
-// the shared-batch prompt state and i_batch stay valid; re-queue the prompt
-// when nothing has been decoded for this request yet.
+// The target's sequence memory is untouched at every call site; the MTP
+// transition left i_batch = -1 with no prompt rows, so re-queue the prompt
+// when nothing has been decoded for this request yet and let the plain
+// PROCESSING_PROMPT loop (rn-slot-manager.cpp build_batch) add the rows and
+// set i_batch.
 void llama_rn_slot::fall_back_to_plain(const char * why) {
     if (!mtp_capability_logged) {
         mtp_capability_logged = true;
         LOG_ERROR("%s", why);
     }
+    // common/speculative.cpp:1414 arms nextn output on the target and no
+    // engine-side reset exists -- turn it off for the plain path.
+    const bool owned_draft = !spec_is_shared;
     reset_speculative();
+    if (owned_draft && params != nullptr) {
+        // drop this init's draft pointers before the freed context rots them
+        params->speculative.draft.ctx_tgt = nullptr;
+        params->speculative.draft.ctx_dft = nullptr;
+    }
+    llama_set_embeddings_nextn(parent_ctx->active_ctx(), false, false);
     spec_n_past = -1;
     if (generated_tokens.empty()) {
         state = SLOT_STATE_PROCESSING_PROMPT;
@@ -456,8 +467,8 @@ void llama_rn_slot::init_mtp() {
         // createMTPDraftContext bottoms out in llama_init_from_model, which
         // throws for pure recurrent and hybrid-SWA architectures (ctx_other
         // unsupported). Nothing above has touched the target -- the clears
-        // below have not run -- so the shared-batch prompt state and i_batch
-        // stay valid and the plain path serves this request.
+        // below have not run -- so the prompt state stays valid for a
+        // re-queued plain ingest.
         std::string why = "this model cannot create an MTP draft context (" + std::string(e.what()) + "); running plain";
         fall_back_to_plain(why.c_str());
         return;

@@ -49,8 +49,12 @@ KNOWN_ABSENT = {
     "kleidiai/kleidiai.h",      # optional CPU backend, build-flag guarded
     "llamafile/sgemm.h",        # optional CPU backend, build-flag guarded
     "spacemit/ime.h",           # optional CPU backend, build-flag guarded
-    "half.hpp",                 # ggml-opencl.cpp, #ifdef __cplusplus; the
-                                # OpenCL SDK provides it
+    "half.hpp",                 # ggml-opencl.cpp:14135, inside an #if 0 block
+}
+# The kernel headers that the Android build generates from kernels/*.cl
+# (kernels/embed_kernel.py); a *different* x.cl.h include is a real failure.
+GENERATED_KERNEL_HEADERS = {
+    os.path.basename(k) + ".h" for k in glob.glob(os.path.join(cpp, "ggml-opencl/kernels/*.cl"))
 }
 SEARCH = ["", "common", "common/jinja", "ggml-cpu", "ggml-hexagon/htp",
           "tools/mtmd", "nlohmann"]
@@ -77,7 +81,9 @@ for f in files:
         if inc in KNOWN_ABSENT:
             continue
         if inc.endswith(".cl.h"):
-            continue    # generated from kernels/*.cl by kernels/embed_kernel.py
+            # real generated kernel headers only (see GENERATED_KERNEL_HEADERS)
+            if inc in GENERATED_KERNEL_HEADERS:
+                continue
         here = os.path.join(os.path.dirname(f), inc)
         if os.path.exists(here) or any(os.path.exists(os.path.join(d, inc)) for d in SEARCH):
             continue

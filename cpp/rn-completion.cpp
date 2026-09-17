@@ -866,6 +866,18 @@ void llama_rn_context_completion::resetSpeculative() {
     draft_rollback_fenced = false;
 }
 
+// One error line, then plain. The target is untouched at every call site, so
+// loadPrompt's embd/n_past stay valid and nextToken's plain while-loop decodes
+// the prompt tail.
+void llama_rn_context_completion::fallBackToPlain(const char * why) {
+    if (!mtp_capability_logged) {
+        mtp_capability_logged = true;
+        LOG_ERROR("%s", why);
+    }
+    resetSpeculative();
+    spec_n_past = -1;
+}
+
 void llama_rn_context_completion::initMTP() {
     if (!shouldUseMTP()) {
         return;
@@ -893,12 +905,21 @@ void llama_rn_context_completion::initMTP() {
         // throws for pure recurrent and hybrid-SWA architectures (ctx_other
         // unsupported). Nothing above has touched the target -- embd/n_past
         // from loadPrompt stay valid -- so the plain path serves this turn.
-        if (!mtp_capability_logged) {
-            mtp_capability_logged = true;
-            LOG_ERROR("this model cannot create an MTP draft context (%s); running plain", e.what());
-        }
-        resetSpeculative();
-        spec_n_past = -1;
+        std::string why = "this model cannot create an MTP draft context (" + std::string(e.what()) + "); running plain";
+        fallBackToPlain(why.c_str());
+        return;
+    }
+
+    // Probe the draft clear before anything else consumes this draft: on this
+    // pin the draft's KV cache is shared with the target for dense models, and
+    // a shared cache refuses both seq_rm and init_batch (llama-kv-cache.cpp:411
+    // and :757, TAG_KV_CACHE_SHARE_CELLS), so common_speculative_process could
+    // never decode a proposal from it. When kalsallama lifts the decode fence
+    // for shared cells, this probe must be re-evaluated: seq_rm may still be
+    // refused while decode works, and this latch would then disable MTP that
+    // could run.
+    if (!rn_seq_rm(spec_ctx.get(), 0, -1, -1)) {
+        fallBackToPlain("MTP: this engine cannot decode from a KV cache shared with the target (llama-kv-cache.cpp init_batch fence, TAG_KV_CACHE_SHARE_CELLS); running plain");
         return;
     }
 
@@ -1047,10 +1068,9 @@ bool llama_rn_context_completion::refillMTPTokens() {
         }
 
         // Draft-side removal is advisory: every proposal is verified by the
-        // target sampler, so a failure here never corrupts output. On a
-        // shared cache seq_rm is refused by design -- stop asking after the
-        // first refusal to keep logcat quiet; on hybrid targets it succeeds
-        // and keeps the draft trimmed.
+        // target sampler, so a failure here never corrupts output. The init
+        // probe latches fenced caches, so this site is reachable only if the
+        // cache's sharing changes after init.
         if (!draft_rollback_fenced && !rn_seq_rm(spec_ctx.get(), seq_id, spec_n_past, -1)) {
             draft_rollback_fenced = true;
             LOG_INFO("MTP: draft memory refuses rollbacks (shared KV cache); proposals stay verified by the target");

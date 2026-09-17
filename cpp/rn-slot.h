@@ -59,7 +59,7 @@ struct llama_rn_slot {
     // Context management
     llama_rn_context* parent_ctx;  // Parent context reference
     int32_t n_ctx;                 // Context size for this slot
-    llama_pos n_past;              // Number of tokens processed
+    llama_pos n_past = 0;              // Number of tokens processed
     int32_t n_decoded;             // Tokens generated so far
     int32_t n_remaining;           // Tokens left to generate (-1 = unlimited)
     int32_t i_batch;               // Position in current batch
@@ -189,6 +189,7 @@ struct llama_rn_slot {
     completion_chat_output parseChatOutput(bool is_partial);
     bool should_use_mtp() const;
     void reset_speculative();
+    void fall_back_to_plain(const char * why);
     void init_mtp();
     void eval_mtp_prompt();
     bool refill_mtp_tokens();

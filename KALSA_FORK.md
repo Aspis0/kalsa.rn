@@ -67,3 +67,10 @@ committing a regenerated `cpp/`, bump that ref to the new commit.
 Merge upstream with `git merge v0.12.x` on `kalsa`. Do not resolve engine-file
 conflicts by hand: take any resolution and re-run `pin`, so `cpp/` is
 regenerated from kalsallama + patches.
+
+### Pin bump checklist
+
+After moving the pin, grep the new tree for `TAG_KV_CACHE_SHARE_CELLS` and
+re-read the draft-clear probe in `init_mtp`/`initMTP`: the probe disables MTP
+for draft caches that refuse shared-cell rollbacks, and a lifted fence means
+MTP could run again.

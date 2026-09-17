@@ -216,6 +216,7 @@ struct llama_rn_context_completion {
     completion_token_output nextToken();
     bool shouldUseMTP() const;
     void resetSpeculative();
+    void fallBackToPlain(const char * why);
     void initMTP();
     void evalMTPPrompt();
     bool refillMTPTokens();

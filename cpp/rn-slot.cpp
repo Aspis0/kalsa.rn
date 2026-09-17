@@ -399,6 +399,21 @@ void llama_rn_slot::reset_speculative() {
     spec_pending_tokens.clear();
 }
 
+// One error line, then plain. The target is untouched at every call site, so
+// the shared-batch prompt state and i_batch stay valid; re-queue the prompt
+// when nothing has been decoded for this request yet.
+void llama_rn_slot::fall_back_to_plain(const char * why) {
+    if (!mtp_capability_logged) {
+        mtp_capability_logged = true;
+        LOG_ERROR("%s", why);
+    }
+    reset_speculative();
+    spec_n_past = -1;
+    if (generated_tokens.empty()) {
+        state = SLOT_STATE_PROCESSING_PROMPT;
+    }
+}
+
 void llama_rn_slot::init_mtp() {
     if (!should_use_mtp() || spec != nullptr) {
         return;
@@ -443,19 +458,21 @@ void llama_rn_slot::init_mtp() {
         // unsupported). Nothing above has touched the target -- the clears
         // below have not run -- so the shared-batch prompt state and i_batch
         // stay valid and the plain path serves this request.
-        if (!mtp_capability_logged) {
-            mtp_capability_logged = true;
-            LOG_ERROR("this model cannot create an MTP draft context (%s); running plain", e.what());
-        }
-        reset_speculative();
-        spec_n_past = -1;
-        if (generated_tokens.empty()) {
-            // build_batch's MTP branch moved this slot to GENERATING with
-            // i_batch = -1 and no prompt rows, expecting init_mtp to ingest
-            // the prompt; re-queue it so the plain PROCESSING_PROMPT loop
-            // decodes prompt_tokens from n_past == 0.
-            state = SLOT_STATE_PROCESSING_PROMPT;
-        }
+        std::string why = "this model cannot create an MTP draft context (" + std::string(e.what()) + "); running plain";
+        fall_back_to_plain(why.c_str());
+        return;
+    }
+
+    // Probe the draft clear before the target clear: on this pin the draft's
+    // KV cache is shared with the target for dense models, and a shared cache
+    // refuses both seq_rm and init_batch (llama-kv-cache.cpp:411 and :757,
+    // TAG_KV_CACHE_SHARE_CELLS), so common_speculative_process could never
+    // decode a proposal from it. When kalsallama lifts the decode fence for
+    // shared cells, this probe must be re-evaluated: seq_rm may still be
+    // refused while decode works, and this latch would then disable MTP that
+    // could run.
+    if (!rn_seq_rm(spec_ctx, id, -1, -1)) {
+        fall_back_to_plain("MTP: this engine cannot decode from a KV cache shared with the target (llama-kv-cache.cpp init_batch fence, TAG_KV_CACHE_SHARE_CELLS); running plain");
         return;
     }
 
@@ -464,11 +481,6 @@ void llama_rn_slot::init_mtp() {
 
     if (!rn_seq_rm(parent_ctx->active_ctx(), id, -1, -1)) {
         throw std::runtime_error("MTP: failed to clear sequence " + std::to_string(id));
-    }
-    if (!rn_seq_rm(spec_ctx, id, -1, -1)) {
-        // The draft's KV refuses rollbacks (shared with the target): mark it
-        // fenced instead of failing -- the rollback is advisory.
-        draft_rollback_fenced = true;
     }
     n_past = 0;
 
@@ -570,10 +582,9 @@ bool llama_rn_slot::refill_mtp_tokens() {
         }
 
         // Draft-side removal is advisory: every proposal is verified by the
-        // target sampler, so a failure here never corrupts output. On a
-        // shared cache seq_rm is refused by design -- stop asking after the
-        // first refusal to keep logcat quiet; on hybrid targets it succeeds
-        // and keeps the draft trimmed.
+        // target sampler, so a failure here never corrupts output. The init
+        // probe latches fenced caches, so this site is reachable only if the
+        // cache's sharing changes after init.
         if (!draft_rollback_fenced && !rn_seq_rm(spec_ctx, seq_id, spec_n_past, -1)) {
             draft_rollback_fenced = true;
             LOG_INFO("MTP: draft memory refuses rollbacks (shared KV cache); proposals stay verified by the target");

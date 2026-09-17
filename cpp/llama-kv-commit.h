@@ -8,12 +8,6 @@ bool llama_kv_context_has_non_host_v(const llama_context * ctx);
 // Exact predicate used by governor auto-selection: staged V requires transposed, device-resident V.
 bool llama_kv_context_can_stage_v(const llama_context * ctx);
 
-// Cell-based attention cache backing a context: hybrid memories (e.g. lfm2) wrap
-// it in llama_memory_hybrid, so llama_get_memory() must never be cast to
-// llama_kv_cache directly. Returns nullptr when the memory has no cache.
-LLAMA_API llama_kv_cache * llama_kv_context_attn_cache(llama_context * ctx);
-LLAMA_API const llama_kv_cache * llama_kv_context_attn_cache(const llama_context * ctx);
-
 bool llama_kv_commit_cache_range(llama_kv_cache * dst, const llama_kv_cache * src,
                                  llama_kv_commit_mode mode, lm_ggml_backend_sched_t src_sched,
                                  llama_seq_id seq_id, llama_pos p0, llama_pos p1,

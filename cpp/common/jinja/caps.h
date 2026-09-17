@@ -16,9 +16,6 @@ struct caps {
     // supports preserve reasoning trace in the full history, not just the last assistant message
     bool supports_preserve_reasoning = false;
 
-    // supports reasoning effort levels
-    bool supports_reasoning_effort = false;
-
     // one of the 2 content capabilities must be true
     bool supports_string_content = true;
     bool supports_typed_content = false;
@@ -35,6 +32,5 @@ struct caps {
 caps caps_get(jinja::program & prog);
 
 void caps_apply_preserve_reasoning(jinja::context & ctx, bool enabled);
-void caps_apply_reasoning_effort(jinja::context & ctx, const std::string & effort);
 
 } // namespace jinja

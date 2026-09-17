@@ -5,7 +5,6 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "traits.h"
-#include "iqp.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
 #include "quants.h"
@@ -1559,13 +1558,6 @@ UseGgmlGemm1:;
 
     lm_ggml_barrier(params->threadpool);
 
-    // IQ panel gemm (see iqp.h) - must come after the barrier above, it consumes the q8_K rows
-    // of src1 from the work buffer
-    if (lm_ggml_cpu_iqp_supports_mul_mat(dst) && !params->use_ref) {
-        lm_ggml_compute_forward_mul_mat_iqp(params, dst);
-        return;
-    }
-
 #if LM_GGML_USE_LLAMAFILE
     if (src1->type != vec_dot_type) {
         const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
@@ -1891,16 +1883,6 @@ static void lm_ggml_compute_forward_mul_mat_id(
     char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as]
         incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
 
-    // IQ panel gemm (see iqp.h); per expert eligibility is decided below, but the work buffer is
-    // reserved for the whole node (lm_ggml_graph_plan sizes it without params, use_ref only skips the dispatch)
-    const bool iqp = lm_ggml_cpu_iqp_supports_mul_mat_id(dst) && !params->use_ref;
-
-    char * iqp_panels = NULL;
-
-    if (iqp) {
-        iqp_panels = incr_ptr_aligned(&wdata_cur, nth * lm_ggml_cpu_iqp_scratch_size(dst), 64);
-    }
-
     LM_GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
     if (src1->type != vec_dot_type) {
@@ -1981,13 +1963,6 @@ static void lm_ggml_compute_forward_mul_mat_id(
         // consumed; the hook may block until src0's expert weights are resident.
         if (g_expert_ready_hook) {
             g_expert_ready_hook(src0, cur_a, g_expert_ready_hook_data);
-        }
-
-        if (iqp && lm_ggml_cpu_iqp_mul_mat_id_min_batch(cne1)) {
-            lm_ggml_compute_forward_mul_mat_id_iqp(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0),
-                                                iqp_panels);
-
-            continue;
         }
 
         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
@@ -2401,22 +2376,6 @@ static void lm_ggml_compute_forward(struct lm_ggml_compute_params * params, stru
             {
                 lm_ggml_compute_forward_gated_delta_net(params, tensor);
             } break;
-        case LM_GGML_OP_LIGHTNING_INDEXER:
-            {
-                lm_ggml_compute_forward_lightning_indexer(params, tensor);
-            } break;
-        case LM_GGML_OP_DSV4_HC_COMB:
-            {
-                lm_ggml_compute_forward_dsv4_hc_comb(params, tensor);
-            } break;
-        case LM_GGML_OP_DSV4_HC_PRE:
-            {
-                lm_ggml_compute_forward_dsv4_hc_pre(params, tensor);
-            } break;
-        case LM_GGML_OP_DSV4_HC_POST:
-            {
-                lm_ggml_compute_forward_dsv4_hc_post(params, tensor);
-            } break;
         case LM_GGML_OP_MAP_CUSTOM1:
             {
                 lm_ggml_compute_forward_map_custom1(params, tensor);
@@ -2597,9 +2556,6 @@ static int lm_ggml_get_n_tasks(struct lm_ggml_tensor * node, int n_threads) {
         case LM_GGML_OP_COUNT_EQUAL:
         case LM_GGML_OP_SOLVE_TRI:
         case LM_GGML_OP_GATED_DELTA_NET:
-        case LM_GGML_OP_DSV4_HC_COMB:
-        case LM_GGML_OP_DSV4_HC_PRE:
-        case LM_GGML_OP_DSV4_HC_POST:
             {
                 n_tasks = n_threads;
             } break;
@@ -2652,7 +2608,6 @@ static int lm_ggml_get_n_tasks(struct lm_ggml_tensor * node, int n_threads) {
                 case LM_GGML_GLU_OP_SWIGLU_OAI:
                 case LM_GGML_GLU_OP_GEGLU_ERF:
                 case LM_GGML_GLU_OP_GEGLU_QUICK:
-                case LM_GGML_GLU_OP_SWIGLU_CLAMP:
                     {
                         n_tasks = n_threads;
                     } break;
@@ -2741,7 +2696,6 @@ static int lm_ggml_get_n_tasks(struct lm_ggml_tensor * node, int n_threads) {
         case LM_GGML_OP_FLASH_ATTN_BACK:
         case LM_GGML_OP_SSM_CONV:
         case LM_GGML_OP_SSM_SCAN:
-        case LM_GGML_OP_LIGHTNING_INDEXER:
             {
                 n_tasks = n_threads;
             } break;
@@ -2950,7 +2904,7 @@ static bool lm_ggml_thread_apply_priority(int32_t prio) {
     return true;
 }
 
-#elif defined(__linux__)
+#elif defined(__gnu_linux__)
 // TODO: this may not work on BSD, to be verified
 
 static bool lm_ggml_thread_apply_affinity(const bool * mask) {
@@ -3137,11 +3091,6 @@ struct lm_ggml_cplan lm_ggml_graph_plan(
     n_threads = 1;
 #endif
 
-#if defined(__wasi__)
-    // WASI doesn't support parallelism yet
-    n_threads = 1;
-#endif
-
     size_t work_size = 0;
 
     struct lm_ggml_cplan cplan;
@@ -3199,11 +3148,6 @@ struct lm_ggml_cplan lm_ggml_graph_plan(
                         if (node->src[1]->type != vec_dot_type) {
                             cur = lm_ggml_row_size(vec_dot_type, lm_ggml_nelements(node->src[1]));
                         }
-
-                        // the IQ panel path needs one scratch panel per thread past the q8_K rows
-                        if (lm_ggml_cpu_iqp_supports_mul_mat(node)) {
-                            cur = LM_GGML_PAD(cur, 64) + n_tasks * lm_ggml_cpu_iqp_scratch_size(node);
-                        }
                     } break;
                 case LM_GGML_OP_MUL_MAT_ID:
                     {
@@ -3230,21 +3174,10 @@ struct lm_ggml_cplan lm_ggml_graph_plan(
                         // (2 * 1.0625 B/el >= Q8_K 1.1406); +256 is alignment, not Q8_K-row slack.
                         cur += ids->ne[0] * lm_ggml_row_size(LM_GGML_TYPE_Q8_0, src0->ne[1]) + 256;
                         cur += lm_ggml_row_size(LM_GGML_TYPE_Q8_K, src0->ne[0]) + 256;   // q_input slack if src0 is down-shaped
-                        // the IQ panel path needs one scratch panel per thread on top of that
-                        if (lm_ggml_cpu_iqp_supports_mul_mat_id(node)) {
-                            cur += n_tasks * lm_ggml_cpu_iqp_scratch_size(node) + 64;
-                        }
                     } break;
                 case LM_GGML_OP_OUT_PROD:
                     {
-                        if (lm_ggml_is_quantized(node->src[0]->type) ||
-                            node->src[0]->type == LM_GGML_TYPE_F16) {
-                            cur = lm_ggml_type_size(LM_GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
-                        }
-                    } break;
-                case LM_GGML_OP_SET_ROWS:
-                    {
-                        if (node->src[0]->type == LM_GGML_TYPE_F16 && node->type != LM_GGML_TYPE_F16) {
+                        if (lm_ggml_is_quantized(node->src[0]->type)) {
                             cur = lm_ggml_type_size(LM_GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
                         }
                     } break;
@@ -3294,13 +3227,12 @@ struct lm_ggml_cplan lm_ggml_graph_plan(
                         const int64_t ne10 = node->src[1]->ne[0]; // W
                         const int64_t ne11 = node->src[1]->ne[1]; // H
                         const int64_t ne12 = node->src[1]->ne[2]; // Channels In
-                        const int64_t ne13 = node->src[1]->ne[3]; // Batch
 
                         LM_GGML_ASSERT(node->src[0]->type == LM_GGML_TYPE_F16 || node->src[0]->type == LM_GGML_TYPE_F32);
                         LM_GGML_ASSERT(node->src[1]->type == LM_GGML_TYPE_F32);
 
                         cur += lm_ggml_type_size(node->src[0]->type) * ne00 * ne01 * ne02 * ne03;
-                        cur += lm_ggml_type_size(node->src[0]->type) * ne10 * ne11 * ne12 * ne13;
+                        cur += lm_ggml_type_size(node->src[0]->type) * ne10 * ne11 * ne12;
 
                     } break;
                 case LM_GGML_OP_TOP_K:
@@ -3356,12 +3288,6 @@ struct lm_ggml_cplan lm_ggml_graph_plan(
                     {
                         LM_GGML_ABORT("fatal error");
                     }
-                case LM_GGML_OP_LIGHTNING_INDEXER:
-                    {
-                        // temp buffer for dequantizing lightning indexer keys
-                        const int64_t ne10 = node->src[1]->ne[0];
-                        cur += sizeof(float)*ne10*n_tasks;
-                    } break;
                 default:
                     break;
             }
@@ -4707,14 +4633,6 @@ int lm_ggml_cpu_get_sve_cnt(void) {
 
 int lm_ggml_cpu_has_sme(void) {
 #if defined(__ARM_ARCH) && defined(__ARM_FEATURE_SME)
-    return 1;
-#else
-    return 0;
-#endif
-}
-
-int lm_ggml_cpu_has_sme2(void) {
-#if defined(__ARM_ARCH) && defined(__ARM_FEATURE_SME2)
     return 1;
 #else
     return 0;

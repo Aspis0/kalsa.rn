@@ -8,10 +8,6 @@
 // llama_memory_hybrid_iswa
 //
 
-float llama_memory_hybrid_iswa::get_used_frac() const {
-    return mem_attn->get_used_frac();
-}
-
 llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         const llama_model & model,
                             /* attn */

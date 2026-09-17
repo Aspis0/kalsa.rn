@@ -21,12 +21,6 @@ static llama_memory_t hybrid_attention_other(llama_memory_t mem_other) {
 // llama_memory_hybrid
 //
 
-// only the attention part has a cell-based utilization; the recurrent state is
-// a fixed-size tail with no meaningful fraction
-float llama_memory_hybrid::get_used_frac() const {
-    return mem_attn->get_used_frac();
-}
-
 llama_memory_hybrid::llama_memory_hybrid(
         const llama_model & model,
                             /* attn */

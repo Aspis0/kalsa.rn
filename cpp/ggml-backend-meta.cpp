@@ -132,7 +132,6 @@ static void lm_ggml_backend_meta_device_get_props(lm_ggml_backend_dev_t dev, lm_
         /* .host_buffer           = */ false, // Not implemented.
         /* .buffer_from_host_ptr  = */ false, // Not implemented.
         /* .events                = */ false, // Not implemented.
-        /* .mmap_support          = */ true,
     };
     for (lm_ggml_backend_dev_t simple_dev : meta_dev_ctx->simple_devs) {
         lm_ggml_backend_dev_props tmp_props;
@@ -141,7 +140,6 @@ static void lm_ggml_backend_meta_device_get_props(lm_ggml_backend_dev_t dev, lm_
         props->caps.host_buffer          = props->caps.host_buffer          && tmp_props.caps.host_buffer;
         props->caps.buffer_from_host_ptr = props->caps.buffer_from_host_ptr && tmp_props.caps.buffer_from_host_ptr;
         props->caps.events               = props->caps.events               && tmp_props.caps.events;
-        props->caps.mmap_support         = props->caps.mmap_support         && tmp_props.caps.mmap_support;
     }
 }
 
@@ -592,18 +590,7 @@ static struct lm_ggml_backend_meta_split_state lm_ggml_backend_meta_get_split_st
             LM_GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
             return {assume_sync ? LM_GGML_BACKEND_SPLIT_AXIS_MIRRORED : LM_GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
         }
-        if (src_ss[0].axis == src_ss[1].axis && src_ss[0].axis >= LM_GGML_BACKEND_SPLIT_AXIS_2 &&
-                src_ss[0].axis < LM_GGML_MAX_DIMS) {
-            LM_GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
-            return src_ss[0];
-        }
-        // batched matmul with the batches split across devices and a replicated activation
-        if (src_ss[0].axis >= LM_GGML_BACKEND_SPLIT_AXIS_2 && src_ss[0].axis < LM_GGML_MAX_DIMS &&
-                src_ss[1].axis == LM_GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
-            return src_ss[0];
-        }
-        LM_GGML_ABORT("unsupported mul_mat split states: node=%s src0=%s axis=%d src1=%s axis=%d",
-            tensor->name, tensor->src[0]->name, (int) src_ss[0].axis, tensor->src[1]->name, (int) src_ss[1].axis);
+        LM_GGML_ABORT("fatal error");
         //return {LM_GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
     };
 
@@ -613,40 +600,27 @@ static struct lm_ggml_backend_meta_split_state lm_ggml_backend_meta_get_split_st
             case LM_GGML_BACKEND_SPLIT_AXIS_1:
             case LM_GGML_BACKEND_SPLIT_AXIS_2:
             case LM_GGML_BACKEND_SPLIT_AXIS_3: {
-                int64_t base_ne_in = 1;
-                for (int dim = 0; dim <= src_ss[0].axis; dim++) {
+                LM_GGML_ASSERT(src_ss[0].n_segments == 1);
+                if (src_ss[0].axis == lm_ggml_n_dims(tensor->src[0]) - 1 && src_ss[0].nr[0] == 1) {
+                    return {lm_ggml_backend_meta_split_axis(lm_ggml_n_dims(tensor) - 1), {0}, {1}, 1};
+                }
+                int64_t base_ne_in = tensor->src[0]->ne[0];
+                for (int dim = 1; dim <= src_ss[0].axis; dim++) {
                     base_ne_in *= tensor->src[0]->ne[dim];
                 }
-                if (src_ss[0].n_segments == 1) {
-                    base_ne_in /= src_ss[0].nr[0];
-                    if (src_ss[0].axis == lm_ggml_n_dims(tensor->src[0]) - 1 && src_ss[0].nr[0] == 1) {
-                        return {lm_ggml_backend_meta_split_axis(lm_ggml_n_dims(tensor) - 1), {0}, {1}, 1};
-                    }
-                    if (src_ss[0].axis == LM_GGML_BACKEND_SPLIT_AXIS_0 && tensor->ne[0] == tensor->src[0]->ne[0] &&
-                            tensor->ne[1] == 1 && src_ss[0].nr[0] == 1) {
-                        bool complete_rows = true;
-                        for (size_t j = 0; j < n_bufs; j++) {
-                            const int64_t ne = src_ss[0].ne[j];
-                            complete_rows = complete_rows && (ne == 0 || ne == tensor->src[0]->ne[0]);
-                        }
-                        if (complete_rows) {
-                            // Move a complete dim-0 split to the following singleton dimension.
-                            return {LM_GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
-                        }
-                    }
-                }
-                // Reshape outputs use one segment; split-state propagation merges source segments.
+                base_ne_in /= src_ss[0].nr[0];
                 int64_t base_ne_out = 1;
                 for (int dim = 0; dim < LM_GGML_MAX_DIMS; dim++) {
-                    base_ne_out *= tensor->ne[dim];
-                    if (base_ne_out % base_ne_in == 0) {
-                        return {lm_ggml_backend_meta_split_axis(dim), {0}, {uint32_t(base_ne_out/base_ne_in)}, 1};
+                    const int64_t base_ne_out_next = base_ne_out *= tensor->ne[dim];
+                    if (base_ne_out_next % base_ne_in == 0) {
+                        return {lm_ggml_backend_meta_split_axis(dim), {0}, {uint32_t(base_ne_out_next/base_ne_in)}, 1};
                     }
-                    if (base_ne_out > base_ne_in) {
+                    if (base_ne_out_next > base_ne_in) {
                         LM_GGML_ASSERT(src_ss[0].n_segments == 1);
                         LM_GGML_ASSERT(src_ss[0].nr[0]      == 1);
                         return {lm_ggml_backend_meta_split_axis(dim), {0}, {1}, 1};
                     }
+                    base_ne_out = base_ne_out_next;
                 }
                 LM_GGML_ABORT("shape mismatch for %s", lm_ggml_op_name(tensor->op));
             }
@@ -771,31 +745,12 @@ static struct lm_ggml_backend_meta_split_state lm_ggml_backend_meta_get_split_st
     };
 
     auto handle_flash_attn_ext = [&](const std::vector<lm_ggml_backend_meta_split_state> & src_ss) -> lm_ggml_backend_meta_split_state {
-        LM_GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == LM_GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-
-        if (src_ss[0].axis == LM_GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
-            LM_GGML_ASSERT(src_ss[1].axis == LM_GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-            LM_GGML_ASSERT(src_ss[2].axis == LM_GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-            LM_GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == LM_GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-            return {LM_GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
-        }
-
-        LM_GGML_ASSERT(src_ss[0].axis == LM_GGML_BACKEND_SPLIT_AXIS_2);
-        const bool kv_split = src_ss[1].axis == LM_GGML_BACKEND_SPLIT_AXIS_2 &&
-                src_ss[2].axis == LM_GGML_BACKEND_SPLIT_AXIS_2;
-        const bool kv_mirrored = src_ss[1].axis == LM_GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
-                src_ss[2].axis == LM_GGML_BACKEND_SPLIT_AXIS_MIRRORED;
-        LM_GGML_ASSERT(kv_split || kv_mirrored);
+        LM_GGML_ASSERT(                             src_ss[0].axis == LM_GGML_BACKEND_SPLIT_AXIS_2);
+        LM_GGML_ASSERT(                             src_ss[1].axis == LM_GGML_BACKEND_SPLIT_AXIS_2);
+        LM_GGML_ASSERT(                             src_ss[2].axis == LM_GGML_BACKEND_SPLIT_AXIS_2);
+        LM_GGML_ASSERT(tensor->src[4] == nullptr || src_ss[3].axis == LM_GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         LM_GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == LM_GGML_BACKEND_SPLIT_AXIS_0);
         return {LM_GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
-    };
-
-    auto handle_lightning_indexer = [&](
-            const std::vector<lm_ggml_backend_meta_split_state> & src_ss) -> lm_ggml_backend_meta_split_state {
-        for (size_t i = 0; i < 4; i++) {
-            LM_GGML_ASSERT(src_ss[i].axis == LM_GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-        }
-        return {LM_GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
     };
 
     auto handle_ssm_conv = [&](const std::vector<lm_ggml_backend_meta_split_state> & src_ss) -> lm_ggml_backend_meta_split_state {
@@ -835,7 +790,7 @@ static struct lm_ggml_backend_meta_split_state lm_ggml_backend_meta_get_split_st
             lm_ggml_backend_dev_t dev = lm_ggml_backend_buft_get_device(lm_ggml_backend_buffer_get_type(tensor->buffer));
             const lm_ggml_backend_meta_device_context * dev_ctx = (const lm_ggml_backend_meta_device_context *) dev->context;
             lm_ggml_backend_meta_split_state ret = dev_ctx->get_split_state(tensor, dev_ctx->get_split_state_ud);
-            if (ret.axis >= 0 && ret.axis < LM_GGML_MAX_DIMS) {
+            if (ret.axis >= 0 && ret.axis <= LM_GGML_MAX_DIMS) {
                 const int64_t granularity = ret.axis == LM_GGML_BACKEND_SPLIT_AXIS_0 ? lm_ggml_blck_size(tensor->type) : 1;
                 int64_t ne_sum = 0;
                 for (size_t s = 0; s < ret.n_segments; s++) {
@@ -845,9 +800,6 @@ static struct lm_ggml_backend_meta_split_state lm_ggml_backend_meta_get_split_st
                     }
                 }
                 LM_GGML_ASSERT(ne_sum == tensor->ne[ret.axis]);
-            } else if (ret.axis == LM_GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
-                LM_GGML_ASSERT(ret.n_segments == 1);
-                LM_GGML_ASSERT(ret.nr[0] == 1);
             }
             return ret;
         }
@@ -968,7 +920,7 @@ static struct lm_ggml_backend_meta_split_state lm_ggml_backend_meta_get_split_st
                 split_state = handle_rope(src_ss);
             } break;
             case LM_GGML_OP_ROPE_BACK: {
-                split_state = handle_rope(src_ss);
+                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
             case LM_GGML_OP_CLAMP: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
@@ -1031,14 +983,6 @@ static struct lm_ggml_backend_meta_split_state lm_ggml_backend_meta_get_split_st
             } break;
             case LM_GGML_OP_GATED_DELTA_NET: {
                 split_state = handle_gated_delta_net(src_ss);
-            } break;
-            case LM_GGML_OP_LIGHTNING_INDEXER: {
-                split_state = handle_lightning_indexer(src_ss);
-            } break;
-            case LM_GGML_OP_DSV4_HC_COMB:
-            case LM_GGML_OP_DSV4_HC_PRE:
-            case LM_GGML_OP_DSV4_HC_POST: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
             case LM_GGML_OP_UNARY: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
@@ -1119,14 +1063,13 @@ static struct lm_ggml_backend_meta_split_state lm_ggml_backend_meta_get_split_st
         if (buf_ctx->debug > 0) {
             std::string srcs_info;
             for (size_t i = 0; i < LM_GGML_MAX_SRC; i++) {
-                if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
+                if (tensor->src[i] == nullptr) {
                     continue;
                 }
                 if (!srcs_info.empty()) {
                     srcs_info += ", ";
                 }
-                const lm_ggml_backend_meta_split_state split_state =
-                        lm_ggml_backend_meta_get_split_state(tensor->src[i], true);
+                const lm_ggml_backend_meta_split_state split_state = lm_ggml_backend_meta_get_split_state(tensor->src[0], true);
                 LM_GGML_ASSERT(split_state.n_segments == 1);
                 const char * axis_name = lm_ggml_backend_meta_split_axis_name(split_state.axis);
                 std::string ne_info;
@@ -1168,6 +1111,7 @@ static struct lm_ggml_backend_meta_split_state lm_ggml_backend_meta_get_split_st
 }
 
 static struct lm_ggml_backend_meta_split_state lm_ggml_backend_meta_get_split_state(const struct lm_ggml_tensor * tensor, bool assume_sync) {
+    LM_GGML_ASSERT(lm_ggml_backend_buffer_is_meta(tensor->buffer));
     lm_ggml_backend_meta_buffer_context * buf_ctx = (lm_ggml_backend_meta_buffer_context *) tensor->buffer->context;
     return lm_ggml_backend_meta_get_split_state(buf_ctx->get_simple_tensor_container(tensor), tensor, assume_sync);
 }
@@ -1258,14 +1202,7 @@ static enum lm_ggml_status lm_ggml_backend_meta_buffer_init_tensor_impl(lm_ggml_
             t_ij->data = (char *) lm_ggml_backend_buffer_get_base(simple_buf)
                 + size_t(tensor->data) - size_t(lm_ggml_backend_buffer_get_base(tensor->buffer));
         }
-
-        if (simple_buf) {
-            // the backend that owns the buffer will set .extra
-            lm_ggml_backend_buffer_init_tensor(simple_buf, t_ij);
-        } else {
-            t_ij->extra = tensor->extra;
-        }
-
+        t_ij->extra = tensor->extra;
         for (int i = 0; i < LM_GGML_MAX_SRC; i++) {
             t_ij->src[i] = tensor->src[i];
             if (tensor->src[i] == tensor) {
@@ -1309,108 +1246,6 @@ static enum lm_ggml_status lm_ggml_backend_meta_buffer_init_tensor(lm_ggml_backe
     lm_ggml_backend_meta_buffer_context * buf_ctx = (lm_ggml_backend_meta_buffer_context *) buffer->context;
     buf_ctx->stc_compute_index = buf_ctx->stc_compute_index_next;
     return lm_ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->get_simple_tensor_container(tensor), tensor);
-}
-
-static void lm_ggml_backend_meta_buffer_memset_tensor(
-        lm_ggml_backend_buffer_t buffer, lm_ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
-    const size_t n_bufs = lm_ggml_backend_meta_buffer_n_bufs(buffer);
-    const lm_ggml_backend_meta_split_state split_state =
-            lm_ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
-    LM_GGML_ASSERT(lm_ggml_is_contiguous(tensor) || split_state.axis == LM_GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-
-    if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
-        LM_GGML_ASSERT(split_state.axis >= 0 && split_state.axis < LM_GGML_MAX_DIMS);
-        LM_GGML_ASSERT(split_state.nr[0] != 0);
-        LM_GGML_ASSERT(tensor->ne[3] == 1);
-
-        std::vector<size_t> simple_offsets(n_bufs, 0);
-        if (split_state.axis == LM_GGML_BACKEND_SPLIT_AXIS_0) {
-            LM_GGML_ASSERT(tensor->ne[2] == 1);
-
-            const size_t row_stride = tensor->nb[1];
-            LM_GGML_ASSERT(offset % row_stride == 0);
-            LM_GGML_ASSERT(size   % row_stride == 0);
-            const int64_t row_start = offset / row_stride;
-            const int64_t row_count = size   / row_stride;
-            LM_GGML_ASSERT(row_start + row_count <= tensor->ne[1]);
-
-            const int64_t blck_size = lm_ggml_blck_size(tensor->type);
-            for (size_t s = 0; s < split_state.n_segments; s++) {
-                for (size_t r = 0; r < split_state.nr[s]; r++) {
-                    for (size_t j = 0; j < n_bufs; j++) {
-                        lm_ggml_tensor * simple_tensor = lm_ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                        LM_GGML_ASSERT(split_state.ne[s*n_bufs + j] % blck_size == 0);
-                        const size_t nbytes = split_state.ne[s*n_bufs + j]/blck_size * tensor->nb[0];
-                        for (int64_t row = 0; row < row_count; row++) {
-                            lm_ggml_backend_tensor_memset(simple_tensor, value,
-                                    simple_offsets[j] + (row_start + row)*simple_tensor->nb[1], nbytes);
-                        }
-                        simple_offsets[j] += nbytes;
-                    }
-                }
-            }
-            return;
-        }
-
-        LM_GGML_ASSERT(split_state.axis == LM_GGML_BACKEND_SPLIT_AXIS_1);
-
-        const size_t row_stride = tensor->nb[2];
-        LM_GGML_ASSERT(offset % row_stride == 0);
-        LM_GGML_ASSERT(size   % row_stride == 0);
-        const int64_t row_start = offset / row_stride;
-        const int64_t row_count = size   / row_stride;
-        LM_GGML_ASSERT(row_start + row_count <= tensor->ne[2]);
-
-        for (size_t s = 0; s < split_state.n_segments; s++) {
-            for (size_t r = 0; r < split_state.nr[s]; r++) {
-                for (size_t j = 0; j < n_bufs; j++) {
-                    lm_ggml_tensor * simple_tensor = lm_ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                    const size_t nbytes = split_state.ne[s*n_bufs + j] * tensor->nb[1];
-                    for (int64_t row = 0; row < row_count; row++) {
-                        lm_ggml_backend_tensor_memset(simple_tensor, value,
-                                simple_offsets[j] + (row_start + row)*simple_tensor->nb[2], nbytes);
-                    }
-                    simple_offsets[j] += nbytes;
-                }
-            }
-        }
-        return;
-    }
-
-    switch (split_state.axis) {
-        case LM_GGML_BACKEND_SPLIT_AXIS_0:
-        case LM_GGML_BACKEND_SPLIT_AXIS_1:
-        case LM_GGML_BACKEND_SPLIT_AXIS_2: {
-            const size_t chunk_size_full = tensor->nb[split_state.axis + 1];
-            LM_GGML_ASSERT(offset % chunk_size_full == 0);
-            LM_GGML_ASSERT(size   % chunk_size_full == 0);
-            const int64_t i_start =  offset        / chunk_size_full;
-            const int64_t i_stop  = (offset + size) / chunk_size_full;
-            for (size_t j = 0; j < n_bufs; j++) {
-                lm_ggml_tensor * simple_tensor = lm_ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                const size_t chunk_size = simple_tensor->nb[split_state.axis + 1];
-                if (chunk_size == 0) {
-                    continue;
-                }
-                for (int64_t i = i_start; i < i_stop; i++) {
-                    lm_ggml_backend_tensor_memset(simple_tensor, value, i*chunk_size, chunk_size);
-                }
-            }
-        } break;
-        case LM_GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
-            LM_GGML_ASSERT(value == 0);
-            [[fallthrough]];
-        }
-        case LM_GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
-            for (size_t j = 0; j < n_bufs; j++) {
-                lm_ggml_tensor * simple_tensor = lm_ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                lm_ggml_backend_tensor_memset(simple_tensor, value, offset, size);
-            }
-        } break;
-        default: {
-            LM_GGML_ABORT("fatal error");
-        }
-    }
 }
 
 static void lm_ggml_backend_meta_buffer_set_tensor(lm_ggml_backend_buffer_t buffer, lm_ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
@@ -1510,29 +1345,15 @@ static void lm_ggml_backend_meta_buffer_set_tensor(lm_ggml_backend_buffer_t buff
         } break;
         case LM_GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
             LM_GGML_ASSERT(tensor->type == LM_GGML_TYPE_F32);
-            LM_GGML_ASSERT(offset % sizeof(float) == 0);
-            LM_GGML_ASSERT(size   % sizeof(float) == 0);
-            const size_t n_values = size / sizeof(float);
-            size_t n_contributors = 0;
-            for (size_t j = 0; j < n_bufs; j++) {
-                n_contributors += split_state.ne[j] != 0;
-            }
-            const bool has_contributor_mask = n_contributors != 0;
-            if (!has_contributor_mask) {
-                n_contributors = n_bufs;
-            }
-            std::vector<float> tmp(n_values);
-            for (size_t i = 0; i < n_values; i++) {
-                tmp[i] = ((const float *) data)[i] / n_contributors;
-            }
-            std::vector<float> zero;
-            if (has_contributor_mask) {
-                zero.resize(n_values, 0.0f);
+            const int64_t ne = lm_ggml_nelements(tensor);
+            std::vector<float> tmp;
+            tmp.reserve(ne);
+            for (int64_t i = 0; i < ne; i++) {
+                tmp.push_back(((const float *) data)[i] / n_bufs);
             }
             for (size_t j = 0; j < n_bufs; j++) {
                 lm_ggml_tensor * simple_tensor = lm_ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                const float * partial = has_contributor_mask && split_state.ne[j] == 0 ? zero.data() : tmp.data();
-                lm_ggml_backend_tensor_set(simple_tensor, partial, offset, size);
+                lm_ggml_backend_tensor_set(simple_tensor, tmp.data(), offset, size);
             }
         } break;
         default: {
@@ -1660,7 +1481,7 @@ static const lm_ggml_backend_buffer_i lm_ggml_backend_meta_buffer_iface = {
     /* .free_buffer     = */ lm_ggml_backend_meta_buffer_free_buffer,
     /* .get_base        = */ lm_ggml_backend_meta_buffer_get_base,
     /* .init_tensor     = */ lm_ggml_backend_meta_buffer_init_tensor,
-    /* .memset_tensor   = */ lm_ggml_backend_meta_buffer_memset_tensor,
+    /* .memset_tensor   = */ nullptr, // TODO implement
     /* .set_tensor      = */ lm_ggml_backend_meta_buffer_set_tensor,
     /* .get_tensor      = */ lm_ggml_backend_meta_buffer_get_tensor,
     /* .set_tensor_2d   = */ nullptr,
@@ -1672,16 +1493,6 @@ static const lm_ggml_backend_buffer_i lm_ggml_backend_meta_buffer_iface = {
 
 bool lm_ggml_backend_buffer_is_meta(lm_ggml_backend_buffer_t buf) {
     return buf != nullptr && buf->iface.free_buffer == lm_ggml_backend_meta_buffer_iface.free_buffer;
-}
-
-void lm_ggml_backend_meta_buffer_set_usage(lm_ggml_backend_buffer_t buffer, enum lm_ggml_backend_buffer_usage usage) {
-    LM_GGML_ASSERT(lm_ggml_backend_buffer_is_meta(buffer));
-    lm_ggml_backend_meta_buffer_context * buf_ctx = (lm_ggml_backend_meta_buffer_context *) buffer->context;
-    for (size_t i = 0; i < buf_ctx->bufs.size(); i++) {
-        if (buf_ctx->bufs[i]) {
-            lm_ggml_backend_buffer_set_usage(buf_ctx->bufs[i].get(), usage);
-        }
-    }
 }
 
 static lm_ggml_backend_buffer_t lm_ggml_backend_meta_buffer_type_alloc_buffer(lm_ggml_backend_buffer_type_t buft, size_t size) {
@@ -2023,7 +1834,7 @@ static enum lm_ggml_status lm_ggml_backend_meta_graph_compute(lm_ggml_backend_t 
 
         {
             // For MoE models it may make sense to delay the AllReduce in order to reduce I/O:
-            auto get_i_delayed_branch = [&](const int i) -> int {
+            auto get_i_delayed = [&](const int i) -> int {
                 int id = i; // i_delayed
                 int idr = i; // i_delayed return, last safe return value
 
@@ -2121,62 +1932,6 @@ static enum lm_ggml_status lm_ggml_backend_meta_graph_compute(lm_ggml_backend_t 
                 }
                 idr = id;
                 return idr;
-            };
-
-            // AllReduce(a) + AllReduce(b) == AllReduce(a + b) for independent partial branches.
-            auto get_i_delayed = [&](const int i) -> int {
-                const int i_delayed = get_i_delayed_branch(i);
-                lm_ggml_tensor * node = cgraph->nodes[i_delayed];
-
-                if (lm_ggml_node_get_use_count(cgraph, i_delayed) != 1) {
-                    return i_delayed;
-                }
-
-                for (int id = i_delayed + 1; id < cgraph->n_nodes; id++) {
-                    lm_ggml_tensor * next = cgraph->nodes[id];
-                    if (next->view_src == node) {
-                        return i_delayed;
-                    }
-                    for (int s = 0; s < LM_GGML_MAX_SRC; s++) {
-                        if (next->src[s] == node) {
-                            return i_delayed;
-                        }
-                    }
-
-                    if (next->view_src != nullptr && next->view_src->op == LM_GGML_OP_NONE && lm_ggml_backend_buffer_is_host(next->view_src->buffer)) {
-                        continue;
-                    }
-                    if (lm_ggml_backend_meta_get_split_state(next, false).axis != LM_GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
-                        continue;
-                    }
-
-                    const int i_other = id;
-                    const int i_other_delayed = get_i_delayed_branch(i_other);
-                    lm_ggml_tensor * other = cgraph->nodes[i_other_delayed];
-                    if (lm_ggml_node_get_use_count(cgraph, i_other_delayed) != 1 || i_other_delayed + 1 >= cgraph->n_nodes) {
-                        return i_delayed;
-                    }
-
-                    lm_ggml_tensor * sum = cgraph->nodes[i_other_delayed + 1];
-                    if (sum->op != LM_GGML_OP_ADD ||
-                            !lm_ggml_are_same_shape(node, other) || node->type != other->type || sum->type != node->type ||
-                            !((sum->src[0] == node && sum->src[1] == other) ||
-                              (sum->src[0] == other && sum->src[1] == node)) ||
-                            lm_ggml_backend_meta_get_split_state(sum, false).axis != LM_GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
-                        return i_delayed;
-                    }
-
-                    for (size_t j = 0; j < n_backends; j++) {
-                        auto & bcj = backend_ctx->backend_configs[j];
-                        const bool compute       = bcj.nodes[i]->flags       & LM_GGML_TENSOR_FLAG_COMPUTE;
-                        const bool compute_other = bcj.nodes[i_other]->flags & LM_GGML_TENSOR_FLAG_COMPUTE;
-                        if (compute != compute_other) {
-                            return i_delayed;
-                        }
-                    }
-                    return i_other_delayed + 1;
-                }
-                return i_delayed;
             };
 
             int i_start = 0;

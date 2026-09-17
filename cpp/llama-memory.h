@@ -100,10 +100,6 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
-    // fraction of memory in use in [0, 1], or a negative value when this memory
-    // type has no meaningful utilization metric (e.g. recurrent state)
-    virtual float get_used_frac() const { return -1.0f; }
-
     //
     // ops
     //

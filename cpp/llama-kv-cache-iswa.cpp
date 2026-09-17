@@ -11,16 +11,6 @@
 // llama_kv_cache_iswa
 //
 
-float llama_kv_cache_iswa::get_used_frac() const {
-    // the SWA ring recycles cells in place, so its occupancy saturates at 1.0
-    // during normal single-sequence use: it is not a pressure signal, and
-    // letting it drive the hook would fire early and latch forever, hiding
-    // the real crossing of the base cache. for pure-SWA layouts the base half
-    // owns no layers, reads 0.0 and the hook simply never fires (a pure-SWA
-    // cache cannot fail for a single sequence anyway).
-    return get_base()->get_used_frac();
-}
-
 llama_kv_cache_iswa::llama_kv_cache_iswa(
         const llama_model & model,
                 lm_ggml_type   type_k,

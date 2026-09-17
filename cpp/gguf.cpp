@@ -557,10 +557,6 @@ static struct lm_gguf_context * lm_gguf_init_from_reader(const struct lm_gguf_re
                 LM_GGML_LOG_ERROR("%s: encountered bad_alloc error while reading key %" PRIi64 "\n", __func__, i);
                 ok = false;
             }
-            if (ok && key.empty()) {
-                LM_GGML_LOG_ERROR("%s: key %" PRIi64 " is empty\n", __func__, i);
-                ok = false;
-            }
             for (size_t j = 0; ok && j < ctx->kv.size(); ++j) {
                 if (key == ctx->kv[j].key) {
                     LM_GGML_LOG_ERROR("%s: duplicate key '%s' for tensors %zu and %" PRIi64 " \n", __func__, key.c_str(), j, i);
@@ -611,13 +607,6 @@ static struct lm_gguf_context * lm_gguf_init_from_reader(const struct lm_gguf_re
         LM_GGML_ASSERT(int64_t(ctx->kv.size()) == n_kv);
 
         const int alignment_idx = lm_gguf_find_key(ctx, LM_GGUF_KEY_GENERAL_ALIGNMENT);
-        if (alignment_idx != -1 && lm_gguf_get_kv_type(ctx, alignment_idx) != LM_GGUF_TYPE_UINT32) {
-            LM_GGML_LOG_ERROR("%s: key '%s' must be of type %s but is %s\n",
-                __func__, LM_GGUF_KEY_GENERAL_ALIGNMENT, lm_gguf_type_name(LM_GGUF_TYPE_UINT32),
-                lm_gguf_type_name(lm_gguf_get_kv_type(ctx, alignment_idx)));
-            lm_gguf_free(ctx);
-            return nullptr;
-        }
         ctx->alignment = alignment_idx == -1 ? LM_GGUF_DEFAULT_ALIGNMENT : lm_gguf_get_val_u32(ctx, alignment_idx);
 
         if (ctx->alignment == 0 || (ctx->alignment & (ctx->alignment - 1)) != 0) {
@@ -689,11 +678,9 @@ static struct lm_gguf_context * lm_gguf_init_from_reader(const struct lm_gguf_re
             }
 
             // check that the total number of elements is representable
-            // (a zero-element tensor is trivially representable; the guard also avoids a division by zero below)
-            if (ok && lm_ggml_nelements(&info.t) > 0 &&
-                ((INT64_MAX/info.t.ne[1] <= info.t.ne[0]) ||
-                 (INT64_MAX/info.t.ne[2] <= info.t.ne[0]*info.t.ne[1]) ||
-                 (INT64_MAX/info.t.ne[3] <= info.t.ne[0]*info.t.ne[1]*info.t.ne[2]))) {
+            if (ok && ((INT64_MAX/info.t.ne[1] <= info.t.ne[0]) ||
+                       (INT64_MAX/info.t.ne[2] <= info.t.ne[0]*info.t.ne[1]) ||
+                       (INT64_MAX/info.t.ne[3] <= info.t.ne[0]*info.t.ne[1]*info.t.ne[2]))) {
 
                 LM_GGML_LOG_ERROR("%s: total number of elements in tensor '%s' with shape "
                     "(%" PRIi64 ", %" PRIi64 ", %" PRIi64 ", %" PRIi64 ") is >= %" PRIi64 "\n",
@@ -1195,11 +1182,6 @@ const char * lm_gguf_get_tensor_name(const struct lm_gguf_context * ctx, int64_t
     return ctx->info[tensor_id].t.name;
 }
 
-const int64_t * lm_gguf_get_tensor_ne(const struct lm_gguf_context * ctx, int64_t tensor_id) {
-    LM_GGML_ASSERT(tensor_id >= 0 && tensor_id < lm_gguf_get_n_tensors(ctx));
-    return ctx->info[tensor_id].t.ne;
-}
-
 enum lm_ggml_type lm_gguf_get_tensor_type(const struct lm_gguf_context * ctx, int64_t tensor_id) {
     LM_GGML_ASSERT(tensor_id >= 0 && tensor_id < lm_gguf_get_n_tensors(ctx));
     return ctx->info[tensor_id].t.type;
@@ -1433,7 +1415,7 @@ void lm_gguf_set_tensor_data(struct lm_gguf_context * ctx, const char * name, co
 struct lm_gguf_writer_base {
     size_t written_bytes {0u};
 
-    virtual ~lm_gguf_writer_base(void) = default;
+    ~lm_gguf_writer_base(void) = default;
 
     // we bet on devirtualization
     virtual void write(int8_t val) = 0;

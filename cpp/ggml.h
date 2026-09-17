@@ -570,10 +570,6 @@ extern "C" {
         LM_GGML_OP_RWKV_WKV7,
         LM_GGML_OP_SOLVE_TRI,
         LM_GGML_OP_GATED_DELTA_NET,
-        LM_GGML_OP_LIGHTNING_INDEXER,
-        LM_GGML_OP_DSV4_HC_COMB,
-        LM_GGML_OP_DSV4_HC_PRE,
-        LM_GGML_OP_DSV4_HC_POST,
 
         LM_GGML_OP_UNARY,
 
@@ -627,7 +623,6 @@ extern "C" {
         LM_GGML_GLU_OP_SWIGLU_OAI,
         LM_GGML_GLU_OP_GEGLU_ERF,
         LM_GGML_GLU_OP_GEGLU_QUICK,
-        LM_GGML_GLU_OP_SWIGLU_CLAMP,
 
         LM_GGML_GLU_OP_COUNT,
     };
@@ -783,10 +778,6 @@ extern "C" {
     LM_GGML_API bool lm_ggml_is_contiguous_0(const struct lm_ggml_tensor * tensor); // same as lm_ggml_is_contiguous()
     LM_GGML_API bool lm_ggml_is_contiguous_1(const struct lm_ggml_tensor * tensor); // contiguous for dims >= 1
     LM_GGML_API bool lm_ggml_is_contiguous_2(const struct lm_ggml_tensor * tensor); // contiguous for dims >= 2
-
-    LM_GGML_API bool lm_ggml_is_contiguous_to_1(const struct lm_ggml_tensor * tensor); // contiguous for dims < 1
-    LM_GGML_API bool lm_ggml_is_contiguous_to_2(const struct lm_ggml_tensor * tensor); // contiguous for dims < 2
-    LM_GGML_API bool lm_ggml_is_contiguous_to_3(const struct lm_ggml_tensor * tensor); // contiguous for dims < 3
 
     // returns whether the tensor elements are allocated as one contiguous block of memory (no gaps, but permutation ok)
     LM_GGML_API bool lm_ggml_is_contiguously_allocated(const struct lm_ggml_tensor * tensor);
@@ -1368,12 +1359,6 @@ extern "C" {
             float                 alpha,
             float                 limit);
 
-    LM_GGML_API struct lm_ggml_tensor * lm_ggml_swiglu_clamp(
-            struct lm_ggml_context * ctx,
-            struct lm_ggml_tensor  * a,
-            struct lm_ggml_tensor  * b,
-            float                 limit);
-
     // normalize along rows
     LM_GGML_API struct lm_ggml_tensor * lm_ggml_norm(
             struct lm_ggml_context * ctx,
@@ -1731,19 +1716,6 @@ extern "C" {
             struct lm_ggml_tensor  * a,
             int                   n_past);
 
-    LM_GGML_API struct lm_ggml_tensor * lm_ggml_clamp(
-            struct lm_ggml_context * ctx,
-            struct lm_ggml_tensor  * a,
-            float                 min,
-            float                 max);
-
-    // in-place, returns view(a)
-    LM_GGML_API struct lm_ggml_tensor * lm_ggml_clamp_inplace(
-            struct lm_ggml_context * ctx,
-            struct lm_ggml_tensor  * a,
-            float                 min,
-            float                 max);
-
     LM_GGML_API struct lm_ggml_tensor * lm_ggml_soft_max(
             struct lm_ggml_context * ctx,
             struct lm_ggml_tensor  * a);
@@ -2001,14 +1973,14 @@ extern "C" {
             float                 beta_fast,
             float                 beta_slow);
 
-    // set the offset dims for RoPE
-    // a must be LM_GGML_OP_ROPE or LM_GGML_OP_ROPE_BACK
-    // vision RoPE is not supported
-    // example: (marking: x = rotated, 0 = unrotated)
-    //     n_embd = 10, n_dims = 4, offset = 2 --> [00xxxx0000]
-    LM_GGML_API struct lm_ggml_tensor * lm_ggml_rope_set_offset(
+
+    // clamp
+    // in-place, returns view(a)
+    LM_GGML_API struct lm_ggml_tensor * lm_ggml_clamp(
+            struct lm_ggml_context * ctx,
             struct lm_ggml_tensor  * a,
-            int                   n_offs);
+            float                 min,
+            float                 max);
 
     // im2col
     // converts data into a format that effectively results in a convolution when combined with matrix multiplication
@@ -2453,12 +2425,6 @@ extern "C" {
     LM_GGML_API enum lm_ggml_prec lm_ggml_flash_attn_ext_get_prec(
             const struct lm_ggml_tensor * a);
 
-    // Use finite mask entries as a sparse K/V set. Set 0 to disable.
-    // n_kv_max must bound the number of finite entries in every mask row.
-    LM_GGML_API void lm_ggml_flash_attn_ext_set_n_kv_max(
-            struct lm_ggml_tensor * a,
-            int32_t              n_kv_max);
-
     LM_GGML_API void lm_ggml_flash_attn_ext_add_sinks(
             struct lm_ggml_tensor * a,
             struct lm_ggml_tensor * sinks);
@@ -2485,8 +2451,7 @@ extern "C" {
             struct lm_ggml_tensor  * A,
             struct lm_ggml_tensor  * B,
             struct lm_ggml_tensor  * C,
-            struct lm_ggml_tensor  * ids,
-            int64_t               K);
+            struct lm_ggml_tensor  * ids);
 
     // partition into non-overlapping windows with padding if needed
     // example:
@@ -2609,63 +2574,6 @@ extern "C" {
             struct lm_ggml_tensor  * beta,
             struct lm_ggml_tensor  * state,
             int64_t               K);
-
-    // DSA lightning indexer
-    //
-    // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
-    // k:       [n_embd_idx, 1,          n_kv,    ne3 ]
-    // weights: [n_head_idx, n_batch,    1,       ne3 ] !! prescaled !!
-    // mask:    [n_kv,       n_batch,    1,       ne33] !! f16 !!
-    // res:     [n_kv,       n_batch,    1,       ne3 ]
-    //
-    // broadcast:
-    //   ne3 % ne33 == 0
-    //
-    LM_GGML_API struct lm_ggml_tensor * lm_ggml_lightning_indexer(
-        struct lm_ggml_context * ctx,
-        struct lm_ggml_tensor  * q,
-        struct lm_ggml_tensor  * k,
-        struct lm_ggml_tensor  * weights,
-        struct lm_ggml_tensor  * mask);
-
-    // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
-    // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
-    // using a richer representation through streams.
-    //
-    // hc_comb: mixes [(2 + hc)*hc, n_tokens], scale [3], base [(2 + hc)*hc]
-    //          -> [dst_hc, src_hc, n_tokens]
-    // logits[dst, src, t] = mixes[2*hc + dst + hc*src, t]*scale[2]
-    //                         + base[2*hc + dst + hc*src]
-    // Softmax over dst, add eps, normalize over src, then repeat normalization
-    // over dst followed by src for iterations 1 through n_iter - 1.
-    LM_GGML_API struct lm_ggml_tensor * lm_ggml_dsv4_hc_comb(
-            struct lm_ggml_context * ctx,
-            struct lm_ggml_tensor  * mixes,
-            struct lm_ggml_tensor  * scale,
-            struct lm_ggml_tensor  * base,
-            float                 eps,
-            int32_t               n_iter);
-
-    // hc_pre: x [n_embd, hc, n_tokens], weights [hc, n_tokens] -> [n_embd, n_tokens]
-    //   result[i, t] = sum_h x[i, h, t]*weights[h, t]
-    //
-    LM_GGML_API struct lm_ggml_tensor * lm_ggml_dsv4_hc_pre(
-            struct lm_ggml_context * ctx,
-            struct lm_ggml_tensor  * x,
-            struct lm_ggml_tensor  * weights);
-
-    // hc_post: x [n_embd, n_tokens], residual [n_embd, hc, n_tokens],
-    //          post [hc, n_tokens], comb [dst_hc, src_hc, n_tokens]
-    //          -> [n_embd, hc, n_tokens]
-    //   result[i, dst, t] = x[i, t]*post[dst, t]
-    //                       + sum_src residual[i, src, t]*comb[dst, src, t]
-    //
-    LM_GGML_API struct lm_ggml_tensor * lm_ggml_dsv4_hc_post(
-            struct lm_ggml_context * ctx,
-            struct lm_ggml_tensor  * x,
-            struct lm_ggml_tensor  * residual,
-            struct lm_ggml_tensor  * post,
-            struct lm_ggml_tensor  * comb);
 
     // custom operators
 
@@ -2812,12 +2720,6 @@ extern "C" {
             int                   idx);
 
     LM_GGML_API void lm_ggml_build_forward_expand(
-            struct lm_ggml_cgraph * cgraph,
-            struct lm_ggml_tensor * tensor);
-
-    // add the tensor and its parents to the graph without marking them for compute
-    // the flag is set later, when the tensor is reached from a node that computes
-    LM_GGML_API void lm_ggml_build_forward_order(
             struct lm_ggml_cgraph * cgraph,
             struct lm_ggml_tensor * tensor);
 

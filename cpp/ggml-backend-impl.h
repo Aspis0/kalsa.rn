@@ -34,11 +34,6 @@ extern "C" {
         void * context;
     };
 
-    // [TAG_ALLOC_SIZE_EXPAND]
-    // returns true for ops that may require additional memory for fleeting data on some backends,
-    // i.e. the backend buffer type's get_alloc_size may return more than lm_ggml_nbytes for the output tensor
-    LM_GGML_API bool lm_ggml_op_alloc_size_may_expand(enum lm_ggml_op op);
-
     //
     // Backend buffer
     //
@@ -88,7 +83,6 @@ extern "C" {
     LM_GGML_API lm_ggml_backend_buffer_t lm_ggml_backend_multi_buffer_alloc_buffer(lm_ggml_backend_buffer_t * buffers, size_t n_buffers);
     LM_GGML_API bool                  lm_ggml_backend_buffer_is_multi_buffer(lm_ggml_backend_buffer_t buffer);
     LM_GGML_API void                  lm_ggml_backend_multi_buffer_set_usage(lm_ggml_backend_buffer_t buffer, enum lm_ggml_backend_buffer_usage usage);
-    LM_GGML_API void                  lm_ggml_backend_meta_buffer_set_usage (lm_ggml_backend_buffer_t buffer, enum lm_ggml_backend_buffer_usage usage);
 
     //
     // Backend (meta)
@@ -107,16 +101,6 @@ extern "C" {
     //
     // Backend (stream)
     //
-
-    // passed to graph_optimize so the backend can add allocation dependencies:
-    // if the backend executes parts of the graph out of order (e.g. on concurrent streams),
-    // it must keep the affected tensors allocated until a node where execution is known to have joined
-    struct lm_ggml_backend_graph_optimize_params {
-        // keep `tensor` allocated at least until `until` (a node of the same graph) has been computed
-        // can be called multiple times for the same tensor: the longest lifetime applies
-        void (*add_alloc_dep)(void * user_data, struct lm_ggml_tensor * tensor, struct lm_ggml_tensor * until);
-        void * user_data;
-    };
 
     struct lm_ggml_backend_i {
         const char * (*get_name)(lm_ggml_backend_t backend);
@@ -152,7 +136,7 @@ extern "C" {
         void (*event_wait)  (lm_ggml_backend_t backend, lm_ggml_backend_event_t event);
 
         // (optional) sort/optimize the nodes in the graph
-        void                      (*graph_optimize)    (lm_ggml_backend_t backend, struct lm_ggml_cgraph * cgraph, struct lm_ggml_backend_graph_optimize_params * params);
+        void                      (*graph_optimize)    (lm_ggml_backend_t backend, struct lm_ggml_cgraph * cgraph);
     };
 
     struct lm_ggml_backend {

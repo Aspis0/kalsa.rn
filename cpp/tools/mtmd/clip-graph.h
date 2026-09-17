@@ -13,14 +13,6 @@
 
 struct build_vit_opts {
     lm_ggml_tensor * attn_mask = nullptr;
-    // TODO @ngxson : merge attn_mask and attn_mask_layers into one call
-    std::vector<lm_ggml_tensor *> attn_mask_layers; // one per layer
-
-    // hook at layer output embeddings
-    std::function<void(lm_ggml_tensor * cur, int il)> callback_layer_out = nullptr;
-
-    // whether to skip the automatic post-layernorm (model.post_ln_w) applied at the end
-    bool skip_post_ln = false;
 };
 
 struct clip_graph {
@@ -53,9 +45,6 @@ struct clip_graph {
     lm_ggml_cgraph * gf;
 
     clip_graph(clip_ctx * ctx, const clip_image_f32 & img);
-
-    // build sub-graph, reuse buf from parent
-    clip_graph(const clip_graph & parent);
 
     virtual ~clip_graph() = default;
     virtual lm_ggml_cgraph * build() = 0;
@@ -120,12 +109,6 @@ struct clip_graph {
             ffn_op_type type_op,
             int il) const;
 
-    lm_ggml_tensor * build_moe_ffn(
-            lm_ggml_tensor * cur,
-            const clip_layer & layer,
-            ffn_op_type type_op,
-            int il) const;
-
     lm_ggml_tensor * build_attn(
             lm_ggml_tensor * wo,
             lm_ggml_tensor * wo_b,
@@ -137,15 +120,9 @@ struct clip_graph {
             int il,
             lm_ggml_tensor * sinks = nullptr) const;
 
-    // implementation of the 2D RoPE using two lm_ggml_rope_ext calls
-    //
-    // unlike LM_GGML_ROPE_TYPE_VISION which forces NEOX ordering, this rotates adjacent pairs (normal ordering)
-    //
-    // example:
-    //  given a single head with size = 8 --> [00000000]
-    //  dims [0, 4) rotate with pos_a, dims [4, 8) rotate with pos_b --> [aaaabbbb]
-    //  interleave_freq = false --> both halves use the same inv_freq set (like LM_GGML_ROPE_TYPE_VISION)
-    //  interleave_freq = true  --> first half uses even inv_freq, second half uses odd inv_freq (used by pixtral)
+    // implementation of the 2D RoPE without adding a new op in ggml
+    // this is not efficient (use double the memory), but works on all backends
+    // TODO: there was a more efficient which relies on lm_ggml_view and lm_ggml_rope_ext_inplace, but the rope inplace does not work well with non-contiguous tensors ; we should fix that and revert back to the original implementation in https://github.com/ggml-org/llama.cpp/pull/13065
     lm_ggml_tensor * build_rope_2d(
         lm_ggml_context * ctx0,
         lm_ggml_tensor * cur,

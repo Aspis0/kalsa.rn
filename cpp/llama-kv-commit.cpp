@@ -263,14 +263,14 @@ struct llama_kv_commit_access {
         return true;
     }
 };
-const llama_kv_cache * llama_kv_context_attn_cache(const llama_context * ctx) {
+static const llama_kv_cache * get_cache(const llama_context * ctx) {
     if (!ctx) return nullptr;
     auto * mem = llama_get_memory(ctx);
     if (auto * cache = dynamic_cast<const llama_kv_cache *>(mem)) return cache;
     if (auto * hybrid = dynamic_cast<const llama_memory_hybrid *>(mem)) return hybrid->get_mem_attn();
     return nullptr;
 }
-llama_kv_cache * llama_kv_context_attn_cache(llama_context * ctx) {
+static llama_kv_cache * get_cache(llama_context * ctx) {
     if (!ctx) return nullptr;
     auto * mem = llama_get_memory(ctx);
     if (auto * cache = dynamic_cast<llama_kv_cache *>(mem)) return cache;
@@ -278,11 +278,11 @@ llama_kv_cache * llama_kv_context_attn_cache(llama_context * ctx) {
     return nullptr;
 }
 bool llama_kv_context_has_non_host_v(const llama_context * ctx) {
-    const auto * cache = llama_kv_context_attn_cache(ctx);
+    const auto * cache = get_cache(ctx);
     return cache && llama_kv_commit_access::has_non_host_v(*cache);
 }
 bool llama_kv_context_can_stage_v(const llama_context * ctx) {
-    const auto * cache = llama_kv_context_attn_cache(ctx);
+    const auto * cache = get_cache(ctx);
     return cache && llama_kv_commit_access::can_stage_v(*cache);
 }
 static const llama_memory_hybrid * get_hybrid(const llama_context * ctx) { return ctx ? dynamic_cast<const llama_memory_hybrid *>(llama_get_memory(ctx)) : nullptr; }
@@ -290,8 +290,8 @@ static llama_memory_hybrid * get_hybrid(llama_context * ctx) { return ctx ? dyna
 llama_kv_route llama_kv_route_query(const llama_context * dst_ctx, const llama_context * src_ctx) {
     const auto * dst_hybrid = get_hybrid(dst_ctx);
     const auto * src_hybrid = get_hybrid(src_ctx);
-    const auto * dst = llama_kv_context_attn_cache(dst_ctx);
-    const auto * src = llama_kv_context_attn_cache(src_ctx);
+    const auto * dst = get_cache(dst_ctx);
+    const auto * src = get_cache(src_ctx);
     if ((dst_hybrid == nullptr) != (src_hybrid == nullptr) || !dst || !src || !llama_kv_commit_access::compatible(*dst, *src) ||
         (dst_hybrid && !llama_hybrid_memory_compatible(*dst_hybrid, *src_hybrid))) {
         if (!dst || !src) {
@@ -321,7 +321,7 @@ bool llama_kv_route_query_cost(const llama_context * dst_ctx, const llama_contex
     if (route == llama_kv_route::Direct || !cost) {
         return true;
     }
-    const auto * src = llama_kv_context_attn_cache(src_ctx);
+    const auto * src = get_cache(src_ctx);
     if (!src) {
         return false;
     }
@@ -347,8 +347,8 @@ bool llama_kv_commit_with_stats(llama_context * dst_ctx, llama_context * src_ctx
                                 llama_kv_commit_stats * stats) {
     if (copied_bytes) *copied_bytes = 0;
     if (stats) *stats = {};
-    auto * dst = llama_kv_context_attn_cache(dst_ctx);
-    const auto * src = llama_kv_context_attn_cache(src_ctx);
+    auto * dst = get_cache(dst_ctx);
+    const auto * src = get_cache(src_ctx);
     if (!dst || !src) {
         LLAMA_LOG_ERROR("%s: commit requires compatible KV caches\n", __func__);
         return false;

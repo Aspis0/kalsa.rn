@@ -100,50 +100,6 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
-// Proactive memory pressure hook. The callback fires at most once per
-// llama_decode call, before the batch (and any pending memory update) is
-// processed, when memory utilization has reached trigger_frac; it re-arms
-// automatically once utilization drops back below the threshold. Intended
-// for proactive compaction: by the time a batch fails to fit, summarizing a
-// chat gracefully is already too late.
-//
-// used_frac semantics per memory type:
-//   - KV caches report the WORST STREAM's used/total cells: find_slot()
-//     fails per stream, so one exhausted slot must fire even when other
-//     slots are empty.
-//   - iSWA memories report the base (non-sliding) part only. SWA cells are
-//     recycled in place, so the sliding ring saturates at 1.0 in normal
-//     single-sequence use and is never the binding constraint. Pure-SWA
-//     layouts read 0.0 and never fire (a pure-SWA cache cannot fail for a
-//     single sequence).
-//   - hybrid memories report their attention (KV) part; the recurrent tail
-//     has no meaningful fraction. Exhausting recurrent sequence slots is
-//     NOT reported by this hook.
-//   - recurrent memories and the DeepSeek DSA/DSV4 caches report a negative
-//     value and never fire.
-//
-// Contract:
-//   - install on the context that OWNS the memory. Shared-memory contexts
-//     (MTP draft, Gemma4Assistant) report the owner's fraction but reject
-//     every mutation, so they cannot act on the signal; installing on both
-//     contexts of one physical cache double-fires.
-//   - the setter is not thread-safe; call it before the first decode. The
-//     callback runs on the decode thread and must not re-enter llama_decode
-//     or free the context.
-//   - the reported value is observed before pending memory updates (shifts,
-//     copies), so with context shifting enabled it can include cells a
-//     pending shift is about to drop.
-//   - valid trigger_frac is [0, 1]; non-finite or > 1 disables the hook, a
-//     negative value is treated as 0. Leaving the hook unset (the default)
-//     costs one null check per decode.
-typedef void (*llama_memory_pressure_cb)(float used_frac, void * user_data);
-
-LLAMA_API void llama_memory_set_pressure_callback(
-        struct llama_context * ctx,
-        llama_memory_pressure_cb cb,
-        void * user_data,
-        float trigger_frac);
-
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
@@ -446,15 +402,7 @@ LLAMA_API void llama_governor_reset_prefill_stats(struct llama_governor * govern
 // model/context data extraction
 //
 
-LLAMA_API int32_t llama_model_dflash_selector_top_k(const struct llama_model * model);
-
 // returns pointer to the target-model layer indices
 LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
 // returns the number of extracted layers from target model
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
-
-// retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
-// returns total number of elements or 0 on error
-// if out is nullptr, returns the number of tokens without writing to out
-// caller must allocate enough memory for out before calling
-LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out);

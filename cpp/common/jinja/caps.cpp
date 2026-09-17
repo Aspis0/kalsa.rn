@@ -4,32 +4,25 @@
 
 // note: the json dependency is only for defining input in a convenient way
 // we can remove it in the future when we figure out a better way to define inputs using jinja::value
-#include "json.h"
+#include <nlohmann/json.hpp>
 
 #include <functional>
 #include <sstream>
 
 #define FILENAME "jinja-caps"
 
-using json = common_json;
+using json = nlohmann::ordered_json;
 
 namespace jinja {
 
 using caps_json_fn = std::function<json()>;
 using caps_ctx_fn = std::function<void(context &)>;
-using caps_analyze_fn = std::function<void(context &, bool, value &, value &, const std::string &)>;
+using caps_analyze_fn = std::function<void(bool, value &, value &, const std::string &)>;
 
 void caps_apply_preserve_reasoning(jinja::context & ctx, bool enabled) {
     ctx.set_val("preserve_thinking",         mk_val<value_bool>(enabled));
     ctx.set_val("clear_thinking",            mk_val<value_bool>(!enabled));
     ctx.set_val("truncate_history_thinking", mk_val<value_bool>(!enabled));
-    ctx.set_val("drop_thinking",             mk_val<value_bool>(!enabled));
-}
-
-void caps_apply_reasoning_effort(jinja::context & ctx, const std::string & effort) {
-    value var = mk_val<value_string>(effort); // bind to the same value for stats
-    ctx.set_val("reasoning_effort",   var);
-    ctx.set_val("reasoning_strength", var);
 }
 
 static void caps_try_execute(jinja::program & prog,
@@ -68,7 +61,7 @@ static void caps_try_execute(jinja::program & prog,
         // ignore exceptions during capability analysis
     }
 
-    analyze_fn(ctx, success, messages, tools, result);
+    analyze_fn(success, messages, tools, result);
 }
 
 // for debugging only
@@ -93,7 +86,6 @@ std::map<std::string, bool> caps::to_map() const {
         {"supports_parallel_tool_calls", supports_parallel_tool_calls},
         {"supports_system_role", supports_system_role},
         {"supports_preserve_reasoning", supports_preserve_reasoning},
-        {"supports_reasoning_effort", supports_reasoning_effort},
         {"supports_object_arguments", supports_object_arguments},
     };
 }
@@ -117,8 +109,6 @@ caps caps_get(jinja::program & prog) {
 
     JJ_DEBUG("%s\n", ">>> Running capability check: typed content");
 
-    static const std::string content_marker = "STRING_MARKER";
-
     // case: typed content support
     caps_try_execute(
         prog,
@@ -127,25 +117,21 @@ caps caps_get(jinja::program & prog) {
             return json::array({
                 {
                     {"role", "user"},
-                    {"content", content_marker}
+                    {"content", "content"}
                 }
             });
         },
         nullptr, // ctx_fn
         nullptr, // tools_fn
-        [&](context &, bool success, value & messages, value &, const std::string & rendered) {
+        [&](bool success, value & messages, value &, const std::string &) {
             auto & content = messages->at(0)->at("content");
             caps_print_stats(content, "messages[0].content");
-            bool used_as_array = has_op(content, "selectattr") || has_op(content, "array_access");
-            if (used_as_array) {
+            if (has_op(content, "selectattr") || has_op(content, "array_access")) {
                 // accessed as an array
                 result.supports_typed_content = true;
             }
             if (!success) {
                 // failed to execute with content as string
-                result.supports_string_content = false;
-            } else if (used_as_array && rendered.find(content_marker) == std::string::npos) {
-                // edge case: string may be accessed for checking, but does not appear in the output
                 result.supports_string_content = false;
             }
         }
@@ -171,7 +157,7 @@ caps caps_get(jinja::program & prog) {
         },
         nullptr, // ctx_fn
         nullptr, // tools_fn
-        [&](context &, bool, value & messages, value &, const std::string &) {
+        [&](bool, value & messages, value &, const std::string &) {
             auto & content = messages->at(0)->at("content");
             caps_print_stats(content, "messages[0].content");
             if (!content->stats.used) {
@@ -247,7 +233,7 @@ caps caps_get(jinja::program & prog) {
                 },
             });
         },
-        [&](context &, bool success, value & messages, value & tools, const std::string &) {
+        [&](bool success, value & messages, value & tools, const std::string &) {
             if (!success) {
                 return; // Nothing can be inferred
             }
@@ -340,7 +326,7 @@ caps caps_get(jinja::program & prog) {
                     },
                 });
             },
-            [&](context &, bool success, value & messages, value & tools, const std::string &) {
+            [&](bool success, value & messages, value & tools, const std::string &) {
                 if (!success) {
                     result.supports_tool_calls = false;
                     result.supports_tools = false;
@@ -442,7 +428,7 @@ caps caps_get(jinja::program & prog) {
                 },
             });
         },
-        [&](context &, bool success, value & messages, value &, const std::string &) {
+        [&](bool success, value & messages, value &, const std::string &) {
             if (!success) {
                 result.supports_parallel_tool_calls = false;
                 return;
@@ -495,41 +481,14 @@ caps caps_get(jinja::program & prog) {
             });
         },
         [&](context & ctx) {
-            ctx.set_val("enable_thinking", mk_val<value_bool>(true));
             caps_apply_preserve_reasoning(ctx, true);
         },
         nullptr, // tools_fn
-        [&](context &, bool, value &, value &, const std::string & output) {
+        [&](bool, value &, value &, const std::string & output) {
             // note: we cannot use stats here because the reasoning_content may be used for "if" condition test, but not actually outputted in the final result
             if (output.find(reasoning_placeholder) != std::string::npos) {
                 result.supports_preserve_reasoning = true;
             }
-        }
-    );
-
-    JJ_DEBUG("%s\n", ">>> Running capability check: reasoning effort");
-
-    // case: reasoning effort level
-    caps_try_execute(
-        prog,
-        [&]() {
-            // messages
-            return json::array({
-                {
-                    {"role", "user"},
-                    {"content", "User message"}
-                },
-            });
-        },
-        [&](context & ctx) {
-            ctx.set_val("enable_thinking", mk_val<value_bool>(true));
-            caps_apply_reasoning_effort(ctx, "low");
-        },
-        nullptr, // tools_fn
-        [&](context & ctx, bool, value &, value &, const std::string &) {
-            value effort = ctx.get_val("reasoning_effort");
-            caps_print_stats(effort, "reasoning_effort");
-            result.supports_reasoning_effort = effort->stats.used;
         }
     );
 

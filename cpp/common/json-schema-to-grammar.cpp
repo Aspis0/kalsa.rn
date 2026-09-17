@@ -1,8 +1,9 @@
 #include "json-schema-to-grammar.h"
 #include "common.h"
 
+#include "nlohmann/json.hpp"
+
 #include <algorithm>
-#include <limits>
 #include <map>
 #include <regex>
 #include <sstream>
@@ -11,7 +12,7 @@
 #include <unordered_set>
 #include <vector>
 
-using json = common_json;
+using json = nlohmann::ordered_json;
 
 static std::string build_repetition(const std::string & item_rule, int min_items, int max_items, const std::string & separator_rule = "") {
     auto has_max = max_items != std::numeric_limits<int>::max();
@@ -277,9 +278,7 @@ static std::unordered_map<char, std::string> GRAMMAR_LITERAL_ESCAPES = {
     {'\r', "\\r"}, {'\n', "\\n"}, {'"', "\\\""}, {'-', "\\-"}, {']', "\\]"}, {'\\', "\\\\"}
 };
 
-static const int MAX_PATTERN_DEPTH = 100;
-
-static std::unordered_set<char> NON_LITERAL_SET = {'|', '.', '(', ')', '[', ']', '{', '}', '*', '+', '?', '^', '$'};
+static std::unordered_set<char> NON_LITERAL_SET = {'|', '.', '(', ')', '[', ']', '{', '}', '*', '+', '?'};
 static std::unordered_set<char> ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS = {'^', '$', '.', '[', ']', '(', ')', '|', '{', '}', '*', '+', '?'};
 
 static std::string replacePattern(const std::string & input, const std::regex & regex, const std::function<std::string(const std::smatch  &)> & replacement) {
@@ -309,32 +308,6 @@ static std::string format_literal(const std::string & literal) {
 }
 
 std::string gbnf_format_literal(const std::string & literal) { return format_literal(literal); }
-
-static size_t gbnf_escape_length(const std::string & pattern, size_t pos) {
-    if (pos + 1 >= pattern.length() || pattern[pos] != '\\') {
-        return 0;
-    }
-    size_t n_hex = 0;
-    switch (pattern[pos + 1]) {
-        case 'x': n_hex = 2; break;
-        case 'u': n_hex = 4; break;
-        case 'U': n_hex = 8; break;
-        case 't': case 'r': case 'n': case '\\': case '"': case '[': case ']':
-            return 2;
-        default:
-            return 0;
-    }
-    if (pos + 2 + n_hex > pattern.length()) {
-        return 0;
-    }
-    for (size_t i = pos + 2; i < pos + 2 + n_hex; i++) {
-        char h = pattern[i];
-        if (!((h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F'))) {
-            return 0;
-        }
-    }
-    return 2 + n_hex;
-}
 
 class common_schema_converter {
 private:
@@ -372,42 +345,16 @@ private:
         return string_join(rules, " | ");
     }
 
-    // thrown when the pattern is a valid regex with no grammar equivalent
-    struct unsupported_pattern : public std::runtime_error {
-        using std::runtime_error::runtime_error;
-    };
-
-    // thrown when the pattern is not a valid regex
-    struct invalid_pattern : public std::runtime_error {
-        using std::runtime_error::runtime_error;
-    };
-
     std::string _visit_pattern(const std::string & pattern, const std::string & name) {
-        auto rules_snapshot = _rules;
-        try {
-            return _pattern_to_rule(pattern, name);
-        } catch (const unsupported_pattern & err) {
-            // revert rules
-            _rules = std::move(rules_snapshot);
-            _warnings.push_back("pattern " + pattern + " is not supported (" + err.what() + "), accepting any string");
-            return _add_rule(name, _add_primitive("string", PRIMITIVE_RULES.at("string")));
-        } catch (const invalid_pattern & err) {
-            _rules = std::move(rules_snapshot);
-            _errors.push_back("Invalid pattern " + pattern + ": " + err.what());
+        if (!(pattern.front() == '^' && pattern.back() == '$')) {
+            _errors.push_back("Pattern must start with '^' and end with '$'");
             return "";
-        }
-    }
-
-    std::string _pattern_to_rule(const std::string & pattern, const std::string & name) {
-        if (pattern.length() < 2 || pattern.front() != '^' || pattern.back() != '$') {
-            throw unsupported_pattern("not anchored with '^' and '$'");
         }
         std::string sub_pattern = pattern.substr(1, pattern.length() - 2);
         std::unordered_map<std::string, std::string> sub_rule_ids;
 
         size_t i = 0;
         size_t length = sub_pattern.length();
-        int paren_depth = 0;
 
         using literal_or_rule = std::pair<std::string, bool>;
         auto to_rule = [&](const literal_or_rule & ls) {
@@ -416,6 +363,7 @@ private:
             return is_literal ? "\"" + s + "\"" : s;
         };
         std::function<literal_or_rule()> transform = [&]() -> literal_or_rule {
+            size_t start = i;
             std::vector<literal_or_rule> seq;
 
             auto get_dot = [&]() {
@@ -472,42 +420,43 @@ private:
                         if (i + 1 < length && sub_pattern[i + 1] == ':') {
                             i += 2; // skip "?:" for non-capturing group, treat as regular group
                         } else {
-                            // lookaround, named group, inline flags, ...
-                            throw unsupported_pattern("unsupported group syntax");
+                            // lookahead/lookbehind (?=, ?!, ?<=, ?<!) - not supported
+                            _warnings.push_back("Unsupported pattern syntax");
+                            // skip to matching ')' to avoid UB on empty seq
+                            int depth = 1;
+                            while (i < length && depth > 0) {
+                                if (sub_pattern[i] == '\\' && i + 1 < length) {
+                                    i += 2; // skip escaped character
+                                } else {
+                                    if (sub_pattern[i] == '(') depth++;
+                                    else if (sub_pattern[i] == ')') depth--;
+                                    i++;
+                                }
+                            }
+                            continue;
                         }
-                    }
-                    paren_depth++;
-                    if (paren_depth > MAX_PATTERN_DEPTH) {
-                        throw unsupported_pattern("pattern nesting too deep");
                     }
                     seq.emplace_back("(" + to_rule(transform()) + ")", false);
                 } else if (c == ')') {
                     i++;
-                    if (paren_depth == 0) {
-                        throw invalid_pattern("unbalanced parentheses");
+                    if (start > 0 && sub_pattern[start - 1] != '(' && (start < 2 || sub_pattern[start - 2] != '?' || sub_pattern[start - 1] != ':')) {
+                        _errors.push_back("Unbalanced parentheses");
                     }
-                    paren_depth--;
                     return join_seq();
-                } else if (c == '^' || c == '$') {
-                    throw unsupported_pattern("anchor inside the pattern");
                 } else if (c == '[') {
                     std::string square_brackets = std::string(1, c);
                     i++;
                     while (i < length && sub_pattern[i] != ']') {
                         if (sub_pattern[i] == '\\') {
-                            auto escape_length = gbnf_escape_length(sub_pattern, i);
-                            if (escape_length == 0) {
-                                throw unsupported_pattern("unsupported escape in character class: " + sub_pattern.substr(i, 2));
-                            }
-                            square_brackets += sub_pattern.substr(i, escape_length);
-                            i += escape_length;
+                            square_brackets += sub_pattern.substr(i, 2);
+                            i += 2;
                         } else {
                             square_brackets += sub_pattern[i];
                             i++;
                         }
                     }
                     if (i >= length) {
-                        throw invalid_pattern("unterminated character class");
+                        _errors.push_back("Unbalanced square brackets");
                     }
                     square_brackets += ']';
                     i++;
@@ -516,9 +465,6 @@ private:
                     seq.emplace_back("|", false);
                     i++;
                 } else if (c == '*' || c == '+' || c == '?') {
-                    if (seq.empty()) {
-                        throw invalid_pattern("nothing to repeat");
-                    }
                     seq.back() = std::make_pair(to_rule(seq.back()) + c, false);
                     i++;
                 } else if (c == '{') {
@@ -529,19 +475,18 @@ private:
                         i++;
                     }
                     if (i >= length) {
-                        throw unsupported_pattern("unterminated curly brackets");
+                        _errors.push_back("Unbalanced curly brackets");
                     }
                     curly_brackets += '}';
                     i++;
                     auto nums = string_split(curly_brackets.substr(1, curly_brackets.length() - 2), ",");
                     int min_times = 0;
                     int max_times = std::numeric_limits<int>::max();
-                    if (nums.size() != 1 && nums.size() != 2) {
-                        throw unsupported_pattern("wrong number of values in curly brackets");
-                    }
                     try {
                         if (nums.size() == 1) {
                             min_times = max_times = std::stoi(nums[0]);
+                        } else if (nums.size() != 2) {
+                            _errors.push_back("Wrong number of values in curly brackets");
                         } else {
                             if (!nums[0].empty()) {
                                 min_times = std::stoi(nums[0]);
@@ -550,11 +495,9 @@ private:
                                 max_times = std::stoi(nums[1]);
                             }
                         }
-                    } catch (const std::logic_error &) {
-                        throw unsupported_pattern("invalid number in curly brackets");
-                    }
-                    if (seq.empty()) {
-                        throw invalid_pattern("nothing to repeat");
+                    } catch (const std::invalid_argument & e) {
+                        _errors.push_back("Invalid number in curly brackets");
+                        return std::make_pair("", false);
                     }
                     auto &last = seq.back();
                     auto &sub = last.first;
@@ -580,22 +523,15 @@ private:
                         return NON_LITERAL_SET.find(c) != NON_LITERAL_SET.end();
                     };
                     while (i < length) {
-                        if (sub_pattern[i] == '\\') {
-                            if (i == length - 1) {
-                                throw invalid_pattern("trailing backslash");
-                            }
+                        if (sub_pattern[i] == '\\' && i < length - 1) {
                             char next = sub_pattern[i + 1];
                             if (ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS.find(next) != ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS.end()) {
                                 i++;
                                 literal += sub_pattern[i];
                                 i++;
                             } else {
-                                auto escape_length = gbnf_escape_length(sub_pattern, i);
-                                if (escape_length == 0) {
-                                    throw unsupported_pattern("unsupported escape: " + sub_pattern.substr(i, 2));
-                                }
-                                literal += sub_pattern.substr(i, escape_length);
-                                i += escape_length;
+                                literal += sub_pattern.substr(i, 2);
+                                i += 2;
                             }
                         } else if (sub_pattern[i] == '"') {
                             literal += "\\\"";
@@ -608,21 +544,14 @@ private:
                             break;
                         }
                     }
-                    if (literal.empty()) { // nothing was consumed, ex. a stray ']' or '}'
-                        throw unsupported_pattern(std::string("unsupported character: ") + c);
+                    if (!literal.empty()) {
+                        seq.emplace_back(literal, true);
                     }
-                    seq.emplace_back(literal, true);
                 }
             }
             return join_seq();
         };
-
-        auto rule = to_rule(transform());
-        if (paren_depth != 0) {
-            throw invalid_pattern("unbalanced parentheses");
-        }
-
-        return _add_rule(name, "\"\\\"\" (" + rule + ") \"\\\"\"");
+        return _add_rule(name, "\"\\\"\" (" + to_rule(transform()) + ") \"\\\"\"");
     }
 
     /*
@@ -746,10 +675,6 @@ private:
             std::string kv_rule = _add_rule(sub_name + "-kv", key_rule + " \":\" space " + value_rule);
             prop_kv_rule_names["*"] = kv_rule;
             optional_props.push_back("*");
-        }
-
-        if (required_props.empty() && optional_props.empty()) {
-            return "\"{\" space \"}\"";
         }
 
         std::string rule = "\"{\" space ";
@@ -920,11 +845,7 @@ public:
             return _add_rule(rule_name, _resolve_ref(schema["$ref"]));
         }
         if (schema.contains("oneOf") || schema.contains("anyOf")) {
-            const json & alts = schema.contains("oneOf") ? schema.at("oneOf") : schema.at("anyOf");
-            std::vector<json> alt_schemas;
-            for (const auto & alt : alts) {
-                alt_schemas.push_back(alt);
-            }
+            std::vector<json> alt_schemas = schema.contains("oneOf") ? schema["oneOf"].get<std::vector<json>>() : schema["anyOf"].get<std::vector<json>>();
             return _add_rule(rule_name, _generate_union_rule(name, alt_schemas));
         }
         if (schema_type.is_array()) {
@@ -1118,7 +1039,7 @@ common_schema_info::~common_schema_info() = default;
 common_schema_info::common_schema_info(common_schema_info &&) noexcept = default;
 common_schema_info & common_schema_info::operator=(common_schema_info &&) noexcept = default;
 
-void common_schema_info::resolve_refs(common_json & schema) {
+void common_schema_info::resolve_refs(nlohmann::ordered_json & schema) {
     impl_->resolve_refs(schema, "");
 }
 
@@ -1126,7 +1047,7 @@ void common_schema_info::resolve_refs(common_json & schema) {
 // Some models emit raw string values rather than JSON-encoded strings for string parameters.
 // If any branch of the schema (via oneOf, anyOf, $ref, etc.) permits a string, this returns
 // true, allowing callers to handle the value as a raw string for simplicity.
-bool common_schema_info::resolves_to_string(const common_json & schema) {
+bool common_schema_info::resolves_to_string(const nlohmann::ordered_json & schema) {
     std::unordered_set<std::string> visited_refs;
 
     std::function<bool(const json &)> check = [&](const json & s) -> bool {
@@ -1234,7 +1155,7 @@ bool common_schema_info::resolves_to_string(const common_json & schema) {
     return check(schema);
 }
 
-std::string json_schema_to_grammar(const common_json & schema, bool force_gbnf) {
+std::string json_schema_to_grammar(const json & schema, bool force_gbnf) {
 #ifdef LLAMA_USE_LLGUIDANCE
     if (!force_gbnf) {
         return "%llguidance {}\nstart: %json " + schema.dump();
@@ -1255,10 +1176,10 @@ std::string build_grammar(const std::function<void(const common_grammar_builder 
         /* .add_rule = */ [&](const std::string & name, const std::string & rule) {
             return converter._add_rule(name, rule);
         },
-        /* .add_schema = */ [&](const std::string & name, const common_json & schema) {
+        /* .add_schema = */ [&](const std::string & name, const nlohmann::ordered_json & schema) {
             return converter.visit(schema, name == "root" ? "" : name);
         },
-        /* .resolve_refs = */ [&](common_json & schema) {
+        /* .resolve_refs = */ [&](nlohmann::ordered_json & schema) {
             converter.resolve_refs(schema, "");
         }
     };

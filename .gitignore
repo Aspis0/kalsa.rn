@@ -105,3 +105,6 @@ tests/android/build-hexagon/
 
 # skill-creator eval scaffolding (throwaway)
 .agents/skills/*-workspace/
+
+# sync-kalsallama.sh clone cache
+tmp/

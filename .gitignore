@@ -107,4 +107,4 @@ tests/android/build-hexagon/
 .agents/skills/*-workspace/
 
 # sync-kalsallama.sh clone cache
-tmp/
+/tmp/

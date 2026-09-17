@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # Regenerate cpp/ from the pinned kalsallama commit: flatten the pin (llama.rn
-# v0.12.8 bootstrap layout + LM_ prefix), rsync it over cpp/, then re-apply
-# scripts/kalsa-patches/*.patch.
+# v0.12.8 bootstrap layout + LM_ prefix), apply scripts/kalsa-patches/*.patch
+# to the regenerated tree, then rsync it over cpp/.
 #
 # Invariant: cpp/ = kalsallama@<kalsallama.pin> flattened + scripts/kalsa-patches,
 # except the llama.rn-owned files the sync excludes (rn-*, jsi/, ggml-ext.h,
-# anyascii.*) and the KALSALLAMA_SHA marker. Nothing else under cpp/ is
-# hand-edited; see KALSA_FORK.md.
+# anyascii.*). Nothing else under cpp/ is hand-edited; see KALSA_FORK.md.
 set -euo pipefail
 
 OS=$(uname)
@@ -15,9 +14,13 @@ PIN_FILE="$ROOT/kalsallama.pin"
 CPP_DIR="$ROOT/cpp"
 PATCH_DIR="$ROOT/scripts/kalsa-patches"
 TMP_CLONE="$ROOT/tmp/kalsallama-src"
+# The llama.rn-owned files that live in cpp/ but do not come from llama.cpp:
+# --delete must never remove them and verify must ignore them.
+SYNC_EXCLUDES=('rn-*' 'jsi' 'ggml-ext.h' 'anyascii.*')
 
 EXTRACT_TMP=""
 FLATTEN_TMP=""
+GIT_DIR=""
 cleanup() {
   if [ -n "$EXTRACT_TMP" ] && [ -d "$EXTRACT_TMP" ]; then
     rm -rf "$EXTRACT_TMP"
@@ -99,12 +102,8 @@ write_pin() {
 ensure_commit_object() {
   local git_dir="$1"
   local sha="$2"
-  if git -C "$git_dir" cat-file -e "${sha}^{commit}" 2>/dev/null; then
-    return 0
-  fi
-  git -C "$git_dir" fetch origin "$sha"
   git -C "$git_dir" cat-file -e "${sha}^{commit}" 2>/dev/null \
-    || die "commit $sha not in $git_dir after fetch"
+    || die "commit $sha not in $git_dir (fetch it, or point KALSALLAMA_SRC at a checkout that has it)"
 }
 
 fetch_prune() {
@@ -120,31 +119,35 @@ fetch_prune() {
 
 resolve_git_dir() {
   # KALSALLAMA_SRC is the reproducible local-source escape hatch for pins that
-  # are not pushed yet. CI omits it and resolves the immutable pin from repo.
+  # are not pushed yet: read-only (cat-file / archive), never fetched or
+  # pruned. CI omits it and resolves the immutable pin from its own clone.
+  # Idempotent per invocation so a pin flattens with exactly one fetch.
+  if [ -n "$GIT_DIR" ]; then
+    return
+  fi
   if [ -n "${KALSALLAMA_SRC:-}" ]; then
     [ -d "$KALSALLAMA_SRC/.git" ] || [ -f "$KALSALLAMA_SRC/.git" ] \
       || die "KALSALLAMA_SRC is not a git checkout: $KALSALLAMA_SRC"
     GIT_DIR="$KALSALLAMA_SRC"
-    fetch_prune "$GIT_DIR"
     return
   fi
   mkdir -p "$ROOT/tmp"
   if [ ! -d "$TMP_CLONE/.git" ]; then
     git clone "$PIN_REPO" "$TMP_CLONE"
   fi
+  local url
+  url=$(git -C "$TMP_CLONE" remote get-url origin)
+  [ "$url" = "$PIN_REPO" ] || git -C "$TMP_CLONE" remote set-url origin "$PIN_REPO"
   GIT_DIR="$TMP_CLONE"
-  fetch_prune "$GIT_DIR"
+  fetch_prune "$GIT_DIR" required
 }
 
 extract_tree() {
   local git_dir="$1"
   local sha="$2"
-  local head
-  head=$(git -C "$git_dir" rev-parse HEAD)
-  if [ "$head" = "$sha" ] && [ -z "$(git -C "$git_dir" status --porcelain)" ]; then
-    LLAMA="$git_dir"
-    return
-  fi
+  # Always go through git archive: the worktree fast path would leak ignored
+  # build artifacts into the flatten, and reading a KALSALLAMA_SRC checkout
+  # through the same path keeps that repo untouched.
   EXTRACT_TMP=$(mktemp -d "${TMPDIR:-/tmp}/kalsallama-src.XXXXXX")
   git -C "$git_dir" archive "$sha" | tar -x -C "$EXTRACT_TMP"
   LLAMA="$EXTRACT_TMP"
@@ -580,30 +583,45 @@ flatten_and_prefix() {
   printf '%s\n' "$sha" > "$DST/KALSALLAMA_SHA"
 }
 
-# rsync the regenerated tree over cpp/. rn-*, jsi/, ggml-ext.h and anyascii.*
-# are llama.rn-owned files that live in cpp/ but do not come from llama.cpp;
-# without these excludes --delete removes them. KALSALLAMA_SHA is excluded
-# from the rsync and installed explicitly so a re-pin can never leave a
-# stale marker behind.
+# rsync the regenerated tree over cpp/. The SYNC_EXCLUDES files are
+# llama.rn-owned; without the excludes --delete removes them.
+# KALSALLAMA_SHA is part of the regenerated tree and is synced like any
+# other file.
 install_cpp_tree() {
-  rsync -a --delete \
-    --exclude 'rn-*' \
-    --exclude 'jsi/' \
-    --exclude 'ggml-ext.h' \
-    --exclude 'anyascii.*' \
-    --exclude 'KALSALLAMA_SHA' \
-    "$FLATTEN_TMP/cpp/" "$CPP_DIR/"
-  cp "$FLATTEN_TMP/cpp/KALSALLAMA_SHA" "$CPP_DIR/KALSALLAMA_SHA"
+  local args=() e
+  for e in "${SYNC_EXCLUDES[@]}"; do
+    args+=(--exclude="$e")
+  done
+  rsync -a --delete "${args[@]}" "$FLATTEN_TMP/cpp/" "$CPP_DIR/"
+}
+
+# A patch may only touch pin-derived engine files: paths under cpp/ that the
+# sync does not exclude. Anything else would escape the regenerated tree.
+assert_patch_path() {
+  local patch="$1" path="$2"
+  case "$path" in
+    cpp/*) ;;
+    *) die "${patch#$ROOT/} touches a path outside cpp/: $path" ;;
+  esac
+  case "$path" in
+    jsi/*|*/jsi/*) die "${patch#$ROOT/} touches a llama.rn-owned path: $path" ;;
+  esac
+  case "${path##*/}" in
+    rn-*|ggml-ext.h|anyascii.*) die "${patch#$ROOT/} touches a llama.rn-owned path: $path" ;;
+  esac
 }
 
 # The patches are rooted at the fork root (a/cpp/common/common.cpp): apply
-# from ROOT when installing into cpp/, from the regenerated pseudo-root during
-# verify -- outside a repository git apply behaves like patch -p1 there.
+# from the regenerated pseudo-root -- outside a repository git apply behaves
+# like patch -p1 there. cpp/ is only written later, by install_cpp_tree.
 apply_kalsa_patches() {
   local workdir="$1"
-  local patch
+  local patch path
   for patch in "$PATCH_DIR"/*.patch; do
     [ -f "$patch" ] || die "no patches found in $PATCH_DIR"
+    while IFS= read -r path; do
+      assert_patch_path "$patch" "$path"
+    done < <(sed -n -e 's/^--- a\///p' -e 's/^+++ b\///p' "$patch")
     git -C "$workdir" apply --check "$patch" \
       || die "patch does not apply (workdir $workdir): ${patch#$ROOT/}"
     git -C "$workdir" apply "$patch" \
@@ -611,13 +629,43 @@ apply_kalsa_patches() {
   done
 }
 
-# write_pin + flatten + install + patches -- the whole regeneration path.
+# After the patches apply, the two kalsa hunks must sit exactly once each in
+# their expected scope -- catches a silently dropped or double-applied patch
+# that git apply --check cannot see.
+assert_kalsa_post_image() {
+  local tree="$1" marker_n moe_n
+  marker_n=$(awk '/^[A-Za-z_].*common_params_get_system_info\(/ { in_fn = 1 }
+      in_fn && /kalsa-native-patches/ { n++ }
+      in_fn && /^\}/ { print n + 0; exit }' "$tree/cpp/common/common.cpp")
+  moe_n=$(awk '/^struct common_params \{/ { in_fn = 1 }
+      in_fn && /^[ \t]*\} kalsa_moe;/ { n++ }
+      in_fn && /^\}/ { print n + 0; exit }' "$tree/cpp/common/common.h")
+  [ "$marker_n" = "1" ] \
+    || die "post-image: expected exactly one 'kalsa-native-patches' line in common_params_get_system_info, found ${marker_n:-none}"
+  [ "$moe_n" = "1" ] \
+    || die "post-image: expected exactly one '} kalsa_moe;' line in struct common_params, found ${moe_n:-none}"
+}
+
+# cpp/ must carry the marker of the pin it was regenerated from. verify
+# checks this explicitly instead of diffing the file.
+assert_installed_sha() {
+  local sha_file="$CPP_DIR/KALSALLAMA_SHA" installed
+  [ -f "$sha_file" ] || die "missing $sha_file"
+  installed=$(tr -d '[:space:]' < "$sha_file")
+  [ "$installed" = "$PIN_COMMIT" ] \
+    || die "cpp/KALSALLAMA_SHA (${installed:-empty}) != pin ($PIN_COMMIT); re-run pin"
+}
+
+# write_pin LAST: cpp/ is only rewritten -- and the pin only re-pointed --
+# after flatten, patches and post-image checks have all succeeded.
 regen_cpp() {
   local full="$1"
-  write_pin "$PIN_REPO" "$PIN_BRANCH" "$full"
   flatten_and_prefix "$full"
+  apply_kalsa_patches "$FLATTEN_TMP"
+  assert_kalsa_post_image "$FLATTEN_TMP"
   install_cpp_tree
-  apply_kalsa_patches "$ROOT"
+  "$ROOT/scripts/assert-cpp-includes.sh"
+  write_pin "$PIN_REPO" "$PIN_BRANCH" "$full"
 }
 
 cmd_pin() {
@@ -634,7 +682,6 @@ cmd_pin() {
 cmd_bump() {
   read_pin
   resolve_git_dir
-  fetch_prune "$GIT_DIR" required
   local full
   full=$(git -C "$GIT_DIR" rev-parse --verify "origin/${PIN_BRANCH}^{commit}") \
     || die "origin/${PIN_BRANCH} not found after fetch"
@@ -643,28 +690,23 @@ cmd_bump() {
 
 cmd_verify() {
   read_pin
+  assert_installed_sha
   flatten_and_prefix "$PIN_COMMIT"
   apply_kalsa_patches "$FLATTEN_TMP"
-  # The last three excludes are gitignored build artifacts under cpp/
-  # (*.metallib, the embedded Metal assembly, the hexagon v73 output dir):
-  # they are not part of the tree this command certifies.
+  assert_kalsa_post_image "$FLATTEN_TMP"
+  local diff_args=() e
+  for e in "${SYNC_EXCLUDES[@]}"; do
+    diff_args+=(-x "$e")
+  done
   local diff_out
-  if diff_out=$(diff -r \
-      -x 'rn-*' \
-      -x 'jsi' \
-      -x 'ggml-ext.h' \
-      -x 'anyascii.*' \
-      -x 'KALSALLAMA_SHA' \
-      -x '*.metallib' \
-      -x 'ggml-metal-embed.s' \
-      -x 'v73' \
-      "$FLATTEN_TMP/cpp" "$CPP_DIR"); then
+  if diff_out=$(diff -r "${diff_args[@]}" "$FLATTEN_TMP/cpp" "$CPP_DIR"); then
     echo "verify: cpp/ == kalsallama@$PIN_COMMIT + scripts/kalsa-patches"
   else
     echo "verify: cpp/ does not match kalsallama@$PIN_COMMIT + scripts/kalsa-patches:" >&2
     printf '%s\n' "$diff_out" >&2
     exit 1
   fi
+  "$ROOT/scripts/assert-cpp-includes.sh"
 }
 
 [ -f "$PIN_FILE" ] || die "missing pin file $PIN_FILE"

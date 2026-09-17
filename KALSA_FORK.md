@@ -20,14 +20,24 @@ edit to pin-derived engine code must live as a patch under
     scripts/sync-kalsallama.sh pin <sha>  # re-point the pin, regenerate cpp/
     scripts/sync-kalsallama.sh bump       # pin to origin/<branch> of the pin
     scripts/sync-kalsallama.sh verify     # regenerate into a temp copy and
-                                          # diff it against cpp/
+                                          # check it against cpp/
 
-`pin`/`bump` rewrite `kalsallama.pin`, rsync the flattened tree over `cpp/`
-(`--delete`, minus the excludes above) and re-apply the patches with
-`git apply`. `verify` touches nothing under `cpp/` and exits 0 only when
-`cpp/` is exactly pin + patches; run it after any manual touch of `cpp/`.
-`KALSALLAMA_SRC=/path/to/kalsallama` flattens from a local checkout instead
-of cloning the pin repo (for pins that are not pushed yet).
+`pin`/`bump` flatten the pinned commit, apply the patches to the flattened
+tree, assert the kalsa post-image, rsync it over `cpp/` (`--delete`, minus
+the excludes above), run the include gate, and rewrite `kalsallama.pin`
+LAST -- a failing check leaves `cpp/` and the pin untouched.
+`KALSALLAMA_SRC=/path/to/kalsallama` flattens from a local checkout
+read-only (never fetched or pruned) for pins that are not pushed yet.
+
+`verify` touches nothing under `cpp/` and exits 0 only when all of these
+hold: `cpp/KALSALLAMA_SHA` equals the pin; the regenerated tree with the
+patches applied diffs clean against `cpp/` (excluding the llama.rn-owned
+files); the kalsa post-image markers are present; and every local
+`#include "..."` in `cpp/` resolves (`scripts/assert-cpp-includes.sh`).
+What verify cannot catch: the copy lists do not learn, so a fork file that
+should be in `cpp/` but was never copied diffs clean in both trees -- that
+class is caught only by the include check, and only if something in the
+tree already includes it. Run verify after any manual touch of `cpp/`.
 
 ## Consuming from the app
 

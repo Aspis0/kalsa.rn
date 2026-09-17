@@ -512,12 +512,17 @@ prefix_vendor_tree() {
   done
 }
 
-# The llama.rn bootstrap prepends build-info fallback defines at the top of
-# cpp/ggml.c (lm_ggml_version()/lm_ggml_commit() reference them). Insert right
-# after the two MSVC guards, idempotently.
+# Pins whose ggml.c includes ggml-version.h get their version/commit from the
+# generated header (write_version_headers below); the injected ggml.c fallback
+# defines the same macros BEFORE that include and would both shadow the real
+# values and trip -Wmacro-redefinition. Older pins without the include keep
+# the bootstrap fallback.
 prepend_ggml_build_info() {
   local ggml_c="$DST/ggml.c"
   [ -f "$ggml_c" ] || return 0
+  if grep -q '^#include "ggml-version.h"' "$ggml_c"; then
+    return 0
+  fi
   if grep -q '^#define LM_GGML_VERSION' "$ggml_c"; then
     return 0
   fi
@@ -557,6 +562,52 @@ write_build_info() {
       "$src" > "$DST/common/build-info.cpp"
 }
 
+# The pin's engine includes two build-generated version headers that upstream
+# materializes with configure_file (src/llama-version.h.in,
+# ggml/src/ggml-version.h.in): the Android build compiles the flattened tree
+# and never runs upstream's CMake, and the iOS podspec compiles cpp/** with no
+# CMake of ours. So the flatten generates both, tracked in cpp/, with values
+# that are a pure function of the pin: version strings read from the pin's own
+# CMake version blocks (LLAMA_BUILD_IS_DEV defaults ON -> "-dev"; GGML has no
+# dev variant), commits from the pinned sha (--short=7 like write_build_info;
+# a pinned archive is never dirty, so no -dirty suffix). Generated before
+# prefix_vendor_tree so ggml-version.h goes through the same LM_ rename as
+# every other engine source.
+cmake_var() {  # cmake_var <fallback> <file> <var-name>
+  local fallback="$1" file="$2" var="$3" v
+  v=$(sed -n "s/^set($var \\(.*\\))\$/\\1/p" "$file" | head -1)
+  echo "${v:-$fallback}"
+}
+
+write_version_headers() {
+  local git_dir="$1"
+  local sha="$2"
+  local llama_in="$LLAMA/src/llama-version.h.in"
+  local ggml_in="$LLAMA/ggml/src/ggml-version.h.in"
+  [ -f "$llama_in" ] || die "missing $llama_in: pin does not ship the version templates"
+  [ -f "$ggml_in" ] || die "missing $ggml_in: pin does not ship the version templates"
+  local short_commit
+  short_commit=$(git -C "$git_dir" rev-parse --short=7 "$sha")
+  local llama_major llama_minor llama_patch llama_dev llama_version
+  llama_major=$(cmake_var 0 "$LLAMA/CMakeLists.txt" LLAMA_VERSION_MAJOR)
+  llama_minor=$(cmake_var 0 "$LLAMA/CMakeLists.txt" LLAMA_VERSION_MINOR)
+  llama_patch=$(cmake_var 0 "$LLAMA/CMakeLists.txt" LLAMA_VERSION_PATCH)
+  llama_dev=$(sed -n 's/^option(LLAMA_BUILD_IS_DEV "llama: dev build" \(ON\|OFF\))$/\1/p' "$LLAMA/CMakeLists.txt")
+  llama_version="$llama_major.$llama_minor.$llama_patch"
+  [ "$llama_dev" = "OFF" ] || llama_version="${llama_version}-dev"
+  local ggml_major ggml_minor ggml_patch ggml_version
+  ggml_major=$(cmake_var 0 "$LLAMA/ggml/CMakeLists.txt" GGML_VERSION_MAJOR)
+  ggml_minor=$(cmake_var 0 "$LLAMA/ggml/CMakeLists.txt" GGML_VERSION_MINOR)
+  ggml_patch=$(cmake_var 0 "$LLAMA/ggml/CMakeLists.txt" GGML_VERSION_PATCH)
+  ggml_version="$ggml_major.$ggml_minor.$ggml_patch"
+  sed -e "s|@LLAMA_VERSION@|$llama_version|g" \
+      -e "s|@LLAMA_BUILD_COMMIT@|$short_commit|g" \
+      "$llama_in" > "$DST/llama-version.h"
+  sed -e "s|@GGML_VERSION@|$ggml_version|g" \
+      -e "s|@GGML_BUILD_COMMIT@|$short_commit|g" \
+      "$ggml_in" > "$DST/ggml-version.h"
+}
+
 flatten_and_prefix() {
   local sha="$1"
   resolve_git_dir
@@ -581,6 +632,7 @@ flatten_and_prefix() {
   copy_common
   copy_mtmd
   copy_vendored_third_party
+  write_version_headers "$GIT_DIR" "$sha"
   fix_jinja_and_ext_includes
   prefix_vendor_tree
   prepend_ggml_build_info

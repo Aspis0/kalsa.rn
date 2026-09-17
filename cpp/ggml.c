@@ -1,14 +1,6 @@
 #define _CRT_SECURE_NO_DEPRECATE // Disables "unsafe" warnings on Windows
 #define _USE_MATH_DEFINES // For M_PI on MSVC
 
-// GGML build info
-#ifndef LM_GGML_VERSION
-#define LM_GGML_VERSION "unknown"
-#endif
-#ifndef LM_GGML_COMMIT
-#define LM_GGML_COMMIT "unknown"
-#endif
-
 #include "ggml-version.h"
 #include "ggml-backend.h"
 #include "ggml-impl.h"

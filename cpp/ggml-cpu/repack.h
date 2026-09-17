@@ -72,6 +72,26 @@ struct block_q2_Kx16 {
 };
 static_assert(sizeof(block_q2_Kx16) == sizeof(lm_ggml_half) * 32 + QK_K + QK_K * 4, "wrong q2_K block size/padding");
 
+// ARM 8-row / 4-activation-row tiles. Internal CPU_REPACK storage only;
+// the logical tensor type remains LM_GGML_TYPE_Q2_K / LM_GGML_TYPE_Q3_K.
+struct block_q2_K_8x4 {
+    uint8_t   qs[16][8][4]; // 16 subblocks x 8 rows x 16 2-bit values
+    uint8_t   sm[16][8];    // scale = sm & 0xf, min = sm >> 4
+    lm_ggml_half d[8];
+    lm_ggml_half dmin[8];
+};
+static_assert(sizeof(block_q2_K_8x4) == 672, "wrong q2_K_8x4 tile size/padding");
+static_assert(sizeof(block_q2_K_8x4) % 16 == 0, "q2_K_8x4 tile must be 16-byte aligned");
+
+struct block_q3_K_8x4 {
+    uint8_t   qs[16][8][4];      // 16 subblocks x 8 rows x 16 2-bit low values
+    uint8_t   hmask[16][8][2];   // 16 high bits unpacked per subblock per row
+    uint8_t   scale_code[16][8]; // raw 0..63; effective s = scale_code - 32
+    lm_ggml_half d[8];
+};
+static_assert(sizeof(block_q3_K_8x4) == 912, "wrong q3_K_8x4 tile size/padding");
+static_assert(sizeof(block_q3_K_8x4) % 16 == 0, "q3_K_8x4 tile must be 16-byte aligned");
+
 struct block_q5_Kx8 {
     lm_ggml_half d[8];              // super-block scale for quantized scales
     lm_ggml_half dmin[8];           // super-block scale for quantized mins
@@ -145,6 +165,10 @@ void lm_ggml_gemv_q4_0_4x4_q8_0(int n, float * LM_GGML_RESTRICT s, size_t bs, co
 void lm_ggml_gemv_q4_0_4x8_q8_0(int n, float * LM_GGML_RESTRICT s, size_t bs, const void * LM_GGML_RESTRICT vx, const void * LM_GGML_RESTRICT vy, int nr, int nc);
 void lm_ggml_gemv_q4_0_8x8_q8_0(int n, float * LM_GGML_RESTRICT s, size_t bs, const void * LM_GGML_RESTRICT vx, const void * LM_GGML_RESTRICT vy, int nr, int nc);
 void lm_ggml_gemv_q2_K_8x8_q8_K(int n, float * LM_GGML_RESTRICT s, size_t bs, const void * LM_GGML_RESTRICT vx, const void * LM_GGML_RESTRICT vy, int nr, int nc);
+void lm_ggml_gemv_q2_K_8x4_q8_K(int n, float * LM_GGML_RESTRICT s, size_t bs, const void * LM_GGML_RESTRICT vx, const void * LM_GGML_RESTRICT vy, int nr, int nc);
+void lm_ggml_gemv_q3_K_8x4_q8_K(int n, float * LM_GGML_RESTRICT s, size_t bs, const void * LM_GGML_RESTRICT vx, const void * LM_GGML_RESTRICT vy, int nr, int nc);
+void lm_ggml_gemm_q2_K_8x4_q8_K(int n, float * LM_GGML_RESTRICT s, size_t bs, const void * LM_GGML_RESTRICT vx, const void * LM_GGML_RESTRICT vy, int nr, int nc);
+void lm_ggml_gemm_q3_K_8x4_q8_K(int n, float * LM_GGML_RESTRICT s, size_t bs, const void * LM_GGML_RESTRICT vx, const void * LM_GGML_RESTRICT vy, int nr, int nc);
 void lm_ggml_gemv_q4_K_8x4_q8_K(int n, float * LM_GGML_RESTRICT s, size_t bs, const void * LM_GGML_RESTRICT vx, const void * LM_GGML_RESTRICT vy, int nr, int nc);
 void lm_ggml_gemv_q4_K_8x8_q8_K(int n, float * LM_GGML_RESTRICT s, size_t bs, const void * LM_GGML_RESTRICT vx, const void * LM_GGML_RESTRICT vy, int nr, int nc);
 void lm_ggml_gemv_q5_K_8x4_q8_K(int n, float * LM_GGML_RESTRICT s, size_t bs, const void * LM_GGML_RESTRICT vx, const void * LM_GGML_RESTRICT vy, int nr, int nc);
@@ -197,6 +221,10 @@ void lm_ggml_gemv_q4_0_4x4_q8_0_generic(int n, float * LM_GGML_RESTRICT s, size_
 void lm_ggml_gemv_q4_0_4x8_q8_0_generic(int n, float * LM_GGML_RESTRICT s, size_t bs, const void * LM_GGML_RESTRICT vx, const void * LM_GGML_RESTRICT vy, int nr, int nc);
 void lm_ggml_gemv_q4_0_8x8_q8_0_generic(int n, float * LM_GGML_RESTRICT s, size_t bs, const void * LM_GGML_RESTRICT vx, const void * LM_GGML_RESTRICT vy, int nr, int nc);
 void lm_ggml_gemv_q2_K_8x8_q8_K_generic(int n, float * LM_GGML_RESTRICT s, size_t bs, const void * LM_GGML_RESTRICT vx, const void * LM_GGML_RESTRICT vy, int nr, int nc);
+void lm_ggml_gemv_q2_K_8x4_q8_K_generic(int n, float * LM_GGML_RESTRICT s, size_t bs, const void * LM_GGML_RESTRICT vx, const void * LM_GGML_RESTRICT vy, int nr, int nc);
+void lm_ggml_gemv_q3_K_8x4_q8_K_generic(int n, float * LM_GGML_RESTRICT s, size_t bs, const void * LM_GGML_RESTRICT vx, const void * LM_GGML_RESTRICT vy, int nr, int nc);
+void lm_ggml_gemm_q2_K_8x4_q8_K_generic(int n, float * LM_GGML_RESTRICT s, size_t bs, const void * LM_GGML_RESTRICT vx, const void * LM_GGML_RESTRICT vy, int nr, int nc);
+void lm_ggml_gemm_q3_K_8x4_q8_K_generic(int n, float * LM_GGML_RESTRICT s, size_t bs, const void * LM_GGML_RESTRICT vx, const void * LM_GGML_RESTRICT vy, int nr, int nc);
 void lm_ggml_gemv_q4_K_8x4_q8_K_generic(int n, float * LM_GGML_RESTRICT s, size_t bs, const void * LM_GGML_RESTRICT vx, const void * LM_GGML_RESTRICT vy, int nr, int nc);
 void lm_ggml_gemv_q4_K_8x8_q8_K_generic(int n, float * LM_GGML_RESTRICT s, size_t bs, const void * LM_GGML_RESTRICT vx, const void * LM_GGML_RESTRICT vy, int nr, int nc);
 void lm_ggml_gemv_q5_K_8x4_q8_K_generic(int n, float * LM_GGML_RESTRICT s, size_t bs, const void * LM_GGML_RESTRICT vx, const void * LM_GGML_RESTRICT vy, int nr, int nc);

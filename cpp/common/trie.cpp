@@ -1,6 +1,6 @@
 #include "trie.h"
 
-#include "unicode.h"
+#include "unicode-stream.h"
 
 #include <deque>
 

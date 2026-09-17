@@ -140,6 +140,31 @@ extern "C" {
 
     LM_GGML_BACKEND_API lm_ggml_backend_reg_t lm_ggml_backend_cpu_reg(void);
 
+    // Called by the CPU backend from mul_mat_id for each expert weight matrix that is
+    // about to be consumed (src0 = the expert weight tensor, expert = index along dim 2).
+    // Invoked by every compute thread before any row of that expert is read; the hook
+    // may block until the expert's data is resident. Intended for out-of-band expert
+    // weight residency (streaming/prefetch) integrations.
+    typedef void (*lm_ggml_cpu_expert_ready_hook_t)(const struct lm_ggml_tensor * src0, int expert, void * user_data);
+
+    // Process-global registration; pass NULL to unregister. Not thread-safe with
+    // respect to concurrent graph computation - register before compute starts.
+    LM_GGML_BACKEND_API void lm_ggml_cpu_set_expert_ready_hook(lm_ggml_cpu_expert_ready_hook_t hook, void * user_data);
+
+    // Single-token MUL_MAT_ID: schedule the k selected K-quant expert GEMVs as one
+    // virtual tall GEMV (k * n_rows) without copying weights. Default ON. Does not
+    // apply to n_tokens>1, Q8_0/Q5_0 down, or use_ref (test-backend-ops stock path).
+    // Setter wins; LM_GGML_MOE_FUSED_GEMV is read only if the setter is never called.
+    LM_GGML_BACKEND_API void lm_ggml_cpu_set_moe_fused_gemv(bool enabled);
+    LM_GGML_BACKEND_API bool lm_ggml_cpu_get_moe_fused_gemv(void);
+
+    // Single-token MoE SwiGLU FFN: fuse gate+SiLU+up+mul+down+accumulate into one
+    // graph launch. Default ON. Prefill (n_tokens>1) and use_ref stay on the stock
+    // unfused graph. Setter wins; LM_GGML_MOE_FUSED_FFN is read only if the setter
+    // is never called.
+    LM_GGML_BACKEND_API void lm_ggml_cpu_set_moe_fused_ffn(bool enabled);
+    LM_GGML_BACKEND_API bool lm_ggml_cpu_get_moe_fused_ffn(void);
+
     LM_GGML_BACKEND_API void lm_ggml_cpu_fp32_to_fp32(const float *,       float *, int64_t);
     LM_GGML_BACKEND_API void lm_ggml_cpu_fp32_to_i32 (const float *,     int32_t *, int64_t);
     LM_GGML_BACKEND_API void lm_ggml_cpu_fp32_to_fp16(const float *, lm_ggml_fp16_t *, int64_t);

@@ -11,6 +11,16 @@
 // llama_kv_cache_iswa
 //
 
+float llama_kv_cache_iswa::get_used_frac() const {
+    // the SWA ring recycles cells in place, so its occupancy saturates at 1.0
+    // during normal single-sequence use: it is not a pressure signal, and
+    // letting it drive the hook would fire early and latch forever, hiding
+    // the real crossing of the base cache. for pure-SWA layouts the base half
+    // owns no layers, reads 0.0 and the hook simply never fires (a pure-SWA
+    // cache cannot fail for a single sequence anyway).
+    return get_base()->get_used_frac();
+}
+
 llama_kv_cache_iswa::llama_kv_cache_iswa(
         const llama_model & model,
                 lm_ggml_type   type_k,
@@ -82,15 +92,13 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
 
     LLAMA_LOG_INFO("%s: creating non-SWA KV cache, size = %u cells\n", __func__, size_base);
 
-    llama_memory_t mem_other_base = nullptr;
-    if (mem_other) {
-        mem_other_base = static_cast<llama_kv_cache_iswa *>(mem_other)->get_base();
+    auto * other = dynamic_cast<llama_kv_cache_iswa *>(mem_other);
+    if (mem_other && !other) {
+        throw std::runtime_error("cannot share iSWA cells with an incompatible memory type");
     }
 
-    llama_memory_t mem_other_swa = nullptr;
-    if (mem_other) {
-        mem_other_swa = static_cast<llama_kv_cache_iswa *>(mem_other)->get_swa();
-    }
+    llama_memory_t mem_other_base = other ? other->get_base() : nullptr;
+    llama_memory_t mem_other_swa  = other ? other->get_swa()  : nullptr;
 
     kv_base = std::make_unique<llama_kv_cache>(
             model, hparams, type_k, type_v,

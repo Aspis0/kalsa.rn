@@ -1,4 +1,4 @@
-#include "unicode.h"
+#include "unicode-stream.h"
 
 #include <algorithm>
 #include <cassert>

@@ -35,7 +35,12 @@ kernel void kernel_gemm_noshuffle_q4_0_f32(
     int gx = get_global_id(1);
     int gx_2 = gx << 2;
 
-    half8 c0 = 0, c1 = 0, c2 = 0, c3 = 0; // 8x4 output elements
+    // On Adreno 750 (QRD8650), the half product—not the accumulator—is what diverges.
+    // Measured median KLD: 0.4538 -> 0.004736; same-top-token: 62.8% -> 94.8%.
+    // The float product costs 0.659x prefill throughput (measured 2026-09-07).
+    // A float accumulator alone does not fix it, so keep the explicit convert_float8.
+    // Do not optimize the convert_float8 or float multiply away.
+    float8 c0 = 0, c1 = 0, c2 = 0, c3 = 0; // 8x4 output elements
     half8 B; // registers for activations
     half4 dequantized_weights; // registers for dequantized weights
     __global const ushort* weight_ptr = src0_q + gx_2; // pointer for weights
@@ -58,10 +63,10 @@ kernel void kernel_gemm_noshuffle_q4_0_f32(
         dequantized_weights.s1 = ((bits4.s1 & (0x000F)) - 8) * scale.s1;
         dequantized_weights.s2 = ((bits4.s2 & (0x000F)) - 8) * scale.s2;
         dequantized_weights.s3 = ((bits4.s3 & (0x000F)) - 8) * scale.s3;
-        c0 += B * dequantized_weights.s0; // vector-scalar multiplication to accumulate
-        c1 += B * dequantized_weights.s1;
-        c2 += B * dequantized_weights.s2;
-        c3 += B * dequantized_weights.s3;
+        c0 += convert_float8(B) * (float)dequantized_weights.s0; // vector-scalar multiplication to accumulate
+        c1 += convert_float8(B) * (float)dequantized_weights.s1;
+        c2 += convert_float8(B) * (float)dequantized_weights.s2;
+        c3 += convert_float8(B) * (float)dequantized_weights.s3;
 
         // j=1
         B.s0123 = read_imageh(src1, gy*2 + (i+1)*(n_4));
@@ -70,10 +75,10 @@ kernel void kernel_gemm_noshuffle_q4_0_f32(
         dequantized_weights.s1 = (((bits4.s1 & (0x00F0)) >> 4) - 8) * scale.s1;
         dequantized_weights.s2 = (((bits4.s2 & (0x00F0)) >> 4) - 8) * scale.s2;
         dequantized_weights.s3 = (((bits4.s3 & (0x00F0)) >> 4) - 8) * scale.s3;
-        c0 += B * dequantized_weights.s0; //vector-scalar multiplication to accumulate
-        c1 += B * dequantized_weights.s1;
-        c2 += B * dequantized_weights.s2;
-        c3 += B * dequantized_weights.s3;
+        c0 += convert_float8(B) * (float)dequantized_weights.s0; //vector-scalar multiplication to accumulate
+        c1 += convert_float8(B) * (float)dequantized_weights.s1;
+        c2 += convert_float8(B) * (float)dequantized_weights.s2;
+        c3 += convert_float8(B) * (float)dequantized_weights.s3;
 
         // j=2
         B.s0123 = read_imageh(src1, gy*2 + (i+2)*(n_4));
@@ -82,10 +87,10 @@ kernel void kernel_gemm_noshuffle_q4_0_f32(
         dequantized_weights.s1 = (((bits4.s1 & (0x0F00)) >> 8) - 8) * scale.s1;
         dequantized_weights.s2 = (((bits4.s2 & (0x0F00)) >> 8) - 8) * scale.s2;
         dequantized_weights.s3 = (((bits4.s3 & (0x0F00)) >> 8) - 8) * scale.s3;
-        c0 += B * dequantized_weights.s0; // vector-scalar multiplication to accumulate
-        c1 += B * dequantized_weights.s1;
-        c2 += B * dequantized_weights.s2;
-        c3 += B * dequantized_weights.s3;
+        c0 += convert_float8(B) * (float)dequantized_weights.s0; // vector-scalar multiplication to accumulate
+        c1 += convert_float8(B) * (float)dequantized_weights.s1;
+        c2 += convert_float8(B) * (float)dequantized_weights.s2;
+        c3 += convert_float8(B) * (float)dequantized_weights.s3;
 
         // j=3
         B.s0123 = read_imageh(src1, gy*2 + (i+3)*(n_4));
@@ -94,10 +99,10 @@ kernel void kernel_gemm_noshuffle_q4_0_f32(
         dequantized_weights.s1 = (((bits4.s1 & (0xF000)) >> 12) - 8) * scale.s1;
         dequantized_weights.s2 = (((bits4.s2 & (0xF000)) >> 12) - 8) * scale.s2;
         dequantized_weights.s3 = (((bits4.s3 & (0xF000)) >> 12) - 8) * scale.s3;
-        c0 += B * dequantized_weights.s0; // vector-scalar multiplication to accumulate
-        c1 += B * dequantized_weights.s1;
-        c2 += B * dequantized_weights.s2;
-        c3 += B * dequantized_weights.s3;
+        c0 += convert_float8(B) * (float)dequantized_weights.s0; // vector-scalar multiplication to accumulate
+        c1 += convert_float8(B) * (float)dequantized_weights.s1;
+        c2 += convert_float8(B) * (float)dequantized_weights.s2;
+        c3 += convert_float8(B) * (float)dequantized_weights.s3;
     }
 
     int idx = (gy<<3)*m + (gx<<2); // vectorized store 16 elements

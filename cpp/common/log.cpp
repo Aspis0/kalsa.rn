@@ -13,10 +13,6 @@
 #include <vector>
 #include <algorithm>
 
-#if defined(__ANDROID__) && defined(RNLLAMA_ANDROID_ENABLE_LOGGING)
-#include <android/log.h>
-#endif
-
 #if defined(_WIN32)
 #    define WIN32_LEAN_AND_MEAN
 #    ifndef NOMINMAX
@@ -81,36 +77,7 @@ struct common_log_entry {
 
     common_log_entry(size_t size = 256) : msg(size) { }
 
-    #if defined(__ANDROID__) && defined(RNLLAMA_ANDROID_ENABLE_LOGGING)
-    void android_print() const {
-        int android_log_priority;
-        switch (level) {
-            case LM_GGML_LOG_LEVEL_INFO:
-                android_log_priority = ANDROID_LOG_INFO;
-                break;
-            case LM_GGML_LOG_LEVEL_WARN:
-                android_log_priority = ANDROID_LOG_WARN;
-                break;
-            case LM_GGML_LOG_LEVEL_ERROR:
-                android_log_priority = ANDROID_LOG_ERROR;
-                break;
-            case LM_GGML_LOG_LEVEL_DEBUG:
-                android_log_priority = ANDROID_LOG_DEBUG;
-                break;
-            default:
-                android_log_priority = ANDROID_LOG_DEFAULT;
-                break;
-        }
-
-        const char * tag = "RNLLAMA_LOG_ANDROID";
-        __android_log_print(android_log_priority, tag, "%s", msg.data());
-    }
-    #endif
-
     void print(FILE * file = nullptr) const {
-        #if defined(__ANDROID__) && defined(RNLLAMA_ANDROID_ENABLE_LOGGING)
-        android_print();
-        #else
         FILE * fcur = file;
         if (!fcur) {
             // stderr displays DBG messages only when their verbosity level is not higher than the threshold
@@ -155,7 +122,6 @@ struct common_log_entry {
         }
 
         fflush(fcur);
-        #endif
     }
 };
 
@@ -472,7 +438,7 @@ void common_log_flush(struct common_log * log) {
     log->resume();
 }
 
-static int common_get_verbosity(enum lm_ggml_log_level level) {
+int common_log_get_verbosity(enum lm_ggml_log_level level) {
     switch (level) {
         case LM_GGML_LOG_LEVEL_DEBUG: return LOG_LEVEL_DEBUG;
         case LM_GGML_LOG_LEVEL_INFO:  return LOG_LEVEL_TRACE;
@@ -486,7 +452,7 @@ static int common_get_verbosity(enum lm_ggml_log_level level) {
 }
 
 void common_log_default_callback(enum lm_ggml_log_level level, const char * text, void * /*user_data*/) {
-    auto verbosity = common_get_verbosity(level);
+    auto verbosity = common_log_get_verbosity(level);
     if (verbosity <= common_log_verbosity_thold) {
         common_log_add(common_log_main(), level, "%s", text);
     }

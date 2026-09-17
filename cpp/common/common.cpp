@@ -7,7 +7,7 @@
 #include "log.h"
 #include "llama.h"
 
-#include "../src/llama-ext.h"
+#include "../llama-ext.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode-stream.h"

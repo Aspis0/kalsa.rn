@@ -70,6 +70,7 @@ llama_rn_context_completion::~llama_rn_context_completion() {
 
 void llama_rn_context_completion::rewind() {
     resetSpeculative();
+    mtp_capability_logged = false;
     is_interrupted = false;
     parent_ctx->params.antiprompt.clear();
     parent_ctx->params.sampling.grammar = {};
@@ -804,8 +805,20 @@ void llama_rn_context_completion::updateGenerationTiming() {
 }
 
 bool llama_rn_context_completion::shouldUseMTP() const {
+    if (parent_ctx == nullptr || parent_ctx->active_ctx() == nullptr || parent_ctx->model == nullptr) {
+        return false;
+    }
     if (parent_ctx->hasGovernor()) {
         return false;
+    }
+    // spec_n_past == -1 latches a context whose draft memory failed to roll
+    // back mid-generation: the handoff invariant is memory [0, n_past) ==
+    // history minus its last token (spec_id_last is undecoded), so
+    // nextToken's plain while-loop re-decodes embd.back() == spec_id_last
+    // at n_past. Pending drains first; once it is empty the plain path
+    // takes over until rewind() re-arms the latch.
+    if (spec_n_past == -1) {
+        return !spec_pending_tokens.empty();
     }
     // Kalsa patch: DFLASH rides the same draft-speculative init/decode path as
     // MTP (common_speculative dispatches per-type); without this the whole
@@ -814,7 +827,27 @@ bool llama_rn_context_completion::shouldUseMTP() const {
     const bool has_draft_type =
         std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end() ||
         std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != types.end();
-    return has_draft_type && parent_ctx->params.speculative.draft.n_max > 0;
+    if (!has_draft_type || parent_ctx->params.speculative.draft.n_max <= 0) {
+        return false;
+    }
+    if (llama_model_has_encoder(parent_ctx->model)) {
+        if (!mtp_capability_logged) {
+            mtp_capability_logged = true;
+            LOG_ERROR("MTP speculative decoding is only supported for decoder-only models, running plain");
+        }
+        return false;
+    }
+    const auto n_mtp = parent_ctx->params.speculative.draft.n_max;
+    if ((llama_model_is_recurrent(parent_ctx->model) || llama_model_is_hybrid(parent_ctx->model)) &&
+        llama_n_rs_seq(parent_ctx->active_ctx()) < (uint32_t) n_mtp) {
+        if (!mtp_capability_logged) {
+            mtp_capability_logged = true;
+            LOG_ERROR("MTP for recurrent or hybrid models must be enabled when loading the model "
+                      "with speculative.type='draft-mtp' and speculative.n_max/spec_draft_n_max set; running plain");
+        }
+        return false;
+    }
+    return true;
 }
 
 void llama_rn_context_completion::resetSpeculative() {
@@ -839,34 +872,36 @@ void llama_rn_context_completion::initMTP() {
     if (!shouldUseMTP()) {
         return;
     }
-    if (llama_model_has_encoder(parent_ctx->model)) {
-        throw std::runtime_error("MTP speculative decoding is only supported for decoder-only models");
-    }
     if (embd.empty()) {
         throw std::runtime_error("MTP speculative decoding requires a non-empty prompt");
     }
 
-    const auto n_mtp = parent_ctx->params.speculative.draft.n_max;
-    if ((llama_model_is_recurrent(parent_ctx->model) || llama_model_is_hybrid(parent_ctx->model)) &&
-        llama_n_rs_seq(parent_ctx->active_ctx()) < (uint32_t) n_mtp) {
-        throw std::runtime_error(
-            "MTP for recurrent or hybrid models must be enabled when loading the model "
-            "with speculative.type='draft-mtp' and speculative.n_max/spec_draft_n_max set");
-    }
+    try {
+        resetSpeculative();
+        spec_ctx.reset(parent_ctx->createMTPDraftContext(parent_ctx->params));
+        if (spec_ctx == nullptr) {
+            throw std::runtime_error("failed to create MTP draft context");
+        }
 
-    resetSpeculative();
+        parent_ctx->params.speculative.draft.ctx_tgt = parent_ctx->active_ctx();
+        parent_ctx->params.speculative.draft.ctx_dft = spec_ctx.get();
 
-    spec_ctx.reset(parent_ctx->createMTPDraftContext(parent_ctx->params));
-    if (spec_ctx == nullptr) {
-        throw std::runtime_error("failed to create MTP draft context");
-    }
-
-    parent_ctx->params.speculative.draft.ctx_tgt = parent_ctx->active_ctx();
-    parent_ctx->params.speculative.draft.ctx_dft = spec_ctx.get();
-
-    spec = common_speculative_init(parent_ctx->params.speculative, 1);
-    if (spec == nullptr) {
-        throw std::runtime_error("failed to initialize MTP speculative decoding");
+        spec = common_speculative_init(parent_ctx->params.speculative, 1);
+        if (spec == nullptr) {
+            throw std::runtime_error("failed to initialize MTP speculative decoding");
+        }
+    } catch (const std::exception& e) {
+        // createMTPDraftContext bottoms out in llama_init_from_model, which
+        // throws for pure recurrent and hybrid-SWA architectures (ctx_other
+        // unsupported). Nothing above has touched the target -- embd/n_past
+        // from loadPrompt stay valid -- so the plain path serves this turn.
+        if (!mtp_capability_logged) {
+            mtp_capability_logged = true;
+            LOG_ERROR("this model cannot create an MTP draft context (%s); running plain", e.what());
+        }
+        resetSpeculative();
+        spec_n_past = -1;
+        return;
     }
 
     spec_batch = llama_batch_init(llama_n_batch(parent_ctx->active_ctx()), 0, 1);
@@ -1013,7 +1048,28 @@ bool llama_rn_context_completion::refillMTPTokens() {
             spec_draft.resize(n_draft_limit);
         }
 
-        common_context_seq_rm(spec_ctx.get(), seq_id, spec_n_past, -1);
+        // A mem-shared draft (ctx_other == target) refuses seq_rm outright,
+        // which is fine: shared cells are the target's, there is nothing to
+        // roll back.
+        if (!mtp_draft_mem_shared && !rn_seq_rm(spec_ctx.get(), seq_id, spec_n_past, -1)) {
+            // Handoff: keep everything the target already holds and let the
+            // accepted tokens drain. embd becomes the full history (memory
+            // [0, n_past) == history minus its last token), so nextToken's
+            // plain while-loop re-decodes embd.back() == spec_id_last at
+            // n_past once the drain is done (see the latch in shouldUseMTP()).
+            // No first-token corner: the plain loop decodes embd.back() itself.
+            LOG_ERROR("MTP: draft memory cannot roll back to pos %d, speculative decoding disabled for this generation",
+                      (int) spec_n_past);
+            embd = spec_prompt;
+            embd.push_back(spec_id_last);
+            n_past = spec_prompt.size();
+            auto pending = std::move(spec_pending_tokens);
+            resetSpeculative();
+            spec_pending_tokens = std::move(pending);
+            spec_n_past = -1;
+            has_next_token = !stopped_eos && !stopped_limit && !context_full;
+            return false;
+        }
     }
 
     const size_t n_draft = spec_draft.size();
@@ -1072,8 +1128,24 @@ bool llama_rn_context_completion::refillMTPTokens() {
     spec_n_past += (llama_pos) accepted_count;
     n_past = spec_n_past;
 
-    common_context_seq_rm(parent_ctx->active_ctx(), seq_id, spec_n_past, -1);
-    common_context_seq_rm(spec_ctx.get(), seq_id, spec_n_past, -1);
+    if (!rn_seq_rm(parent_ctx->active_ctx(), seq_id, spec_n_past, -1)) {
+        throw std::runtime_error("MTP: failed to truncate sequence " + std::to_string(seq_id) +
+                                 " to pos " + std::to_string(spec_n_past) + " in the target context");
+    }
+    if (!mtp_draft_mem_shared && !rn_seq_rm(spec_ctx.get(), seq_id, spec_n_past, -1)) {
+        // Handoff: keep everything the target already holds and let the
+        // accepted tokens drain; fall through to the saw_eos / n_predict
+        // tail below (see the latch in shouldUseMTP()).
+        LOG_ERROR("MTP: draft memory cannot roll back to pos %d, speculative decoding disabled for this generation",
+                  (int) spec_n_past);
+        embd = spec_prompt;
+        embd.push_back(spec_id_last);
+        n_past = spec_prompt.size();
+        auto pending = std::move(spec_pending_tokens);
+        resetSpeculative();
+        spec_pending_tokens = std::move(pending);
+        spec_n_past = -1;
+    }
 
     if (saw_eos) {
         stopped_eos = true;
@@ -1096,7 +1168,7 @@ completion_token_output llama_rn_context_completion::nextTokenMTP() {
     completion_token_output result;
     result.tok = -1;
 
-    if (spec == nullptr) {
+    if (spec == nullptr && spec_n_past != -1) {
         initMTP();
     }
     startGenerationTiming();

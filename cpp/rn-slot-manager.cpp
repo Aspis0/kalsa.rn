@@ -1153,7 +1153,10 @@ void llama_rn_slot_manager::sample_and_callback() {
 
                         if (done) {
                             finish_slot();
-                        } else if (!emitted) {
+                        } else if (!emitted && slot.should_use_mtp()) {
+                            // A latched slot (draft-rollback handoff, pending
+                            // drained) legitimately emits nothing here: the
+                            // plain path takes over from the next build_batch.
                             slot.incomplete = true;
                             slot.error_message = "MTP speculative decoding did not produce a token";
                             finish_slot();

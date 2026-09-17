@@ -27,6 +27,13 @@ namespace kalsa { class MoeStream; }
 
 namespace rnllama {
 
+// common_context_seq_rm became static in kalsallama 134a35cf2 (the public
+// removal API is struct common_memory); the memory-level removal is the whole
+// remaining contract for the rn layer. Returns false when nothing was removed.
+static inline bool rn_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    return llama_memory_seq_rm(llama_get_memory(ctx), seq_id, p0, p1);
+}
+
 class rn_governor;
 
 // Display form of a raw token piece: a lone high-bit byte is hex-escaped,

@@ -99,6 +99,7 @@ void llama_rn_slot::reset() {
     error_message.clear();
     num_draft_tokens = 0;
     num_draft_tokens_accepted = 0;
+    mtp_capability_logged = false;
     reset_speculative();
 
     // Clear multimodal state
@@ -331,10 +332,39 @@ completion_token_output llama_rn_slot::get_next_token() {
 }
 
 bool llama_rn_slot::should_use_mtp() const {
-    if (parent_ctx != nullptr && parent_ctx->hasGovernor()) {
+    if (parent_ctx == nullptr || parent_ctx->active_ctx() == nullptr || parent_ctx->model == nullptr) {
+        return false;
+    }
+    if (parent_ctx->hasGovernor()) {
         return false;
     }
     if (params == nullptr || params->speculative.draft.n_max <= 0) {
+        return false;
+    }
+    // spec_n_past == -1 latches a slot whose draft memory failed to roll
+    // back mid-generation: the handoff invariant is memory [0, n_past) ==
+    // history minus its last token (spec_id_last is undecoded), so
+    // build_batch re-decodes generated_tokens.back() == spec_id_last at
+    // n_past exactly as the plain path does. Pending drains first; once it
+    // is empty the plain path takes over until reset() re-arms the latch.
+    if (spec_n_past == -1) {
+        return !spec_pending_tokens.empty();
+    }
+    if (llama_model_has_encoder(parent_ctx->model)) {
+        if (!mtp_capability_logged) {
+            mtp_capability_logged = true;
+            LOG_ERROR("MTP speculative decoding is only supported for decoder-only models, running plain");
+        }
+        return false;
+    }
+    const auto n_mtp = params->speculative.draft.n_max;
+    if ((llama_model_is_recurrent(parent_ctx->model) || llama_model_is_hybrid(parent_ctx->model)) &&
+        llama_n_rs_seq(parent_ctx->active_ctx()) < (uint32_t) n_mtp) {
+        if (!mtp_capability_logged) {
+            mtp_capability_logged = true;
+            LOG_ERROR("MTP for recurrent or hybrid models must be enabled when loading the model "
+                      "with speculative.type='draft-mtp' and speculative.n_max/spec_draft_n_max set; running plain");
+        }
         return false;
     }
 
@@ -359,6 +389,7 @@ void llama_rn_slot::reset_speculative() {
         spec_ctx = nullptr;
     }
     spec_is_shared = false;
+    mtp_draft_mem_shared = false;
     if (spec_batch_initialized) {
         llama_batch_free(spec_batch);
         spec_batch = {};
@@ -375,12 +406,6 @@ void llama_rn_slot::init_mtp() {
     if (!should_use_mtp() || spec != nullptr) {
         return;
     }
-    if (parent_ctx == nullptr || parent_ctx->active_ctx() == nullptr || parent_ctx->model == nullptr) {
-        throw std::runtime_error("MTP speculative decoding requires an initialized context");
-    }
-    if (llama_model_has_encoder(parent_ctx->model)) {
-        throw std::runtime_error("MTP speculative decoding is only supported for decoder-only models");
-    }
     if (!media_paths.empty()) {
         throw std::runtime_error("MTP speculative decoding currently supports text-only queued completions");
     }
@@ -391,43 +416,55 @@ void llama_rn_slot::init_mtp() {
         throw std::runtime_error("MTP speculative decoding for queued completions does not support prompt state load/save");
     }
 
-    const auto n_mtp = params->speculative.draft.n_max;
-    if ((llama_model_is_recurrent(parent_ctx->model) || llama_model_is_hybrid(parent_ctx->model)) &&
-        llama_n_rs_seq(parent_ctx->active_ctx()) < (uint32_t) n_mtp) {
-        throw std::runtime_error(
-            "MTP for recurrent or hybrid models must be enabled when loading the model "
-            "with speculative.type='draft-mtp' and speculative.n_max/spec_draft_n_max set");
-    }
-
     reset_speculative();
 
-    if (parent_ctx->slot_manager != nullptr) {
-        spec = parent_ctx->slot_manager->ensure_mtp_speculative(*params);
-        spec_ctx = parent_ctx->slot_manager->get_mtp_draft_context();
-        spec_is_shared = true;
-    } else {
-        spec_ctx = parent_ctx->createMTPDraftContext(*params);
-        if (spec_ctx == nullptr) {
-            throw std::runtime_error("failed to create MTP draft context");
-        }
+    try {
+        if (parent_ctx->slot_manager != nullptr) {
+            spec = parent_ctx->slot_manager->ensure_mtp_speculative(*params);
+            spec_ctx = parent_ctx->slot_manager->get_mtp_draft_context();
+            spec_is_shared = true;
+        } else {
+            spec_ctx = parent_ctx->createMTPDraftContext(*params);
+            if (spec_ctx == nullptr) {
+                throw std::runtime_error("failed to create MTP draft context");
+            }
 
-        params->speculative.draft.ctx_tgt = parent_ctx->active_ctx();
-        params->speculative.draft.ctx_dft = spec_ctx;
+            params->speculative.draft.ctx_tgt = parent_ctx->active_ctx();
+            params->speculative.draft.ctx_dft = spec_ctx;
 
-        const uint32_t n_seq = std::max<uint32_t>(
-            (uint32_t) std::max<int32_t>(1, params->n_parallel),
-            (uint32_t) id + 1);
-        spec = common_speculative_init(params->speculative, n_seq);
-        if (spec == nullptr) {
-            throw std::runtime_error("failed to initialize MTP speculative decoding");
+            const uint32_t n_seq = std::max<uint32_t>(
+                (uint32_t) std::max<int32_t>(1, params->n_parallel),
+                (uint32_t) id + 1);
+            spec = common_speculative_init(params->speculative, n_seq);
+            if (spec == nullptr) {
+                throw std::runtime_error("failed to initialize MTP speculative decoding");
+            }
         }
+    } catch (const std::exception& e) {
+        // createMTPDraftContext bottoms out in llama_init_from_model, which
+        // throws for pure recurrent and hybrid-SWA architectures (ctx_other
+        // unsupported). Nothing above has touched the target -- the clears
+        // below have not run -- so the shared-batch prompt state and i_batch
+        // stay valid and the plain path serves this request.
+        if (!mtp_capability_logged) {
+            mtp_capability_logged = true;
+            LOG_ERROR("this model cannot create an MTP draft context (%s); running plain", e.what());
+        }
+        reset_speculative();
+        spec_n_past = -1;
+        return;
     }
+    mtp_draft_mem_shared = llama_get_ctx_other(spec_ctx) == parent_ctx->active_ctx();
 
     spec_batch = llama_batch_init(llama_n_batch(parent_ctx->active_ctx()), 0, 1);
     spec_batch_initialized = true;
 
-    common_context_seq_rm(parent_ctx->active_ctx(), id, -1, -1);
-    common_context_seq_rm(spec_ctx, id, -1, -1);
+    if (!rn_seq_rm(parent_ctx->active_ctx(), id, -1, -1)) {
+        throw std::runtime_error("MTP: failed to clear sequence " + std::to_string(id));
+    }
+    if (!rn_seq_rm(spec_ctx, id, -1, -1)) {
+        throw std::runtime_error("MTP: failed to clear sequence " + std::to_string(id));
+    }
     n_past = 0;
 
     eval_mtp_prompt();
@@ -527,7 +564,31 @@ bool llama_rn_slot::refill_mtp_tokens() {
             spec_draft.resize(n_draft_limit);
         }
 
-        common_context_seq_rm(spec_ctx, seq_id, spec_n_past, -1);
+        // A mem-shared draft (ctx_other == target) refuses seq_rm outright,
+        // which is fine: shared cells are the target's, there is nothing to
+        // roll back.
+        if (!mtp_draft_mem_shared && !rn_seq_rm(spec_ctx, seq_id, spec_n_past, -1)) {
+            // Handoff: keep everything the target already holds and let the
+            // accepted tokens drain. Memory [0, n_past) == history minus its
+            // last token, so build_batch re-decodes
+            // generated_tokens.back() == spec_id_last at n_past once the
+            // drain is done (see the latch in should_use_mtp()).
+            LOG_ERROR("MTP: draft memory cannot roll back to pos %d, speculative decoding disabled for this generation",
+                      (int) spec_n_past);
+            if (generated_tokens.empty()) {
+                // build_batch has nothing to feed and the last prompt token
+                // was consumed by eval_mtp_prompt: plain cannot take over.
+                // After the mem-shared skip above this is reachable only for
+                // a non-shared draft failing on its very first rollback.
+                throw std::runtime_error("MTP: non-shared draft failed to roll back before the first token; this is a bug, retry without speculative decoding");
+            }
+            n_past = spec_prompt.size();
+            auto pending = std::move(spec_pending_tokens);
+            reset_speculative();
+            spec_pending_tokens = std::move(pending);
+            spec_n_past = -1;
+            return false;
+        }
     }
 
     const size_t n_draft = spec_draft.size();
@@ -583,8 +644,22 @@ bool llama_rn_slot::refill_mtp_tokens() {
     spec_n_past += (llama_pos) accepted_count;
     n_past = spec_n_past;
 
-    common_context_seq_rm(parent_ctx->active_ctx(), seq_id, spec_n_past, -1);
-    common_context_seq_rm(spec_ctx, seq_id, spec_n_past, -1);
+    if (!rn_seq_rm(parent_ctx->active_ctx(), seq_id, spec_n_past, -1)) {
+        throw std::runtime_error("MTP: failed to truncate sequence " + std::to_string(seq_id) +
+                                 " to pos " + std::to_string(spec_n_past) + " in the target context");
+    }
+    if (!mtp_draft_mem_shared && !rn_seq_rm(spec_ctx, seq_id, spec_n_past, -1)) {
+        // Handoff: keep everything the target already holds and let the
+        // accepted tokens drain; fall through to the saw_eos / n_remaining
+        // tail below (see the latch in should_use_mtp()).
+        LOG_ERROR("MTP: draft memory cannot roll back to pos %d, speculative decoding disabled for this generation",
+                  (int) spec_n_past);
+        n_past = spec_prompt.size();
+        auto pending = std::move(spec_pending_tokens);
+        reset_speculative();
+        spec_pending_tokens = std::move(pending);
+        spec_n_past = -1;
+    }
 
     if (saw_eos) {
         stopped_eos = true;
@@ -598,7 +673,7 @@ completion_token_output llama_rn_slot::next_token_mtp() {
     result.tok = -1;
     result.request_id = request_id;
 
-    if (spec == nullptr) {
+    if (spec == nullptr && spec_n_past != -1) {
         init_mtp();
     }
 

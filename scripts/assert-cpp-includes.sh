@@ -67,3 +67,53 @@ if missing:
 
 print(f"[includes] OK: every local include in {len(files)} files resolves")
 PY
+
+# The scan above only proves files EXIST. It cannot see an API that moved: on
+# 2026-09-17 pin 134a35cf2 made common_context_seq_rm static and gave
+# mtmd_helper_bitmap_init_from_buf a fifth parameter, while rn-completion.cpp,
+# rn-slot.cpp and rn-mtmd.hpp -- which never come from the fork -- kept calling
+# the old ones. Every file resolved; the NDK still failed.
+#
+# So also PARSE the sources the Android build actually compiles. Host clang
+# cannot codegen for ARM, but -fsyntax-only does not need to: it resolves
+# declarations, which is exactly the drift class the file scan misses.
+if ! command -v clang++ >/dev/null 2>&1; then
+  echo "[includes] NOTE: no clang++ - skipping the syntax pass (file scan only)"
+  exit 0
+fi
+
+# rn-*.cpp include the bmoe stream port headers, which live in the app repo;
+# point KALSA_BMOE_DIR at them to bring the rn-owned sources into the syntax
+# pass. Without it the pass covers only the sync's copy lists.
+syntax_check() {
+  local f="$1" extra="${2:-}"
+  clang++ -std=c++17 -fsyntax-only \
+    -I "$CPP" -I "$CPP/common" -I "$CPP/common/jinja" \
+    -I "$CPP/ggml-cpu" -I "$CPP/tools/mtmd" \
+    ${extra:+-I "$extra"} \
+    "$f" > /tmp/kalsa-syntax.log 2>&1
+}
+
+fails=0
+BMOE_DIR=""
+if [ -n "${KALSA_BMOE_DIR:-}" ]; then
+  BMOE_DIR="$KALSA_BMOE_DIR"
+  set -- "$CPP"/common/*.cpp "$CPP"/tools/mtmd/*.cpp "$CPP"/rn-*.cpp
+else
+  echo "[includes] NOTE: KALSA_BMOE_DIR not set - syntax pass skips rn-*.cpp (bmoe headers live in the app repo)"
+  set -- "$CPP"/common/*.cpp "$CPP"/tools/mtmd/*.cpp
+fi
+for f in "$@"; do
+  [ -f "$f" ] || continue
+  if ! syntax_check "$f" "$BMOE_DIR"; then
+    echo "[includes] SYNTAX FAIL: $(basename "$f")"
+    grep -E "error:" /tmp/kalsa-syntax.log | head -3 | sed 's/^/    /'
+    fails=$((fails + 1))
+  fi
+done
+if [ "$fails" -gt 0 ]; then
+  echo "[includes] $fails source(s) do not parse against the assembled tree."
+  echo "[includes] An API the fork moved, or a header the sync did not bring."
+  exit 1
+fi
+echo "[includes] OK: every source the Android build compiles also parses"

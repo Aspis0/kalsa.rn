@@ -118,6 +118,9 @@ struct llama_rn_slot {
     common_speculative *spec = nullptr;
     llama_context *spec_ctx = nullptr;
     bool spec_is_shared = false;
+    // The draft's KV is shared with the target (ctx_other == target): its
+    // seq_rm refuses unconditionally, so the rollback step is skipped.
+    bool mtp_draft_mem_shared = false;
     llama_batch spec_batch = {};
     bool spec_batch_initialized = false;
     llama_tokens spec_prompt;
@@ -125,6 +128,8 @@ struct llama_rn_slot {
     llama_pos spec_n_past = 0;
     llama_tokens spec_draft;
     std::deque<llama_token> spec_pending_tokens;
+    // Logged once per slot when the gate rejects MTP on capability grounds.
+    mutable bool mtp_capability_logged = false;
     size_t num_draft_tokens;
     size_t num_draft_tokens_accepted;
 

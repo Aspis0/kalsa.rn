@@ -153,6 +153,8 @@ struct llama_rn_context_completion {
     llama_pos spec_n_past = 0;
     llama_tokens spec_draft;
     std::deque<completion_token_output> spec_pending_tokens;
+    // Logged once per context when the gate rejects MTP on capability grounds.
+    mutable bool mtp_capability_logged = false;
     // Number of prompt tokens the last MTP prompt eval actually decoded (vs.
     // reused from the cache). Instrumentation for the reuse tests.
     size_t mtp_prompt_reprocessed = 0;

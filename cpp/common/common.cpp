@@ -1813,6 +1813,15 @@ void common_threadpools::init(llama_context * ctx, const common_params & params)
     auto * reg = lm_ggml_backend_dev_backend_reg(cpu_dev);
     auto * lm_ggml_threadpool_new_fn = (decltype(lm_ggml_threadpool_new) *) lm_ggml_backend_reg_get_proc_address(reg, "lm_ggml_threadpool_new");
     free_fn = (decltype(lm_ggml_threadpool_free) *) lm_ggml_backend_reg_get_proc_address(reg, "lm_ggml_threadpool_free");
+    // A backend that does not export the threadpool API returns null here, and
+    // the first use below would be a null call. Same shape as the !cpu_dev exit
+    // above: warn and run without a threadpool, which every caller already
+    // tolerates (the destructor guards on free_fn for the same reason).
+    if (!lm_ggml_threadpool_new_fn || !free_fn) {
+        COM_WRN("%s", "CPU backend does not export the threadpool API; running without one\n");
+        free_fn = nullptr;
+        return;
+    }
 
     struct lm_ggml_threadpool_params tpp_batch =
             lm_ggml_threadpool_params_from_cpu_params(params.cpuparams_batch);

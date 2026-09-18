@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <stdexcept>
 
 //
 // llama_kv_cache_iswa

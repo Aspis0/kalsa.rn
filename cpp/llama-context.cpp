@@ -3765,6 +3765,19 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
+    // The metadata can promise an MTP block whose weights are not in memory:
+    // llama_model_params::load_mtp defaults to false and skips them. Every MTP
+    // graph builder then hard-asserts on nextn.eh_proj/enorm/hnorm, so without
+    // this the process aborts. Refusing instead gives the caller something it can
+    // act on: the RN binding falls back to plain decode, and a caller that treats
+    // null as fatal (tools/server) reports a clean error.
+    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && !model->has_mtp_weights()) {
+        LLAMA_LOG_WARN("%s: context type MTP requested but the MTP weights are not loaded "
+                       "(llama_model_params::load_mtp was false, or the file has the nextn "
+                       "metadata without the tensors)\n", __func__);
+        return nullptr;
+    }
+
     try {
         auto * ctx = new llama_context(*model, params);
         const auto & cparams = ctx->get_cparams();

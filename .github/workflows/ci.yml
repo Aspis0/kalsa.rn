@@ -43,15 +43,22 @@ jobs:
       - name: Run ts unit tests
         run: npm test -- --maxWorkers=2 --coverage
 
-      # Red on `kalsa` for two reasons, both recorded rather than hidden. Run
-      # 35360547883: `cpp/llama-kv-cache-iswa.cpp:97: error: 'runtime_error' is
-      # not a member of 'std'` — an engine defect (the file misses <stdexcept>;
-      # clang accepts it, GCC does not), fixed in kalsallama and arriving with
-      # the Step 5 pin bump. And structurally: tests/CMakeLists.txt compiles
-      # cpp/rn-llama.cpp, which includes bmoe_stream.h — a header that lives in
-      # the app repo (native/bmoe/rn) by design — and links rn_governor, whose
-      # TUs are not in RNLLAMA_COMMON_SOURCES. Un-gate in the same commit as the
-      # pin bump, once tests/CMakeLists.txt can see KALSA_BMOE_DIR.
+      # Red on `kalsa` for one reason now; this commit closes the other. Run
+      # 35360547883 died on `cpp/llama-kv-cache-iswa.cpp:97: error:
+      # 'runtime_error' is not a member of 'std'` — the file missed <stdexcept>,
+      # which clang forgives and GCC does not — and the pin bump in this commit
+      # brings kalsallama's fixed copy (src/llama-kv-cache-iswa.cpp:9).
+      #
+      # What is left is structural and cannot be fixed from inside this repo.
+      # tests/CMakeLists.txt:91 puts cpp/rn-llama.cpp in RNLLAMA_COMMON_SOURCES,
+      # so every test target compiles it, and cpp/rn-llama.cpp:2 includes
+      # "bmoe_stream.h" — a header that lives in the app repo (native/bmoe/rn)
+      # by design and is not checked out here. Two TUs are missing besides: that
+      # file's globs take llama*.cpp but nothing lists cpp/rn-governor.cpp or
+      # cpp/rn-governor-params.cpp, so rn_governor would fail at link even with
+      # the header. Un-gating therefore means putting a private sibling repo
+      # inside this job — a PAT or deploy key in this repo's secrets — which is
+      # Marco's call, not a side effect of a pin bump.
       - name: Run c++ unit tests
         if: github.ref != 'refs/heads/kalsa'
         run: |

@@ -114,7 +114,8 @@
     "modulePathIgnorePatterns": [
       "<rootDir>/example/node_modules",
       "<rootDir>/lib/",
-      "<rootDir>/third_party/llama.cpp/"
+      "<rootDir>/third_party/llama.cpp/",
+      "<rootDir>/tmp/"
     ]
   },
   "commitlint": {

@@ -32,6 +32,8 @@
     "**/node_modules",
     "**/Pods",
     "third_party",
-    "tests"
+    "tests",
+    "tmp",
+    "example"
   ]
 }

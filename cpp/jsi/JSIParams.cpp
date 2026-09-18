@@ -619,9 +619,9 @@ namespace rnllama_jsi {
                 auto reasoningBudgetEnd = common_tokenize(
                         ctx->active_ctx(), thinkingEndTag, /* add_special= */ false, /* parse_special= */ true);
                 if (!reasoningBudgetEnd.empty()) {
-                    // Kalsa: reasoning_budget_end is a flat token vector in kalsallama.
-                    sparams.reasoning_budget_end.insert(sparams.reasoning_budget_end.end(),
-                        reasoningBudgetEnd.begin(), reasoningBudgetEnd.end());
+                    // Kalsa: reasoning_budget_end is a vector of token sequences at this pin;
+                    // the single input end tag must be appended as exactly one sequence.
+                    sparams.reasoning_budget_end.emplace_back(std::move(reasoningBudgetEnd));
                 }
                 sparams.reasoning_budget_forced = common_tokenize(
                         ctx->active_ctx(), thinkingBudgetMessage + thinkingEndTag, /* add_special= */ false, /* parse_special= */ true);

@@ -33,7 +33,6 @@
     "**/Pods",
     "third_party",
     "tests",
-    "tmp",
-    "example"
+    "tmp"
   ]
 }

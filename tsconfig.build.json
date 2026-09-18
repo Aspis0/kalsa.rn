@@ -3,6 +3,7 @@
   "extends": "./tsconfig",
   "exclude": [
     "example",
+    "tmp",
     "tests",
     "third_party/llama.cpp",
     "third_party/OpenCL-Headers",

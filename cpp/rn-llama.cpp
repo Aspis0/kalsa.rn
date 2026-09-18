@@ -681,13 +681,33 @@ bool llama_rn_context::loadModel(
     // The CLI layer this fork does not ship is what resolves the cpu params
     // (kalsallama common/arg.cpp:891-892); nothing else does, and this pin's
     // common_threadpools::init builds one ggml threadpool per cpuparams pair
-    // from the values as given. cpuparams_batch.n_threads defaults to -1 and
-    // -1 means "use cpuparams" (common.cpp:1746), but the threadpool path
-    // never translated it: ggml-cpu.c:4204 computed workers_size =
-    // 544 * -1, lm_ggml_aligned_malloc failed and the memset at :4207 of
-    // (size_t)-544 faulted on the first model load (e2e run 35307242869,
-    // batch pool first). Order and role model copied from upstream: cpuparams
-    // first, then cpuparams_batch with cpuparams as its role model.
+    // from the values as given. It drops two things:
+    //  - an unresolved -1 (the cpuparams_batch default, meaning "use cpuparams"
+    //    per common.cpp:1746) reached ggml raw: ggml-cpu.c:4204 computed
+    //    workers_size = 544 * -1, lm_ggml_aligned_malloc failed and the memset
+    //    at :4207 of (size_t)-544 faulted on the first model load
+    //    (e2e run 35307242869, batch pool first);
+    //  - an explicit 0 survives postprocess_cpu_params, which rescues only
+    //    n_threads < 0 (common.cpp:293), and then faults at ggml-cpu.c:4238
+    //    (workers[0] on the NULL array of a zero-worker pool).
+    // Upstream normalizes the zero where the CLI parses the flag -- arg.cpp:
+    // 1522-1525 for -t, :1532-1535 for -tb, "<= 0 ->
+    // std::thread::hardware_concurrency()", no warning. We deviate on the
+    // source of the default, on purpose: hardware_concurrency() may return 0
+    // ("not computable or well defined"), which is exactly the corner that
+    // makes this reachable -- a device reporting 0 cores -- and a CLI that gets
+    // that wrong prints an error and exits, while an app takes a SIGSEGV in
+    // front of a user. So the default is the 0-safe accessor
+    // postprocess_cpu_params itself uses for its < 0 case (common.cpp:298),
+    // whose Android path counts /sys cores and whose last resort is "... : 4"
+    // (common.cpp:148). -1 semantics stay untouched: resolving that is
+    // postprocess_cpu_params's job, it copies the role model.
+    // Normalizing here and not at the JS parse site: loadModel is the single
+    // choke point every load goes through (main and both governor copies),
+    // whatever built the params.
+    const int default_threads = (int) common_cpu_get_num_math();
+    if (params.cpuparams.n_threads       == 0) { params.cpuparams.n_threads       = default_threads; }
+    if (params.cpuparams_batch.n_threads == 0) { params.cpuparams_batch.n_threads = default_threads; }
     postprocess_cpu_params(params.cpuparams, nullptr);
     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
 

@@ -170,6 +170,28 @@ if (!NativeModules.RNLlama) {
       'llamaGetBackendDevicesInfo',
       jest.fn(async () => '[]'),
     )
+    // Kalsa's governor bindings: src/index.ts requires every name in
+    // jsiBindingKeys, so a mock that omits one fails the whole suite with
+    // "[RNLlama] Missing JSI bindings".
+    setGlobal(
+      'llamaSetGovernorThermo',
+      jest.fn(async () => true),
+    )
+    setGlobal(
+      'llamaGetGovernorStats',
+      jest.fn(async () => ({
+        active: false,
+        engine_prefill: 'mock',
+        engine_decode: 'mock',
+        commit_bytes: 0,
+        commit_ms: 0,
+        prefill_ms: 0,
+        prefill_chunks: '',
+        prefill_ctx_ngl: 0,
+        thermal_state: 'nominal',
+        failure_reason: '',
+      })),
+    )
     setGlobal(
       'llamaLoadSession',
       jest.fn(async () => ({ tokens_loaded: 0, prompt: '' })),

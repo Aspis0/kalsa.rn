@@ -3,6 +3,7 @@ on:
   push:
     branches:
       - main
+      - kalsa
   pull_request:
     branches:
       - main
@@ -50,6 +51,7 @@ jobs:
           ./run_tests.sh
 
   build-ios-from-source:
+    if: github.ref != 'refs/heads/kalsa'
     runs-on: macos-26
     steps:
       - name: Checkout
@@ -83,6 +85,7 @@ jobs:
           npm run build:ios
 
   build-ios-frameworks:
+    if: github.ref != 'refs/heads/kalsa'
     runs-on: macos-26
     steps:
       - name: Checkout
@@ -122,6 +125,7 @@ jobs:
           npm run build:ios
 
   build-android-from-source:
+    if: github.ref != 'refs/heads/kalsa'
     runs-on: ubuntu-latest
     steps:
       - name: Maximize build space
@@ -156,6 +160,7 @@ jobs:
           npm run build:android
 
   build-android-libs:
+    if: github.ref != 'refs/heads/kalsa'
     runs-on: ubuntu-latest
     steps:
       - name: Maximize build space

@@ -283,6 +283,18 @@ llama_rn_context_tts::llama_rn_context_tts(const std::string &vocoder_model_path
   }
   vocoder_params.n_ubatch = vocoder_params.n_batch;
 
+  // Same trap as the main load path (rn-llama.cpp): a default-constructed
+  // common_params carries cpuparams/cpuparams_batch n_threads = -1
+  // (common.h:69), and this pin's common_threadpools::init, reached through
+  // common_init_from_params on the next line, hands the raw value to
+  // ggml_threadpool_new_impl, whose workers_size = 544 * n_threads memset
+  // faults on -1. The CLI layer that resolves the params (kalsallama
+  // common/arg.cpp:891-892) is not shipped here. NOT reachable from the kalsa
+  // app -- its TTS goes through expo-speech and nothing calls this native
+  // vocoder API -- but armed for any other consumer of this binding.
+  postprocess_cpu_params(vocoder_params.cpuparams, nullptr);
+  postprocess_cpu_params(vocoder_params.cpuparams_batch, &vocoder_params.cpuparams);
+
   init_result = common_init_from_params(vocoder_params);
   params = vocoder_params;
   model = init_result->model();

@@ -736,6 +736,42 @@ assert_installed_sha() {
     || die "cpp/KALSALLAMA_SHA (${installed:-empty}) != pin ($PIN_COMMIT); re-run pin"
 }
 
+# The include gate has to grade the PAIR, not the engine alone. cpp/rn-*.cpp and
+# cpp/jsi/*.cpp belong to llama.rn and include engine headers, so an engine API
+# change that breaks them must stop the bump before anything is written. The
+# flattened tree never holds them -- not because of SYNC_EXCLUDES, which only
+# keeps install and verify off those paths, but because the copy lists that
+# build the tree never name them. Borrow the installed copies into the throwaway
+# tree for the gate's sake only: install_cpp_tree rsyncs with those excludes and
+# no --delete-excluded, so nothing borrowed here can travel back into cpp/.
+# Without the borrow the gate sees zero rn and zero jsi TUs and its per-group
+# floors fail the bump. Those floors only run when the gate is not partial: a
+# partial run never parses rn, but it does parse jsi if it found the headers.
+# Sets BORROWED_RN_OWNED for the caller: the gate is told with a flag, never
+# with an exported variable that would outlive this tree.
+borrow_rn_owned_for_gate() {
+  local tree="$1" e
+  BORROWED_RN_OWNED=""
+  for e in "${SYNC_EXCLUDES[@]}"; do
+    if compgen -G "$CPP_DIR/$e" > /dev/null; then
+      # No 2>/dev/null and no || true: a cp that fails half way leaves a
+      # half-borrowed pair, and grading that is worse than not grading it.
+      cp -R "$CPP_DIR"/$e "$tree/cpp/"
+    else
+      # Not an error here: on a first install cpp/ does not exist yet. Say which
+      # pattern found nothing instead of hiding it; what happens next is the
+      # gate's business. Its floors (7 rn, 6 jsi) run whenever the gate is not
+      # partial and fail the run, and no environment variable rescues that --
+      # KALSA_ALLOW_PARTIAL_GATE only turns an already partial pass from exit 1
+      # into exit 0, it never skips a floor.
+      echo "[sync] borrow: nothing matches $e under $CPP_DIR" >&2
+    fi
+  done
+  if compgen -G "$tree/cpp/rn-*.cpp" > /dev/null || [ -d "$tree/cpp/jsi" ]; then
+    BORROWED_RN_OWNED=1
+  fi
+}
+
 # write_pin LAST: cpp/ is only rewritten -- and the pin only re-pointed --
 # after flatten, patches, the post-image check and the include gate have all
 # succeeded on the regenerated tree.
@@ -744,7 +780,12 @@ regen_cpp() {
   flatten_and_prefix "$full"
   apply_kalsa_patches "$FLATTEN_TMP"
   assert_kalsa_post_image "$FLATTEN_TMP"
-  "$ROOT/scripts/assert-cpp-includes.sh" "$FLATTEN_TMP/cpp"
+  borrow_rn_owned_for_gate "$FLATTEN_TMP"
+  if [ -n "$BORROWED_RN_OWNED" ]; then
+    "$ROOT/scripts/assert-cpp-includes.sh" --rn-borrowed "$FLATTEN_TMP/cpp"
+  else
+    "$ROOT/scripts/assert-cpp-includes.sh" "$FLATTEN_TMP/cpp"
+  fi
   install_cpp_tree
   write_pin "$PIN_REPO" "$PIN_BRANCH" "$full"
 }

@@ -27,7 +27,23 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# --rn-borrowed says this tree's rn-*/jsi sources were copied in from the
+# installed cpp/ by the caller (scripts/sync-kalsallama.sh does it before an
+# install). A flag and not an environment variable on purpose: the fact is about
+# one tree in one run, and an exported variable would follow the next verify and
+# make its OK line claim a borrow that never happened.
+rn_borrowed=""
+if [ "${1:-}" = "--rn-borrowed" ]; then
+  rn_borrowed=1
+  shift
+  # The flag describes one tree. Defaulting to this repo's own cpp/ would make
+  # the OK line say those TUs were borrowed when they were the tree's own.
+  [ $# -gt 0 ] || { echo "[includes] --rn-borrowed needs the tree it describes" >&2; exit 1; }
+fi
 CPP="${1:-$ROOT/cpp}"
+# Refuse what we cannot honour rather than ignore it: the flag is only read in
+# first position, so trailing arguments would be silently dropped.
+[ $# -le 1 ] || { echo "[includes] unexpected argument: $2 (usage: [--rn-borrowed] [cpp-dir])" >&2; exit 1; }
 [ -d "$CPP" ] || { echo "[includes] missing $CPP -- run pin first" >&2; exit 1; }
 
 python3 - "$CPP" <<'PY'
@@ -456,6 +472,21 @@ esac
 if [ -n "$partial" ]; then
   if [ -n "$weak_note" ]; then weak_note="$weak_note; "; fi
   weak_note="${weak_note}binding layer NOT covered: $partial"
+fi
+# A tree graded before its install owns no rn-*/jsi sources -- the flatten's copy
+# lists never produce them -- so the caller borrows the installed ones. Name only
+# the groups that actually parsed: the counters are the evidence, the flag only
+# says where those TUs came from. rn is never parsed in a partial run; jsi still
+# is whenever the react-native headers were found, so a partial run can honestly
+# claim jsi alone.
+if [ -n "$rn_borrowed" ]; then
+  borrowed=""
+  if [ "$c_rn" -gt 0 ]; then borrowed="rn"; fi
+  if [ "$c_jsi" -gt 0 ]; then borrowed="${borrowed:+$borrowed/}jsi"; fi
+  if [ -n "$borrowed" ]; then
+    if [ -n "$weak_note" ]; then weak_note="$weak_note; "; fi
+    weak_note="${weak_note}$borrowed graded from the installed cpp/, not from this tree"
+  fi
 fi
 if [ -n "$weak_note" ]; then
   echo "[includes] OK [$SYNTAX_CXX_TAG] ($weak_note): $total TUs parse ($counters)"

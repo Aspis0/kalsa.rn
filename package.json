@@ -114,7 +114,8 @@
     "modulePathIgnorePatterns": [
       "<rootDir>/example/node_modules",
       "<rootDir>/lib/",
-      "<rootDir>/third_party/llama.cpp/"
+      "<rootDir>/third_party/llama.cpp/",
+      "<rootDir>/tmp/"
     ]
   },
   "commitlint": {
@@ -227,7 +228,8 @@
     "tests/build",
     "*.d.ts",
     "tests/build/",
-    "third_party/llama.cpp/"
+    "third_party/llama.cpp/",
+    "tmp/"
   ],
   "prettier": {
     "trailingComma": "all",

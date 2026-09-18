@@ -42,6 +42,16 @@ export type NativeSpeculativeConfig =
   | NativeSpeculativeType
   | boolean
 
+export type GovernorThermoProfile = {
+  batt_temp_tenths_c: number
+  batt_level_pct: number
+  plugged: boolean
+  sensor_valid: boolean
+  t_idle_valid?: boolean
+  t_idle_c?: number
+  trend_c_per_min?: number
+}
+
 export type NativeContextParams = {
   model: string
   /**
@@ -227,16 +237,6 @@ export type NativeContextParams = {
     reload_budget_available?: boolean
     thermo: GovernorThermoProfile
   }
-}
-
-export type GovernorThermoProfile = {
-  batt_temp_tenths_c: number
-  batt_level_pct: number
-  plugged: boolean
-  sensor_valid: boolean
-  t_idle_valid?: boolean
-  t_idle_c?: number
-  trend_c_per_min?: number
 }
 
 export type GovernorStats = {

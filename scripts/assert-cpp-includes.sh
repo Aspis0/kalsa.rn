@@ -13,9 +13,12 @@
 # none were on the lists.
 #
 # The scan below resolves every local `#include "..."` in seconds; the syntax
-# pass then parses the C++ TUs the build actually compiles (host clang cannot
-# codegen for ARM, but -fsyntax-only resolves declarations -- exactly the API
-# drift the file scan cannot see, e.g. common_context_seq_rm going static).
+# pass then parses the C++ TUs the build actually compiles, with the NDK clang
+# the APK build uses -- -fsyntax-only resolves the declarations that drift
+# (e.g. common_context_seq_rm going static). The host clang accepts constructs
+# the NDK rejects (JSIParams.cpp parsed on host and failed the arm64 NDK build
+# on 2026-09-17), so the host compiler is only a fallback and the OK line
+# names which one ran.
 # Conditional backend includes (CUDA, Vulkan, ...) and build-generated headers
 # are listed as known-absent; anything else is a missing copy-list entry.
 # The rn-owned sources need the app repo's bmoe headers: without
@@ -115,9 +118,9 @@ PY
 # rn-*.cpp include the bmoe stream port headers, which live in the app repo;
 # point KALSA_BMOE_DIR at them to bring the rn-owned sources into the syntax
 # pass. The jsi/*.cpp TUs need <jsi/jsi.h> and <ReactCommon/CallInvoker.h>;
-# the react-native checkout of the same app repo provides them on host (the
-# NDK gets both from the ReactAndroid prefab). Without KALSA_BMOE_DIR (or
-# without clang++, or without those react-native headers) the pass runs
+# the react-native checkout of the same app repo provides them (the NDK build
+# gets both from the ReactAndroid prefab). Without KALSA_BMOE_DIR (or without
+# any usable clang, or without those react-native headers) the pass runs
 # PARTIAL and the gate only succeeds with KALSA_ALLOW_PARTIAL_GATE=1.
 #
 # The TU list mirrors what the Android build compiles:
@@ -149,7 +152,9 @@ PY
 # Android build and the iOS podspec run no upstream CMake); the syntax pass
 # resolves them from the tree like any other header.
 
-SYNTAX_LOG="$(mktemp -t kalsa-syntax)"
+# GNU mktemp rejects a -t template without X's (BSD accepts it): spell it so
+# the gate also runs on a Linux runner.
+SYNTAX_LOG="$(mktemp "${TMPDIR:-/tmp}/kalsa-syntax.XXXXXX")"
 KERNEL_EMBED_DIR="$(mktemp -d)"
 trap 'rm -f "$SYNTAX_LOG"; rm -rf "$KERNEL_EMBED_DIR"' EXIT
 
@@ -163,9 +168,114 @@ for cl in "$CPP"/ggml-opencl/kernels/*.cl; do
     "$KERNEL_EMBED_DIR/$(basename "$cl").h"
 done
 
+# Compiler for the syntax pass: the NDK clang the APK build uses, so the pass
+# sees what that build sees. The app declares no ndkVersion anywhere (its build
+# takes AGP's default), so there is no number to read: set
+# KALSA_GATE_NDK_VERSION when you know which one the build reported, and the
+# gate will use that exact NDK or say it is missing. Env:
+#   KALSA_GATE_NDK_VERSION   exact NDK version, looked up under
+#                            $ANDROID_HOME/ndk and $ANDROID_SDK_ROOT/ndk
+#   ANDROID_NDK_HOME / ANDROID_NDK_ROOT  NDK location (else the homebrew path)
+#   KALSA_GATE_ANDROID_API   target API level (default 33 = minSdkVersion)
+#   KALSA_GATE_SYNTAX_CXX    `host` forces the host clang++, or an explicit
+#                            compiler path
+#   KALSA_GATE_REQUIRE_NDK=1 a fallback is a failure, not a weaker pass
+NDK_API="${KALSA_GATE_ANDROID_API:-33}"
+NDK_VER="${KALSA_GATE_NDK_VERSION:-}"
+# android/gradle.properties RNLlama_ndkversion is this repo's declared NDK, but
+# it is a FALLBACK, not the number the build always uses: android/build.gradle:130
+# takes `getExtOrDefault("ndkVersion")`, so a root project that sets ext.ndkVersion
+# (the app does, through AGP/Expo) wins, and the property is consulted only when
+# the resolved major is below 24. Follow it as the best declared candidate, print
+# the revision actually used, and compare the two in one CI log before pinning
+# KALSA_GATE_NDK_VERSION.
+ENGINE_PIN=""
+if [ -f "$ROOT/android/gradle.properties" ]; then
+  ENGINE_PIN="$(sed -n 's/^RNLlama_ndkversion=//p' "$ROOT/android/gradle.properties" | tr -d '[:space:]')"
+fi
+[ -n "$NDK_VER" ] || NDK_VER="$ENGINE_PIN"
+SYNTAX_CXX=""
+SYNTAX_CXX_TAG=""
+NDK_ROOT_USED=""
+NDK_WHY="no NDK directory (ANDROID_NDK_HOME, ANDROID_NDK_ROOT, /opt/homebrew/share/android-ndk)"
+
+ndk_try() {  # ndk_try <ndk root> -- sets SYNTAX_CXX when the wrapper is there
+  [ -n "${1:-}" ] && [ -d "$1" ] || return 1
+  local prebuilt
+  for prebuilt in "$1"/toolchains/llvm/prebuilt/*; do
+    # An unexpanded glob is a string, not a directory.
+    [ -d "$prebuilt" ] || continue
+    if [ -x "$prebuilt/bin/aarch64-linux-android${NDK_API}-clang++" ]; then
+      SYNTAX_CXX="$prebuilt/bin/aarch64-linux-android${NDK_API}-clang++"
+      NDK_ROOT_USED="$1"
+      return 0
+    fi
+  done
+  NDK_WHY="$1 has no aarch64-linux-android${NDK_API}-clang++"
+  return 1
+}
+
+case "${KALSA_GATE_SYNTAX_CXX:-}" in
+  host)
+    NDK_WHY="KALSA_GATE_SYNTAX_CXX=host"
+    ;;
+  "")
+    if [ -n "$NDK_VER" ]; then
+      ndk_try "${ANDROID_HOME:-}/ndk/$NDK_VER" || ndk_try "${ANDROID_SDK_ROOT:-}/ndk/$NDK_VER" || true
+      [ -n "$SYNTAX_CXX" ] || NDK_WHY="NDK $NDK_VER (this repo's pin) is not installed under \$ANDROID_HOME/ndk or \$ANDROID_SDK_ROOT/ndk"
+    fi
+    if [ -z "$SYNTAX_CXX" ] && [ "${KALSA_GATE_REQUIRE_NDK:-}" != "1" ]; then
+      ndk_try "${ANDROID_NDK_HOME:-}" || ndk_try "${ANDROID_NDK_ROOT:-}" \
+        || ndk_try /opt/homebrew/share/android-ndk || true
+    fi
+    ;;
+  *)
+    # Any other value is a compiler, not a typo to ignore silently -- but an
+    # explicit compiler is still not the NDK's, so it cannot satisfy REQUIRE.
+    if [ "${KALSA_GATE_REQUIRE_NDK:-}" = "1" ] \
+       && case "${KALSA_GATE_SYNTAX_CXX##*/}" in aarch64-linux-android*-clang++) false ;; *) true ;; esac; then
+      echo "[includes] FAIL: KALSA_GATE_REQUIRE_NDK=1 and KALSA_GATE_SYNTAX_CXX=$KALSA_GATE_SYNTAX_CXX is not an NDK compiler" >&2
+      exit 1
+    fi
+    if [ -f "${KALSA_GATE_SYNTAX_CXX}" ] && [ -x "${KALSA_GATE_SYNTAX_CXX}" ] \
+       || command -v "${KALSA_GATE_SYNTAX_CXX}" >/dev/null 2>&1; then
+      SYNTAX_CXX="$KALSA_GATE_SYNTAX_CXX"
+      SYNTAX_CXX_TAG="explicit ${KALSA_GATE_SYNTAX_CXX##*/}"
+    else
+      echo "[includes] FAIL: KALSA_GATE_SYNTAX_CXX=$KALSA_GATE_SYNTAX_CXX is not an executable compiler" >&2
+      exit 1
+    fi
+    ;;
+esac
+
+if [ -n "$SYNTAX_CXX" ] && [ -z "$SYNTAX_CXX_TAG" ]; then
+  ndk_rev="$(sed -n 's/^Pkg.Revision *= *//p' "$NDK_ROOT_USED/source.properties" 2>/dev/null | tr -d '[:space:]')"
+  SYNTAX_CXX_TAG="ndk ${ndk_rev:-unknown} api $NDK_API"
+  if [ -n "$ENGINE_PIN" ] && [ "$ndk_rev" != "$ENGINE_PIN" ]; then
+    SYNTAX_CXX_TAG="$SYNTAX_CXX_TAG, NOT this repo's pin $ENGINE_PIN"
+  fi
+fi
+if [ -z "$SYNTAX_CXX" ]; then
+  # A silent fallback that still exits 0 is how a weaker check passes for the
+  # stronger one: under REQUIRE it is a failure, and no compiler at all always is.
+  if [ "${KALSA_GATE_REQUIRE_NDK:-}" = "1" ]; then
+    echo "[includes] FAIL: KALSA_GATE_REQUIRE_NDK=1 and the NDK clang is unusable: $NDK_WHY" >&2
+    exit 1
+  fi
+  if command -v clang++ >/dev/null 2>&1; then
+    SYNTAX_CXX="clang++"
+    SYNTAX_CXX_TAG="host clang"
+  else
+    echo "[includes] FAIL: no compiler for the syntax pass ($NDK_WHY, and no clang++ on PATH)." >&2
+    echo "[includes] The file scan alone cannot see an API that moved: it is not a pass." >&2
+    exit 1
+  fi
+fi
+echo "[includes] syntax pass compiler: $SYNTAX_CXX"
+
 syntax_check() {  # syntax_check <file> [extra-compiler-arg...]
   local f="$1"; shift
-  clang++ -std=c++17 -fsyntax-only \
+  "$SYNTAX_CXX" -std=c++17 -fsyntax-only \
     -I "$CPP" -I "$CPP/common" -I "$CPP/common/jinja" \
     -I "$CPP/ggml-cpu" -I "$CPP/tools/mtmd" \
     ${@+"$@"} \
@@ -173,9 +283,7 @@ syntax_check() {  # syntax_check <file> [extra-compiler-arg...]
 }
 
 partial=""
-if ! command -v clang++ >/dev/null 2>&1; then
-  partial="no clang++"
-elif [ -z "${KALSA_BMOE_DIR:-}" ]; then
+if [ -z "${KALSA_BMOE_DIR:-}" ]; then
   partial="KALSA_BMOE_DIR not set (rn-*.cpp, jsi and bmoe TUs skipped)"
 fi
 
@@ -273,7 +381,10 @@ if [ -n "$BMOE_ROOT" ]; then
     "$BMOE_ROOT"/rn/bmoe_stream.cpp
 fi
 if [ -z "$partial" ]; then
-  parse_group -I "$KALSA_BMOE_DIR" -- "$CPP"/rn-*.cpp
+  # The APK compiles these with the backends the app turns on (ENABLE_OPENCL in
+  # android/src/main/CMakeLists.txt); rn-slot.cpp guards three blocks on
+  # LM_GGML_USE_OPENCL, and without the define this gate never sees them.
+  parse_group -I "$KALSA_BMOE_DIR" -DLM_GGML_USE_OPENCL -- "$CPP"/rn-*.cpp
 fi
 
 for t in "$CPP"/ggml-hexagon/ggml-hexagon.cpp "$CPP"/ggml-hexagon/htp-drv.cpp \
@@ -282,8 +393,9 @@ for t in "$CPP"/ggml-hexagon/ggml-hexagon.cpp "$CPP"/ggml-hexagon/htp-drv.cpp \
   case "$t" in
     */ggml-hexagon/*) r="Hexagon variant only: needs Hexagon SDK headers + -DLM_GGML_USE_HEXAGON (HEXAGON_SDK_ROOT)" ;;
     */android/src/main/RNLlamaJSI.cpp) r="JNI wrapper: needs <android/log.h> (NDK) and fbjni prefab headers; the cpp/jsi TUs it links are parsed" ;;
+    *) r="not parsed by this gate" ;;
   esac
-  echo "[includes] SKIP (host clang): $(basename "$t") -- $r"
+  echo "[includes] SKIP (not parsed): $(basename "$t") -- $r"
 done
 
 if [ "$fails" -gt 0 ]; then
@@ -296,8 +408,57 @@ if [ -n "$partial" ] && [ "${KALSA_ALLOW_PARTIAL_GATE:-}" != "1" ]; then
   echo "[includes] set KALSA_BMOE_DIR=<app repo>/native/bmoe/rn, or KALSA_ALLOW_PARTIAL_GATE=1 to accept half coverage" >&2
   exit 1
 fi
-if [ -n "$partial" ]; then
-  echo "[includes] OK (PARTIAL: $partial): $c_common common + $c_jinja jinja + $c_mtmd mtmd + $c_models models + $c_rn rn + $c_jsi jsi + $c_core core + $c_cpu cpu + $c_opencl opencl + $c_bmoe bmoe TUs parse"
+# The OK line must be impossible to misread: which compiler ran, the total,
+# the binding counters first -- and any weakness spelled out, never a
+# full-coverage sentence for a weaker pass.
+total=$((c_common + c_jinja + c_mtmd + c_models + c_rn + c_jsi + c_core + c_cpu + c_opencl + c_bmoe))
+counters="$c_rn rn, $c_jsi jsi, $c_bmoe bmoe, $c_core core, $c_cpu cpu, $c_opencl opencl, $c_common common, $c_jinja jinja, $c_mtmd mtmd, $c_models models"
+# The counters are the only proof the pass was not vacuous: every TU list is a
+# glob, and an unexpanded glob is a string the loop skips, so a tree that lost
+# its sources parses nothing and would otherwise print OK. 307 today, 285 with
+# the binding layer skipped.
+# One floor per group, close to today's count, because a single total lets a
+# whole group vanish: with `total >= 250` alone, 101 of the 151 model TUs could
+# disappear and the gate would still print OK. Raise these when the tree grows;
+# a legitimate shrink is a deliberate edit, which is the point.
+floor_fails=0
+floor() {  # floor <group> <parsed> <minimum>
+  if [ "$2" -lt "$3" ]; then
+    echo "[includes] FAIL: $1 parsed $2 TUs, expected at least $3." >&2
+    floor_fails=$((floor_fails + 1))
+  fi
+}
+floor common "$c_common" 18
+floor jinja "$c_jinja" 5
+floor mtmd "$c_mtmd" 44
+floor models "$c_models" 135
+floor core "$c_core" 40
+floor cpu "$c_cpu" 10
+floor opencl "$c_opencl" 2
+if [ -z "$partial" ]; then
+  floor rn "$c_rn" 7
+  floor jsi "$c_jsi" 6
+  floor bmoe "$c_bmoe" 9
+  floor total "$total" 290
 else
-  echo "[includes] OK: $c_common common + $c_jinja jinja + $c_mtmd mtmd + $c_models models + $c_rn rn + $c_jsi jsi + $c_core core + $c_cpu cpu + $c_opencl opencl + $c_bmoe bmoe TUs parse"
+  floor total "$total" 270
+fi
+if [ "$floor_fails" -gt 0 ]; then
+  echo "[includes] FAIL: $total TUs parsed ($counters) -- the tree is missing sources this gate exists to cover." >&2
+  exit 1
+fi
+weak_note=""
+case "$SYNTAX_CXX_TAG" in
+  ndk\ *) ;;
+  host\ clang) weak_note="host compiler, not the NDK clang the build compiles with" ;;
+  *) weak_note="$SYNTAX_CXX_TAG, not the NDK clang the build compiles with" ;;
+esac
+if [ -n "$partial" ]; then
+  if [ -n "$weak_note" ]; then weak_note="$weak_note; "; fi
+  weak_note="${weak_note}binding layer NOT covered: $partial"
+fi
+if [ -n "$weak_note" ]; then
+  echo "[includes] OK [$SYNTAX_CXX_TAG] ($weak_note): $total TUs parse ($counters)"
+else
+  echo "[includes] OK [$SYNTAX_CXX_TAG]: $total TUs parse ($counters)"
 fi

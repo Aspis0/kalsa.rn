@@ -520,7 +520,8 @@ prefix_vendor_tree() {
 prepend_ggml_build_info() {
   local ggml_c="$DST/ggml.c"
   [ -f "$ggml_c" ] || return 0
-  if grep -q '^#include "ggml-version.h"' "$ggml_c"; then
+  # Tolerant match: whitespace inside the guard line must not flip this.
+  if grep -Eq '^[[:space:]]*#[[:space:]]*include[[:space:]]+"ggml-version\.h"' "$ggml_c"; then
     return 0
   fi
   if grep -q '^#define LM_GGML_VERSION' "$ggml_c"; then
@@ -580,14 +581,18 @@ cmake_var() {  # cmake_var <fallback> <file> <var-name>
 }
 
 write_version_headers() {
-  local git_dir="$1"
-  local sha="$2"
+  local sha="$1"
   local llama_in="$LLAMA/src/llama-version.h.in"
   local ggml_in="$LLAMA/ggml/src/ggml-version.h.in"
   [ -f "$llama_in" ] || die "missing $llama_in: pin does not ship the version templates"
   [ -f "$ggml_in" ] || die "missing $ggml_in: pin does not ship the version templates"
-  local short_commit
-  short_commit=$(git -C "$git_dir" rev-parse --short=7 "$sha")
+  # Pure function of the pin: the first 7 characters of the 40-char sha -- no
+  # git call, so the generated commit string cannot depend on the local object
+  # store (rev-parse --short returns MORE than 7 characters when the store has
+  # an ambiguous prefix). 7 keeps the bytes identical to what rev-parse
+  # --short=7 produced for unambiguous stores; full identity lives in
+  # kalsallama.pin and cpp/KALSALLAMA_SHA.
+  local short_commit="${sha:0:7}"
   local llama_major llama_minor llama_patch llama_dev llama_version
   llama_major=$(cmake_var 0 "$LLAMA/CMakeLists.txt" LLAMA_VERSION_MAJOR)
   llama_minor=$(cmake_var 0 "$LLAMA/CMakeLists.txt" LLAMA_VERSION_MINOR)
@@ -632,7 +637,7 @@ flatten_and_prefix() {
   copy_common
   copy_mtmd
   copy_vendored_third_party
-  write_version_headers "$GIT_DIR" "$sha"
+  write_version_headers "$sha"
   fix_jinja_and_ext_includes
   prefix_vendor_tree
   prepend_ggml_build_info

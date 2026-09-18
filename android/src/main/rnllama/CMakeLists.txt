@@ -15,6 +15,8 @@ include_directories(
     ${RNLLAMA_LIB_DIR}/common
     ${RNLLAMA_LIB_DIR}/common/jinja
     ${RNLLAMA_LIB_DIR}/ggml-cpu
+    # vendored sha256.c includes "rotate-bits/rotate-bits.h" from the hash root
+    ${RNLLAMA_LIB_DIR}/hash
     ${RNLLAMA_LIB_DIR}/tools/mtmd
 )
 
@@ -82,6 +84,14 @@ set(
     ${COMMON_FILES}
 
     ${RNLLAMA_LIB_DIR}/anyascii.c
+
+    # mtmd-helper.cpp keys its bitmap cache with hash_sha256_hex
+    # (hash/hash.cpp), which calls sha256_hash (hash/sha256/sha256.c); neither
+    # was in the target, so the arm64 link ended in "undefined symbol:
+    # hash_sha256_hex". The rest of the vendored hash tree (sha1, xxhash)
+    # ships with no caller among the compiled sources and stays out.
+    ${RNLLAMA_LIB_DIR}/hash/hash.cpp
+    ${RNLLAMA_LIB_DIR}/hash/sha256/sha256.c
 
     # Jinja template engine
     ${JINJA_FILES}

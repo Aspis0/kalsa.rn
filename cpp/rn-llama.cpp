@@ -678,6 +678,19 @@ bool llama_rn_context::loadModel(
     model = nullptr;
     ctx = nullptr;
 
+    // The CLI layer this fork does not ship is what resolves the cpu params
+    // (kalsallama common/arg.cpp:891-892); nothing else does, and this pin's
+    // common_threadpools::init builds one ggml threadpool per cpuparams pair
+    // from the values as given. cpuparams_batch.n_threads defaults to -1 and
+    // -1 means "use cpuparams" (common.cpp:1746), but the threadpool path
+    // never translated it: ggml-cpu.c:4204 computed workers_size =
+    // 544 * -1, lm_ggml_aligned_malloc failed and the memset at :4207 of
+    // (size_t)-544 faulted on the first model load (e2e run 35307242869,
+    // batch pool first). Order and role model copied from upstream: cpuparams
+    // first, then cpuparams_batch with cpuparams as its role model.
+    postprocess_cpu_params(params.cpuparams, nullptr);
+    postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
+
     if (governor_enabled) {
         if (!load_governor_models(*this, *governor_params, *governor_thermo)) {
             return false;

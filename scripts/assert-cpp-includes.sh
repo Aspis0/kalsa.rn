@@ -49,22 +49,28 @@ KNOWN_ABSENT = {
     "llamafile/sgemm.h",        # optional CPU backend, build-flag guarded
     "spacemit/ime.h",           # optional CPU backend, build-flag guarded
     "half.hpp",                 # ggml-opencl.cpp:14135, inside an #if 0 block
+    "HAP_farf.h",               # Hexagon SDK (DSP-side htp/*.c, built by
+    "hexagon_protos.h",         # scripts/build-hexagon-htp.sh, never by the
+    "hexagon_types.h",          # NDK or host clang)
+    "hvx_hexagon_protos.h",     #
 }
 # The kernel headers that the Android build generates from kernels/*.cl
 # (kernels/embed_kernel.py); a *different* x.cl.h include is a real failure.
 GENERATED_KERNEL_HEADERS = {
     os.path.basename(k) + ".h" for k in glob.glob(os.path.join(cpp, "ggml-opencl/kernels/*.cl"))
 }
-SEARCH = ["", "common", "common/jinja", "ggml-cpu", "ggml-hexagon/htp",
-          "tools/mtmd", "nlohmann"]
+SEARCH = ["", "common", "common/jinja", "ggml-cpu", "ggml-hexagon",
+          "ggml-hexagon/htp", "tools/mtmd", "nlohmann"]
 
 files = []
-for pat in ("*.h", "*.cpp",
+for pat in ("*.h", "*.cpp", "*.c",
             "common/*.h", "common/*.cpp",
             "common/jinja/*.h", "common/jinja/*.cpp",
             "models/*.cpp", "models/*.h",
             "ggml-cpu/*.c", "ggml-cpu/*.cpp", "ggml-cpu/*.h", "ggml-cpu/*/*.cpp",
+            "ggml-cpu/arch/*/*.c",
             "ggml-metal/*", "ggml-hexagon/*.cpp", "ggml-hexagon/*.h",
+            "ggml-hexagon/htp/*.c", "ggml-hexagon/htp/*/*.c",
             "ggml-opencl/*.cpp", "ggml-opencl/*.h",
             "jsi/*.h", "jsi/*.cpp",
             "tools/mtmd/*.h", "tools/mtmd/*.cpp",
@@ -80,7 +86,12 @@ for f in files:
         if inc in KNOWN_ABSENT:
             continue
         if inc.endswith(".cl.h"):
-            # real generated kernel headers only (see GENERATED_KERNEL_HEADERS)
+            # The OpenCL build generates <name>.cl.h from kernels/<name>.cl
+            # (kernels/embed_kernel.py); a .cl.h include is only honest when
+            # that .cl exists -- this is the check that would have caught the
+            # hand-written CMake kernel list running 25 names behind the
+            # overlay. A .cl.h shipped directly also passes (file-exists
+            # branch below).
             if inc in GENERATED_KERNEL_HEADERS:
                 continue
         here = os.path.join(os.path.dirname(f), inc)
@@ -92,6 +103,8 @@ if missing:
     print(f"[includes] FAIL: {len(missing)} unresolved include(s) in {cpp}")
     for inc, users in sorted(missing.items()):
         print(f"  {inc}  <- {', '.join(sorted(users)[:4])}")
+        if inc.endswith(".cl.h"):
+            print(f"    kernel include without a shipped .cl: add ggml-opencl/kernels/{inc[:-len('.cl.h')]}.cl")
     print("[includes] add the file to the copy lists in scripts/sync-kalsallama.sh,")
     print("[includes] then: scripts/sync-kalsallama.sh pin <sha>")
     raise SystemExit(1)
@@ -111,7 +124,7 @@ PY
 #   android/src/main/CMakeLists.txt      -> JNI_SOURCE_FILES (cpp/jsi/*.cpp)
 #   android/src/main/rnllama/CMakeLists.txt -> RNLLAMA_SOURCE_FILES and its
 #       file(GLOB ...) sets: common/*.cpp, common/jinja/*.cpp, models/*.cpp,
-#       tools/mtmd/*.cpp + models/*.cpp, llama*.cpp, unicode*.cpp,
+#       tools/mtmd/*.cpp + models/*.cpp, llama*.cpp, unicode*.cpp, gguf.cpp,
 #       ggml-backend*.cpp, ggml-opt.cpp, ggml-threading.cpp,
 #       ggml-cpu/*.cpp + amx/*.cpp + arch/{arm,x86}/repack.cpp, rn-*.cpp,
 #       plus BMOE_SOURCE_FILES from the app repo (native/bmoe/{src/config.cpp,
@@ -127,9 +140,10 @@ PY
 # ggml-hexagon host sources need the Hexagon SDK headers and
 # -DLM_GGML_USE_HEXAGON (HEXAGON_SDK_ROOT). android/src/main/RNLlamaJSI.cpp
 # needs <android/log.h> and the fbjni prefab headers -- the cpp/jsi TUs it
-# links carry the drift risk. The .c sources (ggml.c, ggml-quants.c, gguf.c,
-# anyascii.c, ggml-cpu/*.c, arch quants.c, htp_iface_stub.c) are covered by
-# the include scan.
+# links carry the drift risk. The .c sources (ggml.c, ggml-alloc.c,
+# ggml-quants.c, gguf.c, anyascii.c, ggml-cpu/*.c, arch quants.c,
+# ggml-hexagon/htp/**/*.c) are covered by the include scan above, which
+# globs them.
 #
 # .c sources (ggml.c, ggml-quants.c, gguf.c, anyascii.c, ggml-cpu/*.c, arch
 # quants.c, htp_iface_stub.c) are covered by the include scan.
@@ -160,22 +174,27 @@ fi
 
 # The react-native checkout of the app repo KALSA_BMOE_DIR points into
 # (kalsa/native/bmoe/rn -> kalsa/node_modules/react-native); the same
-# derivation gives the bmoe root <app>/native/bmoe.
+# derivation gives the bmoe root <app>/native/bmoe. A stale KALSA_BMOE_DIR
+# must degrade to PARTIAL, not kill the script with a raw cd error.
 RN_JSI_INCS=()
 BMOE_ROOT=""
 if [ -z "$partial" ]; then
-  APP_ROOT="$(cd "$KALSA_BMOE_DIR/../../.." && pwd)"
-  RN_DIR="$APP_ROOT/node_modules/react-native"
-  if [ -f "$RN_DIR/ReactCommon/jsi/jsi/jsi.h" ] && \
-     [ -f "$RN_DIR/ReactCommon/callinvoker/ReactCommon/CallInvoker.h" ]; then
-    RN_JSI_INCS+=("$RN_DIR/ReactCommon/jsi" "$RN_DIR/ReactCommon/callinvoker")
+  if [ ! -d "$KALSA_BMOE_DIR" ]; then
+    partial="KALSA_BMOE_DIR is not a directory: ${KALSA_BMOE_DIR} (rn-*, jsi and bmoe TUs skipped)"
   else
-    partial="react-native headers not found under $APP_ROOT (jsi TUs skipped)"
-  fi
-  BMOE_ROOT="$(cd "$KALSA_BMOE_DIR/.." && pwd)"
-  if [ ! -f "$BMOE_ROOT/bmoe_lmggml_compat.h" ]; then
-    partial="bmoe sources not found next to KALSA_BMOE_DIR (bmoe TUs skipped)"
-    BMOE_ROOT=""
+    APP_ROOT="$(cd "$KALSA_BMOE_DIR/../../.." && pwd)"
+    RN_DIR="$APP_ROOT/node_modules/react-native"
+    if [ -f "$RN_DIR/ReactCommon/jsi/jsi/jsi.h" ] && \
+       [ -f "$RN_DIR/ReactCommon/callinvoker/ReactCommon/CallInvoker.h" ]; then
+      RN_JSI_INCS+=("$RN_DIR/ReactCommon/jsi" "$RN_DIR/ReactCommon/callinvoker")
+    else
+      partial="react-native headers not found under $APP_ROOT (jsi TUs skipped)"
+    fi
+    BMOE_ROOT="$(cd "$KALSA_BMOE_DIR/.." && pwd)"
+    if [ ! -f "$BMOE_ROOT/bmoe_lmggml_compat.h" ]; then
+      partial="bmoe sources not found next to KALSA_BMOE_DIR (bmoe TUs skipped)"
+      BMOE_ROOT=""
+    fi
   fi
 fi
 if [ -n "$partial" ]; then
@@ -196,6 +215,9 @@ parse_group() {  # parse_group [extra-compiler-arg...] -- <files...>
       continue
     fi
     case "$f" in
+      # jinja before common: case patterns' * crosses "/", so common/* would
+      # swallow common/jinja/*
+      "$CPP"/common/jinja/*) c_jinja=$((c_jinja + 1)) ;;
       "$CPP"/common/*) c_common=$((c_common + 1)) ;;
       "$CPP"/models/*) c_models=$((c_models + 1)) ;;
       "$CPP"/tools/mtmd/*) c_mtmd=$((c_mtmd + 1)) ;;
@@ -211,12 +233,13 @@ parse_group() {  # parse_group [extra-compiler-arg...] -- <files...>
 }
 
 fails=0
-c_common=0; c_mtmd=0; c_models=0; c_rn=0; c_jsi=0; c_core=0; c_cpu=0; c_bmoe=0
-parse_group -- "$CPP"/common/*.cpp "$CPP"/tools/mtmd/*.cpp \
+c_common=0; c_mtmd=0; c_models=0; c_rn=0; c_jsi=0; c_core=0; c_cpu=0; c_bmoe=0; c_jinja=0
+parse_group -- "$CPP"/common/*.cpp "$CPP"/common/jinja/*.cpp "$CPP"/tools/mtmd/*.cpp \
   "$CPP"/models/*.cpp "$CPP"/tools/mtmd/models/*.cpp
 parse_group -- "$CPP"/llama*.cpp "$CPP"/unicode.cpp "$CPP"/unicode-data.cpp \
   "$CPP"/ggml-backend.cpp "$CPP"/ggml-backend-dl.cpp "$CPP"/ggml-backend-meta.cpp \
-  "$CPP"/ggml-backend-reg.cpp "$CPP"/ggml-opt.cpp "$CPP"/ggml-threading.cpp
+  "$CPP"/ggml-backend-reg.cpp "$CPP"/ggml-opt.cpp "$CPP"/ggml-threading.cpp \
+  "$CPP"/gguf.cpp
 parse_group -- "$CPP"/ggml-cpu/*.cpp "$CPP"/ggml-cpu/amx/*.cpp \
   "$CPP"/ggml-cpu/arch/arm/repack.cpp "$CPP"/ggml-cpu/arch/x86/repack.cpp
 if [ ${#RN_JSI_INCS[@]} -gt 0 ]; then
@@ -258,7 +281,7 @@ if [ -n "$partial" ] && [ "${KALSA_ALLOW_PARTIAL_GATE:-}" != "1" ]; then
   exit 1
 fi
 if [ -n "$partial" ]; then
-  echo "[includes] OK (PARTIAL: $partial): $c_common common + $c_mtmd mtmd + $c_models models + $c_rn rn + $c_jsi jsi + $c_core core + $c_cpu cpu + $c_bmoe bmoe TUs parse"
+  echo "[includes] OK (PARTIAL: $partial): $c_common common + $c_jinja jinja + $c_mtmd mtmd + $c_models models + $c_rn rn + $c_jsi jsi + $c_core core + $c_cpu cpu + $c_bmoe bmoe TUs parse"
 else
-  echo "[includes] OK: $c_common common + $c_mtmd mtmd + $c_models models + $c_rn rn + $c_jsi jsi + $c_core core + $c_cpu cpu + $c_bmoe bmoe TUs parse"
+  echo "[includes] OK: $c_common common + $c_jinja jinja + $c_mtmd mtmd + $c_models models + $c_rn rn + $c_jsi jsi + $c_core core + $c_cpu cpu + $c_bmoe bmoe TUs parse"
 fi

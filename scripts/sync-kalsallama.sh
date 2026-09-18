@@ -301,8 +301,15 @@ copy_backend_trees() {
 copy_ggml_cpu() {
   mkdir -p "$DST/ggml-cpu" "$DST/ggml-cpu/arch"
   local name
+  # Allow-list by name: the directory also ships sources this build never
+  # compiles (hbm.cpp is all #ifdef GGML_USE_CPU_HBM; kleidiai/, llamafile/,
+  # spacemit/ are opt-in backends needing their own flags), so mirroring the
+  # whole directory is wrong. The price is that a root source a pin adds is
+  # invisible to the include scan and only fails at link -- ggml-cpu.c calls
+  # ggml_cpu_iqp_supports_mul_mat and friends and iqp.cpp was not listed here.
   for name in \
     ggml-cpu.c ggml-cpu.cpp \
+    iqp.cpp \
     quants.c \
     repack.cpp \
     traits.cpp \

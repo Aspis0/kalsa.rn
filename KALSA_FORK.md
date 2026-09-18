@@ -47,9 +47,13 @@ files); the kalsa post-image markers are present; and every local
 `#include "..."` in `cpp/` resolves plus every C++ TU parses
 (`scripts/assert-cpp-includes.sh [dir]`, run against `cpp/`). What verify
 cannot catch: the copy lists do not learn, so a fork file that should be
-in `cpp/` but was never copied diffs clean in both trees -- that class is
-caught only by the include check, and only if something in the tree
-already includes it. Run verify after any manual touch of `cpp/`.
+in `cpp/` but was never copied diffs clean in both trees. A missing
+*header* shows up in the include check, a missing *.c/*.cpp does not:
+the gate parses the TUs that are there, so an absent one is caught by
+nothing short of the linker. Two of those reached CI that way --
+`ggml-cpu/iqp.cpp` (run 35301310178, missing from the copy list) and
+`hash/hash.cpp` (undefined symbol: hash_sha256_hex, missing from the
+target sources). Run verify after any manual touch of `cpp/`.
 
 The gate parses `common/`, `tools/mtmd/` and `models/` unconditionally;
 the rn-owned sources need the app repo's bmoe headers, so run it locally

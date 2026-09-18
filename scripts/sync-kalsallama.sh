@@ -553,9 +553,18 @@ write_build_info() {
   local src="$LLAMA/common/build-info.cpp.in"
   [ -f "$src" ] || return 0
   mkdir -p "$DST/common"
+  # build_commit is the same pure ${sha:0:7} the version headers carry:
+  # llama_commit() reads THIS file, so the commit string the phone reports
+  # must never drift with the clone's object store the way LLAMA_BUILD_COMMIT
+  # used to (rev-parse --short grows past 7 on ambiguous prefixes). The build
+  # NUMBER needs real history; on a shallow clone rev-list --count would
+  # number a truncated graph, so refuse instead of writing it.
+  if [ "$(git -C "$git_dir" rev-parse --is-shallow-repository)" = "true" ]; then
+    die "$git_dir is a shallow clone: rev-list --count would number a truncated graph; pin/bump from a full clone"
+  fi
   local build_number build_commit
   build_number=$(git -C "$git_dir" rev-list --count "$sha")
-  build_commit=$(git -C "$git_dir" rev-parse --short=7 "$sha")
+  build_commit="${sha:0:7}"
   sed -e "s|@LLAMA_BUILD_NUMBER@|$build_number|g" \
       -e "s|@LLAMA_BUILD_COMMIT@|$build_commit|g" \
       -e "s|@BUILD_COMPILER@|unknown|g" \

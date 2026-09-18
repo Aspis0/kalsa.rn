@@ -5081,6 +5081,9 @@ static void load_cl_kernels(lm_ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
 
         CL_CHECK((backend_ctx->kernel_gemm_moe_q3_k_f32_ns = clCreateKernel(prog, "kernel_gemm_moe_q3_k_f32_ns", &err), err));
+        CL_CHECK(clReleaseProgram(prog));
+        LM_GGML_LOG_CONT(".");
+    }
     // gemm_moe_q6_k_f32_ns_bin
     {
         size_t bin_size = 0;
@@ -23515,7 +23518,6 @@ static void lm_ggml_cl_mul_mat(lm_ggml_backend_t backend, const lm_ggml_tensor *
                     kernel = backend_ctx->kernel_mul_mat_f16_f32;
                     nrows = 4;
                 } else if (ne11 * ne12 < 4) {
-                if (ne11 * ne12 < 4) {
                     // Decode (single token): the legacy _1row runs one 64-lane
                     // subgroup per WG (one output row), under-utilizing BW. Route the
                     // wide f16 weight matmuls (attn proj + lm_head) to the multi-row

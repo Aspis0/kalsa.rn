@@ -13,9 +13,12 @@
 # none were on the lists.
 #
 # The scan below resolves every local `#include "..."` in seconds; the syntax
-# pass then parses the C++ TUs the build actually compiles (host clang cannot
-# codegen for ARM, but -fsyntax-only resolves declarations -- exactly the API
-# drift the file scan cannot see, e.g. common_context_seq_rm going static).
+# pass then parses the C++ TUs the build actually compiles, with the NDK clang
+# the APK build uses -- -fsyntax-only resolves the declarations that drift
+# (e.g. common_context_seq_rm going static). The host clang accepts constructs
+# the NDK rejects (JSIParams.cpp parsed on host and failed the arm64 NDK build
+# on 2026-09-17), so the host compiler is only a fallback and the OK line
+# names which one ran.
 # Conditional backend includes (CUDA, Vulkan, ...) and build-generated headers
 # are listed as known-absent; anything else is a missing copy-list entry.
 # The rn-owned sources need the app repo's bmoe headers: without
@@ -115,9 +118,9 @@ PY
 # rn-*.cpp include the bmoe stream port headers, which live in the app repo;
 # point KALSA_BMOE_DIR at them to bring the rn-owned sources into the syntax
 # pass. The jsi/*.cpp TUs need <jsi/jsi.h> and <ReactCommon/CallInvoker.h>;
-# the react-native checkout of the same app repo provides them on host (the
-# NDK gets both from the ReactAndroid prefab). Without KALSA_BMOE_DIR (or
-# without clang++, or without those react-native headers) the pass runs
+# the react-native checkout of the same app repo provides them (the NDK build
+# gets both from the ReactAndroid prefab). Without KALSA_BMOE_DIR (or without
+# any usable clang, or without those react-native headers) the pass runs
 # PARTIAL and the gate only succeeds with KALSA_ALLOW_PARTIAL_GATE=1.
 #
 # The TU list mirrors what the Android build compiles:
@@ -163,9 +166,37 @@ for cl in "$CPP"/ggml-opencl/kernels/*.cl; do
     "$KERNEL_EMBED_DIR/$(basename "$cl").h"
 done
 
+# Compiler for the syntax pass: the NDK clang wrapper for the API the app
+# ships (default 33 = minSdkVersion), so the pass sees what the APK build
+# sees. Where there is no NDK it falls back to the host clang++, and the OK
+# line says so -- a host pass is weaker, not equivalent. Env:
+#   ANDROID_NDK_HOME / ANDROID_NDK_ROOT  NDK location (else the homebrew path)
+#   KALSA_GATE_ANDROID_API               target API level (default 33)
+#   KALSA_GATE_SYNTAX_CXX=host           force the host fallback (gate debugging)
+NDK_API="${KALSA_GATE_ANDROID_API:-33}"
+SYNTAX_CXX=""
+if [ "${KALSA_GATE_SYNTAX_CXX:-}" != "host" ]; then
+  for ndk_root in "${ANDROID_NDK_HOME:-}" "${ANDROID_NDK_ROOT:-}" \
+                  /opt/homebrew/share/android-ndk; do
+    [ -n "$ndk_root" ] || continue
+    for prebuilt in "$ndk_root"/toolchains/llvm/prebuilt/*; do
+      if [ -x "$prebuilt/bin/aarch64-linux-android${NDK_API}-clang++" ]; then
+        SYNTAX_CXX="$prebuilt/bin/aarch64-linux-android${NDK_API}-clang++"
+        break 2
+      fi
+    done
+  done
+fi
+if [ -n "$SYNTAX_CXX" ]; then
+  SYNTAX_CXX_TAG="ndk aarch64-linux-android${NDK_API}"
+else
+  SYNTAX_CXX="clang++"
+  SYNTAX_CXX_TAG="host clang"
+fi
+
 syntax_check() {  # syntax_check <file> [extra-compiler-arg...]
   local f="$1"; shift
-  clang++ -std=c++17 -fsyntax-only \
+  "$SYNTAX_CXX" -std=c++17 -fsyntax-only \
     -I "$CPP" -I "$CPP/common" -I "$CPP/common/jinja" \
     -I "$CPP/ggml-cpu" -I "$CPP/tools/mtmd" \
     ${@+"$@"} \
@@ -173,8 +204,8 @@ syntax_check() {  # syntax_check <file> [extra-compiler-arg...]
 }
 
 partial=""
-if ! command -v clang++ >/dev/null 2>&1; then
-  partial="no clang++"
+if [ "$SYNTAX_CXX_TAG" = "host clang" ] && ! command -v clang++ >/dev/null 2>&1; then
+  partial="no NDK and no host clang++"
 elif [ -z "${KALSA_BMOE_DIR:-}" ]; then
   partial="KALSA_BMOE_DIR not set (rn-*.cpp, jsi and bmoe TUs skipped)"
 fi
@@ -283,7 +314,7 @@ for t in "$CPP"/ggml-hexagon/ggml-hexagon.cpp "$CPP"/ggml-hexagon/htp-drv.cpp \
     */ggml-hexagon/*) r="Hexagon variant only: needs Hexagon SDK headers + -DLM_GGML_USE_HEXAGON (HEXAGON_SDK_ROOT)" ;;
     */android/src/main/RNLlamaJSI.cpp) r="JNI wrapper: needs <android/log.h> (NDK) and fbjni prefab headers; the cpp/jsi TUs it links are parsed" ;;
   esac
-  echo "[includes] SKIP (host clang): $(basename "$t") -- $r"
+  echo "[includes] SKIP (not parsed): $(basename "$t") -- $r"
 done
 
 if [ "$fails" -gt 0 ]; then
@@ -296,8 +327,21 @@ if [ -n "$partial" ] && [ "${KALSA_ALLOW_PARTIAL_GATE:-}" != "1" ]; then
   echo "[includes] set KALSA_BMOE_DIR=<app repo>/native/bmoe/rn, or KALSA_ALLOW_PARTIAL_GATE=1 to accept half coverage" >&2
   exit 1
 fi
+# The OK line must be impossible to misread: which compiler ran, the total,
+# the binding counters first -- and any weakness spelled out, never a
+# full-coverage sentence for a weaker pass.
+total=$((c_common + c_jinja + c_mtmd + c_models + c_rn + c_jsi + c_core + c_cpu + c_opencl + c_bmoe))
+weak_note=""
+if [ "$SYNTAX_CXX_TAG" = "host clang" ]; then
+  weak_note="host compiler, not the NDK clang the build compiles with"
+fi
 if [ -n "$partial" ]; then
-  echo "[includes] OK (PARTIAL: $partial): $c_common common + $c_jinja jinja + $c_mtmd mtmd + $c_models models + $c_rn rn + $c_jsi jsi + $c_core core + $c_cpu cpu + $c_opencl opencl + $c_bmoe bmoe TUs parse"
+  if [ -n "$weak_note" ]; then weak_note="$weak_note; "; fi
+  weak_note="${weak_note}binding layer NOT covered: $partial"
+fi
+counters="$c_rn rn, $c_jsi jsi, $c_bmoe bmoe, $c_core core, $c_cpu cpu, $c_opencl opencl, $c_common common, $c_jinja jinja, $c_mtmd mtmd, $c_models models"
+if [ -n "$weak_note" ]; then
+  echo "[includes] OK [$SYNTAX_CXX_TAG] ($weak_note): $total TUs parse ($counters)"
 else
-  echo "[includes] OK: $c_common common + $c_jinja jinja + $c_mtmd mtmd + $c_models models + $c_rn rn + $c_jsi jsi + $c_core core + $c_cpu cpu + $c_opencl opencl + $c_bmoe bmoe TUs parse"
+  echo "[includes] OK [$SYNTAX_CXX_TAG]: $total TUs parse ($counters)"
 fi

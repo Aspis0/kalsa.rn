@@ -182,9 +182,13 @@ done
 #   KALSA_GATE_REQUIRE_NDK=1 a fallback is a failure, not a weaker pass
 NDK_API="${KALSA_GATE_ANDROID_API:-33}"
 NDK_VER="${KALSA_GATE_NDK_VERSION:-}"
-# This repo declares the NDK its own Android build uses: android/gradle.properties
-# RNLlama_ndkversion, read as `ndkVersion` in android/build.gradle. Follow it, so
-# the gate and the build are the same compiler when that version is installed.
+# android/gradle.properties RNLlama_ndkversion is this repo's declared NDK, but
+# it is a FALLBACK, not the number the build always uses: android/build.gradle:130
+# takes `getExtOrDefault("ndkVersion")`, so a root project that sets ext.ndkVersion
+# (the app does, through AGP/Expo) wins, and the property is consulted only when
+# the resolved major is below 24. Follow it as the best declared candidate, print
+# the revision actually used, and compare the two in one CI log before pinning
+# KALSA_GATE_NDK_VERSION.
 ENGINE_PIN=""
 if [ -f "$ROOT/android/gradle.properties" ]; then
   ENGINE_PIN="$(sed -n 's/^RNLlama_ndkversion=//p' "$ROOT/android/gradle.properties" | tr -d '[:space:]')"
@@ -226,8 +230,15 @@ case "${KALSA_GATE_SYNTAX_CXX:-}" in
     fi
     ;;
   *)
-    # Any other value is a compiler, not a typo to ignore silently.
-    if [ -x "${KALSA_GATE_SYNTAX_CXX}" ] || command -v "${KALSA_GATE_SYNTAX_CXX}" >/dev/null 2>&1; then
+    # Any other value is a compiler, not a typo to ignore silently -- but an
+    # explicit compiler is still not the NDK's, so it cannot satisfy REQUIRE.
+    if [ "${KALSA_GATE_REQUIRE_NDK:-}" = "1" ] \
+       && case "${KALSA_GATE_SYNTAX_CXX##*/}" in aarch64-linux-android*-clang++) false ;; *) true ;; esac; then
+      echo "[includes] FAIL: KALSA_GATE_REQUIRE_NDK=1 and KALSA_GATE_SYNTAX_CXX=$KALSA_GATE_SYNTAX_CXX is not an NDK compiler" >&2
+      exit 1
+    fi
+    if [ -f "${KALSA_GATE_SYNTAX_CXX}" ] && [ -x "${KALSA_GATE_SYNTAX_CXX}" ] \
+       || command -v "${KALSA_GATE_SYNTAX_CXX}" >/dev/null 2>&1; then
       SYNTAX_CXX="$KALSA_GATE_SYNTAX_CXX"
       SYNTAX_CXX_TAG="explicit ${KALSA_GATE_SYNTAX_CXX##*/}"
     else
@@ -406,19 +417,42 @@ counters="$c_rn rn, $c_jsi jsi, $c_bmoe bmoe, $c_core core, $c_cpu cpu, $c_openc
 # glob, and an unexpanded glob is a string the loop skips, so a tree that lost
 # its sources parses nothing and would otherwise print OK. 307 today, 285 with
 # the binding layer skipped.
-if [ "$total" -lt 250 ] || [ "$c_common" -eq 0 ] || [ "$c_models" -lt 50 ]; then
-  echo "[includes] FAIL: only $total TUs parsed ($counters)." >&2
-  echo "[includes] The tree is missing sources this gate exists to cover." >&2
-  exit 1
+# One floor per group, close to today's count, because a single total lets a
+# whole group vanish: with `total >= 250` alone, 101 of the 151 model TUs could
+# disappear and the gate would still print OK. Raise these when the tree grows;
+# a legitimate shrink is a deliberate edit, which is the point.
+floor_fails=0
+floor() {  # floor <group> <parsed> <minimum>
+  if [ "$2" -lt "$3" ]; then
+    echo "[includes] FAIL: $1 parsed $2 TUs, expected at least $3." >&2
+    floor_fails=$((floor_fails + 1))
+  fi
+}
+floor common "$c_common" 18
+floor jinja "$c_jinja" 5
+floor mtmd "$c_mtmd" 44
+floor models "$c_models" 135
+floor core "$c_core" 40
+floor cpu "$c_cpu" 10
+floor opencl "$c_opencl" 2
+if [ -z "$partial" ]; then
+  floor rn "$c_rn" 7
+  floor jsi "$c_jsi" 6
+  floor bmoe "$c_bmoe" 9
+  floor total "$total" 290
+else
+  floor total "$total" 270
 fi
-if [ -z "$partial" ] && { [ "$c_rn" -eq 0 ] || [ "$c_jsi" -eq 0 ] || [ "$c_bmoe" -eq 0 ]; }; then
-  echo "[includes] FAIL: full coverage claimed with rn=$c_rn jsi=$c_jsi bmoe=$c_bmoe." >&2
+if [ "$floor_fails" -gt 0 ]; then
+  echo "[includes] FAIL: $total TUs parsed ($counters) -- the tree is missing sources this gate exists to cover." >&2
   exit 1
 fi
 weak_note=""
-if [ "$SYNTAX_CXX_TAG" = "host clang" ]; then
-  weak_note="host compiler, not the NDK clang the build compiles with"
-fi
+case "$SYNTAX_CXX_TAG" in
+  ndk\ *) ;;
+  host\ clang) weak_note="host compiler, not the NDK clang the build compiles with" ;;
+  *) weak_note="$SYNTAX_CXX_TAG, not the NDK clang the build compiles with" ;;
+esac
 if [ -n "$partial" ]; then
   if [ -n "$weak_note" ]; then weak_note="$weak_note; "; fi
   weak_note="${weak_note}binding layer NOT covered: $partial"

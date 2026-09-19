@@ -1,0 +1,32 @@
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -433,6 +433,9 @@
+     os << " / " << std::thread::hardware_concurrency() << " | " << llama_print_system_info();
+ #endif
+ 
++    // Compiled into librnllama.so (the jniLibs binary). RNLlamaJSI.cpp is the
++    // JNI wrapper — always built from source — and cannot prove this .so is ours.
++    os << " | kalsa-native-patches";
+     return os.str();
+ }
+ 
+@@ -1683,6 +1686,7 @@
+         mparams.devices = params.devices.data();
+     }
+ 
++    mparams.vocab_only      = params.vocab_only;
+     mparams.n_gpu_layers    = params.n_gpu_layers;
+     mparams.main_gpu        = params.main_gpu;
+     mparams.split_mode      = params.split_mode;
+@@ -1712,6 +1716,11 @@
+     mparams.no_alloc                    = params.no_alloc;
+     mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+ 
++    if (params.progress_callback != nullptr) {
++        mparams.progress_callback = params.progress_callback;
++        mparams.progress_callback_user_data = params.progress_callback_user_data;
++    }
++
+     return mparams;
+ }
+ 

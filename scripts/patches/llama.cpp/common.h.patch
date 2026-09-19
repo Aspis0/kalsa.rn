@@ -1,0 +1,50 @@
+--- a/common/common.h
++++ b/common/common.h
+@@ -287,6 +287,7 @@
+     // reasoning budget sampler parameters
+     // these are populated by the server/CLI based on chat template params
+     int32_t                   reasoning_budget_tokens   = -1;  // -1 = disabled, >= 0 = token budget
++    bool                      reasoning_budget_activate_immediately = false;
+     std::vector<llama_token>  reasoning_budget_start;          // start tag token sequence
+     std::vector<llama_tokens> reasoning_budget_end;            // end tag token sequences; the first tag is used as the forcing sequence
+     std::vector<llama_token>  reasoning_budget_forced;         // forced sequence (message + first end tag)
+@@ -446,6 +447,7 @@
+ struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
+ 
+ struct common_params {
++    bool vocab_only               = false;
+     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
+     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
+     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
+@@ -580,10 +582,31 @@
+     bool check_tensors     = false; // validate tensor data
+     bool no_op_offload     = false; // globally disable offload host tensor operations to device
+     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
++
++    // Kalsa patch (MoE streaming): the transport for native/bmoe/rn/bmoe_stream.h. Plain data,
++    // declared here rather than in that header so common.h keeps depending on nothing: this is
++    // the one struct both the JSI reader and the streamer agree on. Defaults are the recipe
++    // measured in moe-experiments (S23 -42.7%, W=0, p=0.000488) minus the two LOSSY knobs.
++    struct {
++        bool  enabled        = false; // off unless JS asks; a dense model declines anyway
++        int   cache_mb       = 0;     // explicit LRU budget in MiB; wins over cache_auto
++        bool  cache_auto     = true;  // size once from free RAM at init, then hold
++        int   cache_floor_mb = 1536;  // RAM left free for the rest of the system
++        int   cache_ceil_mb  = 0;     // 0 = cap only at the full expert-set size
++        int   io_threads     = 4;     // parallel read lanes
++        bool  overlap        = true;  // read a layer's experts while its matmuls run
++        char  dense_weights[16] = "anon"; // mmap | warm | anon | ahwb | anon-gpu
++        int   n_expert_used  = 0;     // top-k override, 0 = model default. LOSSY.
++        float drop_cold_frac = 0.0f;  // skip cold, barely-weighted experts. LOSSY.
++        bool  drop_no_renorm = false; // ~70% of the drop's quality cost is the renorm
++    } kalsa_moe;
+     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
+ 
+     bool single_turn       = false; // single turn chat conversation
+ 
++    llama_progress_callback progress_callback = nullptr;
++    void * progress_callback_user_data = nullptr;
++
+     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
+     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+ 

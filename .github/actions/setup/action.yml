@@ -27,6 +27,13 @@ runs:
         npm ci
       shell: bash
 
-    - name: Build
-      run: npm run build
+    # `npm run bootstrap` is what downloads the Hexagon SDK into
+    # ~/.hexagon-sdk, and build:android-libs starts with build-hexagon-htp.sh,
+    # which exits 1 without it. It was dropped from this step back when
+    # bootstrap.sh also rewrote the engine tree with the lm_ symbol prefix and
+    # running it here would have corrupted the checkout. It no longer renames
+    # anything: it fetches the SDK and generates the gitignored Metal embed
+    # assembly, so it is safe again -- and required.
+    - name: Bootstrap & Build
+      run: npm run bootstrap && npm run build
       shell: bash

@@ -9,7 +9,16 @@
 #include "JSIRequestManager.h"
 #include "JSITaskManager.h"
 #include "JSINativeHeaders.h"
+// Only this file needs these two. With a prebuilt xcframework they come from
+// the framework, where an engine header is spelled <rnllama/name.h>; a bare
+// include resolves from source and fails there. Same shape as JSIParams.cpp.
+#if defined(RNLLAMA_USE_FRAMEWORK_HEADERS)
+#include <rnllama/rn-governor-params.h>
+#include <rnllama/llama-ext.h>
+#else
+#include "rn-governor-params.h"
 #include "llama-ext.h"
+#endif
 #include "JSIJson.h"
 
 #include <algorithm>

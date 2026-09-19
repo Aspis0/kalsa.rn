@@ -103,26 +103,52 @@ EOF
 echo "assert-rnllama-sources: ok ($count explicitly-named paths resolve)"
 
 # With a prebuilt xcframework the pod compiles only cpp/jsi/**, and every engine
-# header comes from the framework, where the spelling is <rnllama/name.h> and
-# not "name.h". JSINativeHeaders.h is the single place that carries both forms.
-# A bare include anywhere else under cpp/jsi builds fine from source and fails
-# only in build-ios-frameworks, half an hour later and far from its cause.
+# header then comes from the framework, where the spelling is <rnllama/name.h>.
+# A quoted include reaches the sibling directory but NOT the framework, so one
+# written "name.h" builds fine from source and fails only in
+# build-ios-frameworks, half an hour later and far from its cause.
+#
+# The invariant: a quoted include that does not resolve inside cpp/jsi is
+# coming from the framework, so the same file must also carry the
+# <rnllama/name.h> spelling behind RNLLAMA_USE_FRAMEWORK_HEADERS. That accepts
+# both shapes already in the tree -- the shared block in JSINativeHeaders.h and
+# the local #if in JSIParams.cpp -- and needs no exemption list.
+
+# A line-oriented match cannot tell code from a comment, and an #include inside
+# /* ... */ is not an include. Strip comments first. (assert-kalsa-vendor.sh
+# carries the same helper; never pipe either into `grep -q` -- the producer
+# takes SIGPIPE and pipefail turns that into a random red.)
+code_only() {
+  perl -0777 -pe 's{/\*.*?\*/}{}gs; s{//[^\n]*}{}g' "$1"
+}
+
+jsi_files="$(find "$ROOT_DIR/cpp/jsi" -type f \( -name '*.cpp' -o -name '*.h' -o -name '*.hpp' \) | sort)"
+[ -n "$jsi_files" ] \
+  || fail "found no sources under cpp/jsi -- the layout changed, fix this check"
+
 jsi_checked=0
 jsi_bad=0
 while IFS= read -r f; do
-  case "$(basename "$f")" in JSINativeHeaders.h) continue ;; esac
+  [ -n "$f" ] || continue
   jsi_checked=$((jsi_checked + 1))
+  body="$(code_only "$f")"
+  includes="$(sed -n 's/^[[:space:]]*#[[:space:]]*include[[:space:]]*"\([^"]*\)".*/\1/p' <<< "$body")"
   while IFS= read -r h; do
-    if [ -e "$ROOT_DIR/cpp/$h" ] && [ ! -e "$ROOT_DIR/cpp/jsi/$h" ]; then
-      echo "assert-rnllama-sources: cpp/jsi/$(basename "$f") includes \"$h\", a cpp/ root header" >&2
-      jsi_bad=$((jsi_bad + 1))
+    [ -n "$h" ] || continue
+    if [ -e "$ROOT_DIR/cpp/jsi/$h" ]; then
+      continue
     fi
-  done < <(sed -n 's/^[[:space:]]*#include[[:space:]]*"\([^"/]*\.h\)".*/\1/p' "$f")
-done < <(find "$ROOT_DIR/cpp/jsi" -maxdepth 1 -type f \( -name '*.cpp' -o -name '*.h' \))
+    case "$body" in
+      *"<rnllama/$h>"*) ;;
+      *)
+        echo "assert-rnllama-sources: ${f#"$ROOT_DIR"/} includes \"$h\", which does not exist under cpp/jsi and has no <rnllama/$h> counterpart" >&2
+        jsi_bad=$((jsi_bad + 1))
+        ;;
+    esac
+  done <<< "$includes"
+done <<< "$jsi_files"
 
-[ "$jsi_checked" -ge 1 ] \
-  || fail "found no sources under cpp/jsi -- the layout changed, fix this check"
 [ "$jsi_bad" = 0 ] \
-  || fail "$jsi_bad bare include(s) of a cpp/ root header under cpp/jsi -- route them through JSINativeHeaders.h, both branches"
+  || fail "$jsi_bad framework-unsafe include(s) under cpp/jsi -- guard each one with RNLLAMA_USE_FRAMEWORK_HEADERS and add the <rnllama/name.h> spelling"
 
 echo "assert-rnllama-sources: ok ($jsi_checked cpp/jsi sources use framework-safe includes)"

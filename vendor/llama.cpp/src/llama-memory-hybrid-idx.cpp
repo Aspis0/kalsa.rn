@@ -44,6 +44,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
         type_r, type_s, rs_size,
         n_seq_max, n_rs_seq, offload, unified,
+        nullptr, // standalone: no shared attention cells (kalsa mem_other param)
         filter_attn, filter_recr),
     hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {

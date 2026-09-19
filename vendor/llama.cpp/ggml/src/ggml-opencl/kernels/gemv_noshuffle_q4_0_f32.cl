@@ -372,10 +372,21 @@ __kernel void kernel_gemv_noshuffle_q4_0_f32_mc3(
         }
         dst = (global float*)((global char*)dst + offsetd);
         // dst is column-major [M rows x n_cols cols]: (row, col) at col*M + row
-        vstore2((float2)(acc.s0, acc.s1), 0, &(dst[0 * M + gid * 2]));
-        vstore2((float2)(acc.s2, acc.s3), 0, &(dst[1 * M + gid * 2]));
-        if (n_cols > 2) vstore2((float2)(acc.s4, acc.s5), 0, &(dst[2 * M + gid * 2]));
-        if (n_cols > 3) vstore2((float2)(acc.s6, acc.s7), 0, &(dst[3 * M + gid * 2]));
+        // The x-grid is padded to CEIL_DIV(M/2,64)*64, so the tail row-pair can run
+        // past row M. q4_0 does not take the q4_K branch of use_adreno_kernels(), so M
+        // is not certified even here -> guard each lane. The vector stores stay on the
+        // fully-covered fast path (byte-identical whenever M is even).
+        if (gid * 2 + 1 < M) {
+            vstore2((float2)(acc.s0, acc.s1), 0, &(dst[0 * M + gid * 2]));
+            vstore2((float2)(acc.s2, acc.s3), 0, &(dst[1 * M + gid * 2]));
+            if (n_cols > 2) vstore2((float2)(acc.s4, acc.s5), 0, &(dst[2 * M + gid * 2]));
+            if (n_cols > 3) vstore2((float2)(acc.s6, acc.s7), 0, &(dst[3 * M + gid * 2]));
+        } else if (gid * 2 + 0 < M) {
+            dst[0 * M + gid * 2 + 0] = acc.s0;
+            dst[1 * M + gid * 2 + 0] = acc.s2;
+            if (n_cols > 2) dst[2 * M + gid * 2 + 0] = acc.s4;
+            if (n_cols > 3) dst[3 * M + gid * 2 + 0] = acc.s6;
+        }
     }
 }
 #undef MC_COL_Q40

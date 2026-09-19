@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -12,6 +13,10 @@ struct llama_cparams;
 struct llama_hparams;
 struct llama_model;
 struct llama_context;
+enum class llama_kv_route;
+struct llama_kv_commit_access;
+struct llama_kv_staged_access;
+struct llama_kv_staged_plan;
 
 //
 // llama_kv_cache
@@ -116,7 +121,7 @@ public:
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "");
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache();
 
     //
     // llama_memory_i
@@ -145,6 +150,8 @@ public:
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+
+    float get_used_frac() const override;
 
     // state write/load
 
@@ -244,6 +251,9 @@ public:
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
 private:
+    friend struct llama_kv_commit_access;
+    friend struct llama_kv_staged_access;
+
     const llama_model & model;
     const llama_hparams & hparams;
 
@@ -260,6 +270,9 @@ private:
     };
 
     bool v_trans = true;  // the value tensor is transposed
+
+    const ggml_type cache_type_k;
+    const ggml_type cache_type_v;
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
@@ -312,6 +325,8 @@ private:
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
+
+    mutable std::unique_ptr<llama_kv_staged_plan> staged_plan;
 
     size_t total_size() const;
 

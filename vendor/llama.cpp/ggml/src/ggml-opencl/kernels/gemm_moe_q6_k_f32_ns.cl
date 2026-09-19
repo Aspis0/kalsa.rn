@@ -205,6 +205,9 @@ kernel void kernel_gemm_moe_q6_k_f32_ns(
     uint num_superblocks = ne00 / QK_K;
     uint scales_per_row = num_superblocks * 16;
     uint row_idx = row + get_global_id(0);
+    const bool valid = (row_idx < ne01);
+    const uint row_load = valid ? row_idx : (ne01 - 1u);
+    const uint row_offset = row_load - row;
 
     // Loop along K axis, 32 elements per iteration (one sub-block), divided into 2 halves of 16
     for (uint step = 0; step < ne00; step += TILESIZE_K * 2) {
@@ -213,15 +216,15 @@ kernel void kernel_gemm_moe_q6_k_f32_ns(
         uint j = sub % 8;      // group within super-block
 
         // Load d for super-block
-        uint d_offset = row + sb * ne01 + expert_id * num_superblocks * ne01 + get_global_id(0);
+        uint d_offset = row + sb * ne01 + expert_id * num_superblocks * ne01 + row_offset;
         half d_val = src0_d[d_offset];
 
         // Load sub-block scales
-        global const char * sc = src0_s + (expert_id * ne01 + row_idx) * scales_per_row + sb * 16;
+        global const char * sc = src0_s + (expert_id * ne01 + row_load) * scales_per_row + sb * 16;
         float scale0 = (float)d_val * (float)sc[j * 2];
         float scale1 = (float)d_val * (float)sc[j * 2 + 1];
 
-        uint qh_base = row + (sub * 2) * ne01 + expert_id * (num_superblocks * 16) * ne01 + get_global_id(0);
+        uint qh_base = row + (sub * 2) * ne01 + expert_id * (num_superblocks * 16) * ne01 + row_offset;
         uint qh_first16 = src0_qh[qh_base];
         uint qh_second16 = src0_qh[qh_base + ne01];
 
@@ -231,8 +234,8 @@ kernel void kernel_gemm_moe_q6_k_f32_ns(
 
         // Load 16 ql nibbles (2 uints) from image
         uint2 q4x16;
-        q4x16.x = read_imageui(src0_ql, q_sub_offset + sub_block_id_m).x;
-        q4x16.y = read_imageui(src0_ql, q_sub_offset + sub_block_id_m + ne01).x;
+        q4x16.x = read_imageui(src0_ql, q_sub_offset + row_offset).x;
+        q4x16.y = read_imageui(src0_ql, q_sub_offset + row_offset + ne01).x;
 
         // Load 16x32 floats from matrix B
         float8 bx8_f32;
@@ -258,8 +261,8 @@ kernel void kernel_gemm_moe_q6_k_f32_ns(
         q_sub_offset = row + ((ne01 * half_step) >> 3) + ((expert_id * ne00 * ne01) >> 3);
         b_sub_offset = col * ne00 + half_step;
 
-        q4x16.x = read_imageui(src0_ql, q_sub_offset + sub_block_id_m).x;
-        q4x16.y = read_imageui(src0_ql, q_sub_offset + sub_block_id_m + ne01).x;
+        q4x16.x = read_imageui(src0_ql, q_sub_offset + row_offset).x;
+        q4x16.y = read_imageui(src0_ql, q_sub_offset + row_offset + ne01).x;
 
         bx8_f32.lo = read_imagef(src1, (b_sub_offset + b_global_offset.x) / 4);
         bx8_f32.hi = read_imagef(src1, (b_sub_offset + b_global_offset.y) / 4);
@@ -275,10 +278,6 @@ kernel void kernel_gemm_moe_q6_k_f32_ns(
         if (!skip_g1) { dotx8_reduce4(reg_a, shared_b, reg_c.lo.hi, 8); }
         if (!skip_g2) { dotx8_reduce4(reg_a, shared_b, reg_c.hi.lo, 16); }
         if (!skip_g3) { dotx8_reduce4(reg_a, shared_b, reg_c.hi.hi, 24); }
-    }
-
-    if ((get_global_id(0) + block_id_m * TILESIZE_M) >= ne01) {
-        return;
     }
 
     // Load post router and share in LM
@@ -297,6 +296,7 @@ kernel void kernel_gemm_moe_q6_k_f32_ns(
     // Scatter results back to original position in output grid
     uint m_offset = row + get_local_id(0);
 
+    if (valid) {
     write_imagef(dst, out_idx[1] + m_offset, (reg_c.s1));
     write_imagef(dst, out_idx[2] + m_offset, (reg_c.s2));
     write_imagef(dst, out_idx[3] + m_offset, (reg_c.s3));
@@ -328,8 +328,11 @@ kernel void kernel_gemm_moe_q6_k_f32_ns(
     write_imagef(dst, out_idx[29] + m_offset, (reg_c.st));
     write_imagef(dst, out_idx[30] + m_offset, (reg_c.su));
     write_imagef(dst, out_idx[31] + m_offset, (reg_c.sv));
+    }
 
     // Store zero padding parts to the index of first output in tile
     barrier(CLK_GLOBAL_MEM_FENCE);
-    write_imagef(dst, out_idx[0] + m_offset, (reg_c.s0));
+    if (valid) {
+        write_imagef(dst, out_idx[0] + m_offset, (reg_c.s0));
+    }
 }

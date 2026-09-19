@@ -18,14 +18,17 @@ inline void get_scale_min_k4(
     int j,
     global const uchar * q,
     uchar * d,
-    uchar * m
+    uchar * m,
+    uchar mask_d6,
+    uchar mask_d4,
+    uchar mask_hi2
 ) {
     if (j < 4) {
-        *d = q[j]   & 63;
-        *m = q[j+4] & 63;
+        *d = q[j]   & mask_d6;
+        *m = q[j+4] & mask_d6;
     } else {
-        *d = (q[j+4] & 0x0F) | ((q[j-4] & 0xC0) >> 2);
-        *m = ((q[j+4] >> 4) & 0x0F) | ((q[j]   & 0xC0) >> 2);
+        *d = (q[j+4] & mask_d4) | ((q[j-4] & mask_hi2) >> 2);
+        *m = ((q[j+4] >> 4) & mask_d4) | ((q[j]   & mask_hi2) >> 2);
     }
 }
 
@@ -70,7 +73,10 @@ kernel void kernel_gemm_moe_q4_k_q8_1_dp4a(
         __global     int *            total_tiles,
         uint ne00,
         uint ne01,
-        int  is_ragged                          // 1: compute only real tokens per tile
+        int  is_ragged,                         // 1: compute only real tokens per tile
+        uchar mask_d6,
+        uchar mask_d4,
+        uchar mask_hi2
 ) {
     const uint block_id_m = get_global_id(1); // m_tile
     const uint block_id_n = get_global_id(2); // n_tile
@@ -133,7 +139,7 @@ kernel void kernel_gemm_moe_q4_k_q8_1_dp4a(
 
         global const uchar * sc = src0_s + (expert_id * ne01 + row_idx) * scales_per_row + sb * K_SCALE_SIZE;
         uchar sv, mn;
-        get_scale_min_k4(j, sc, &sv, &mn);
+        get_scale_min_k4(j, sc, &sv, &mn, mask_d6, mask_d4, mask_hi2);
         const float scale = d_val  * (float)sv;
         const float minv  = dm_val * (float)mn;
 

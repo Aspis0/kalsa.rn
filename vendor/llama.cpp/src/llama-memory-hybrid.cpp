@@ -4,9 +4,28 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#include <stdexcept>
+
+static llama_memory_t hybrid_attention_other(llama_memory_t mem_other) {
+    if (!mem_other) {
+        return nullptr;
+    }
+    auto * other = dynamic_cast<llama_memory_hybrid *>(mem_other);
+    if (!other) {
+        throw std::runtime_error("cannot share hybrid memory with an incompatible memory type");
+    }
+    return other->get_mem_attn();
+}
+
 //
 // llama_memory_hybrid
 //
+
+// only the attention part has a cell-based utilization; the recurrent state is
+// a fixed-size tail with no meaningful fraction
+float llama_memory_hybrid::get_used_frac() const {
+    return mem_attn->get_used_frac();
+}
 
 llama_memory_hybrid::llama_memory_hybrid(
         const llama_model & model,
@@ -27,10 +46,12 @@ llama_memory_hybrid::llama_memory_hybrid(
                  uint32_t   n_rs_seq,
                      bool   offload,
                      bool   unified,
+           llama_memory_t   mem_other,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr) :
     hparams(model.hparams),
+    shared(mem_other != nullptr),
     mem_attn(new llama_kv_cache(
         model,
         model.hparams,
@@ -44,7 +65,7 @@ llama_memory_hybrid::llama_memory_hybrid(
         n_pad,
         n_swa,
         swa_type,
-        nullptr,
+        hybrid_attention_other(mem_other),
         filter_attn == nullptr ?
             [&](int32_t il) { return !hparams.is_recr(il); }
             : filter_attn,
@@ -64,7 +85,19 @@ llama_memory_hybrid::llama_memory_hybrid(
             : filter_recr
     )) {}
 
+bool llama_memory_hybrid::shared_fence(const char * operation) const {
+    if (!shared) {
+        return false;
+    }
+    LLAMA_LOG_ERROR("%s: %s is not allowed from shared hybrid memory (recurrent state is owner-only)\n",
+                    __func__, operation);
+    return true;
+}
+
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
+    if (shared_fence("decode")) {
+        return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
     do {
         balloc.split_reset();
 
@@ -127,20 +160,29 @@ llama_memory_context_ptr llama_memory_hybrid::init_full() {
 }
 
 llama_memory_context_ptr llama_memory_hybrid::init_update(llama_context * lctx, bool optimize) {
+    if (shared_fence("memory update")) {
+        return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
     return std::make_unique<llama_memory_hybrid_context>(this, lctx, optimize);
 }
 
 bool llama_memory_hybrid::get_can_shift() const {
     // Shifting is trivially supported for recurrent
-    return mem_attn->get_can_shift();
+    return !shared && mem_attn->get_can_shift();
 }
 
 void llama_memory_hybrid::clear(bool data) {
+    if (shared_fence("clear")) {
+        return;
+    }
     mem_attn->clear(data);
     mem_recr->clear(data);
 }
 
 bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (shared_fence("sequence removal")) {
+        return false;
+    }
     // Try removing from the recurrent cache first since it may fail. If it does
     // fail, the cache will not have been mutated.
     if (!mem_recr->seq_rm(seq_id, p0, p1)) {
@@ -150,21 +192,33 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
 }
 
 void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    if (shared_fence("sequence copy")) {
+        return;
+    }
     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
 void llama_memory_hybrid::seq_keep(llama_seq_id seq_id) {
+    if (shared_fence("sequence keep")) {
+        return;
+    }
     mem_attn->seq_keep(seq_id);
     mem_recr->seq_keep(seq_id);
 }
 
 void llama_memory_hybrid::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    if (shared_fence("sequence shift")) {
+        return;
+    }
     mem_attn->seq_add(seq_id, p0, p1, shift);
     mem_recr->seq_add(seq_id, p0, p1, shift);
 }
 
 void llama_memory_hybrid::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    if (shared_fence("sequence division")) {
+        return;
+    }
     mem_attn->seq_div(seq_id, p0, p1, d);
     mem_recr->seq_div(seq_id, p0, p1, d);
 }
@@ -188,6 +242,9 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdo
 }
 
 void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (shared) {
+        throw std::runtime_error("state IO is not supported on a shared hybrid memory");
+    }
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         mem_attn->state_write(io, seq_id, flags);
     }
@@ -195,6 +252,9 @@ void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id
 }
 
 void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (shared) {
+        throw std::runtime_error("state IO is not supported on a shared hybrid memory");
+    }
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         mem_attn->state_read(io, seq_id, flags);
     }

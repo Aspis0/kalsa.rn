@@ -479,8 +479,12 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_glu(
             upSum   += p.zw;
         }
         dst = (global float*)((global char*)dst + offsetd);
-        dst[gid * 2 + 0] = glu_apply(glu_op, gateSum.s0, upSum.s0);
-        dst[gid * 2 + 1] = glu_apply(glu_op, gateSum.s1, upSum.s1);
+        // Guard the two output rows. The x-grid is padded to CEIL_DIV(M/2,64)*64,
+        // so when M is not a multiple of 128 the tail row-pairs run past row M and
+        // would overrun dst into the adjacent tensor. No-op / byte-identical when
+        // M % 128 == 0 (M/2 already a multiple of 64 -> no padding).
+        if (gid * 2 + 0 < M) dst[gid * 2 + 0] = glu_apply(glu_op, gateSum.s0, upSum.s0);
+        if (gid * 2 + 1 < M) dst[gid * 2 + 1] = glu_apply(glu_op, gateSum.s1, upSum.s1);
     }
 }
 
@@ -573,7 +577,12 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_splitk(
         for (uint i = 0; i < nsg - 1; ++i) {
             totalSum += reduceLM[SUBGROUP_SIZE * i + slid];
         }
-        vstore2(totalSum, 0, &(partial[kslice * M + gid * 2]));
+        // Guard the row-pair. The x-grid is padded to CEIL_DIV(M/2,64)*64, so when M
+        // is not a multiple of 128 the tail lanes of slice k would store into slice
+        // k+1's rows -- racing that slice's own workgroups, so the partials come out
+        // nondeterministically wrong -- and the last slice would write past the
+        // ksplit*M buffer. No-op / byte-identical when M % 128 == 0.
+        if (gid * 2 + 1 < M) vstore2(totalSum, 0, &(partial[kslice * M + gid * 2]));
     }
 }
 
@@ -816,8 +825,14 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc3(
         acc += reduceLM[SUBGROUP_SIZE * 2 + slid];
         dst = (global float*)((global char*)dst + offsetd);
         // dst is column-major [M rows x 3 cols]: (row, col) at col*M + row
-        vstore2((float2)(acc.s0, acc.s1), 0, &(dst[0 * M + gid * 2]));
-        vstore2((float2)(acc.s2, acc.s3), 0, &(dst[1 * M + gid * 2]));
-        vstore2((float2)(acc.s4, acc.s5), 0, &(dst[2 * M + gid * 2]));
+        // The x-grid is padded to CEIL_DIV(M/2,64)*64, so when M is not a multiple
+        // of 128 the tail row-pairs run past row M. M % 64 == 0 on this path (the
+        // noshuffle layout packs 2 rows per texel), so gid*2+1 < M covers both lanes
+        // of the vstore2; no-op / byte-identical when M % 128 == 0.
+        if (gid * 2 + 1 < M) {
+            vstore2((float2)(acc.s0, acc.s1), 0, &(dst[0 * M + gid * 2]));
+            vstore2((float2)(acc.s2, acc.s3), 0, &(dst[1 * M + gid * 2]));
+            vstore2((float2)(acc.s4, acc.s5), 0, &(dst[2 * M + gid * 2]));
+        }
     }
 }

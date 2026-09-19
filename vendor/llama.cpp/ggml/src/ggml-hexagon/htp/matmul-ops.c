@@ -2176,6 +2176,15 @@ static void transfer_output_chunk_scattered_worker_fn(unsigned int n, unsigned i
 
 // --- HMX Dispatchers & Entry Points ---
 
+#ifdef HTP_ZERO_TILE_PAD
+static inline void htp_zero_weight_tile_pad(void * weights, size_t n_tiles, size_t tile_size, size_t aligned_tile_size) {
+    uint8_t * weight_bytes = (uint8_t *) weights;
+    for (size_t i = 0; i < n_tiles; ++i) {
+        memset(weight_bytes + i * aligned_tile_size + tile_size, 0, aligned_tile_size - tile_size);
+    }
+}
+#endif
+
 static void dequantize_tiled_weight_chunk_to_fp16_tiles(
         struct htp_context *ctx, __fp16 *vtcm_dst,
         const void *weight_src_ddr,
@@ -2514,6 +2523,12 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
     const size_t vec_dot_size = k * sizeof(__fp16);
     const size_t vtcm_budget  = ctx->vtcm_size;
 
+#ifdef HTP_ZERO_TILE_PAD
+    if (is_quant && tile_size < aligned_tile_size) {
+        FARF(HIGH, "hmx-mm: zero-pad active");
+    }
+#endif
+
     const uint32_t dma_dst_stride  = is_quant ? aligned_tile_size : row_stride;
     const uint32_t dma_src_stride  = is_quant ? tile_size : weight_stride;
     const uint32_t dma_width_bytes = is_quant ? tile_size : row_stride;
@@ -2607,6 +2622,12 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
                 // 1. pop A_i
                 void * curr_raw = dma_queue_pop(ctx->dma[0]).dst;
 
+#ifdef HTP_ZERO_TILE_PAD
+                if (is_quant && tile_size < aligned_tile_size) {
+                    htp_zero_weight_tile_pad(curr_raw, (size_t) (n_cols / 32) * n_k_tiles, tile_size, aligned_tile_size);
+                }
+#endif
+
                 // 2. dequantize A_i
                 dequantize_tiled_weight_chunk_to_fp16_tiles(
                     ctx, vtcm_weight_bufs[i % 2], curr_raw,
@@ -2688,6 +2709,12 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
 
                 // A: Wait for weight DMA
                 void * curr_raw = dma_queue_pop(ctx->dma[0]).dst;
+
+#ifdef HTP_ZERO_TILE_PAD
+                if (is_quant && tile_size < aligned_tile_size) {
+                    htp_zero_weight_tile_pad(curr_raw, (size_t) (n_cols / 32) * n_k_tiles, tile_size, aligned_tile_size);
+                }
+#endif
 
                 // B: Weight Dequantize (Threaded)
                 dequantize_tiled_weight_chunk_to_fp16_tiles(
@@ -3375,6 +3402,12 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
     const uint32_t dma_src_stride  = is_quant ? tile_size : weight_stride;
     const uint32_t dma_width_bytes = is_quant ? tile_size : row_stride;
 
+#ifdef HTP_ZERO_TILE_PAD
+    if (is_quant && tile_size < aligned_tile_size) {
+        FARF(HIGH, "hmx-mm: zero-pad active");
+    }
+#endif
+
     const size_t qweight_row_stride = is_quant ? (size_t)(n_k_tiles * aligned_tile_size) / 32 : 0;
     const size_t weight_row_stride = is_quant ? qweight_row_stride : row_stride;
 
@@ -3439,6 +3472,12 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
 
             // A: Wait for weight DMA
             void * curr_raw = dma_queue_pop(ctx->dma[0]).dst;
+
+#ifdef HTP_ZERO_TILE_PAD
+            if (is_quant && tile_size < aligned_tile_size) {
+                htp_zero_weight_tile_pad(curr_raw, (size_t) (n_cols / 32) * n_k_tiles, tile_size, aligned_tile_size);
+            }
+#endif
 
             // B: Weight Dequantize (Threaded)
             dequantize_tiled_weight_chunk_to_fp16_tiles(

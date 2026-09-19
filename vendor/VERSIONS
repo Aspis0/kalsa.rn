@@ -4,9 +4,9 @@
 # The script resolves *_REF to *_COMMIT and rewrites those lines itself.
 # See vendor/README.md.
 
-LLAMA_CPP_REPO=https://github.com/ggml-org/llama.cpp
-LLAMA_CPP_REF=b11010
-LLAMA_CPP_COMMIT=4bc272fd729bd094c0422e4b8353da8d2fec91f8
+LLAMA_CPP_REPO=https://github.com/Aspis0/kalsallama
+LLAMA_CPP_REF=f6ba2786d2811932904584ce79291e9ea34f8a45
+LLAMA_CPP_COMMIT=f6ba2786d2811932904584ce79291e9ea34f8a45
 
 CODEC_CPP_REPO=https://github.com/mybigday/codec.cpp
 CODEC_CPP_REF=63ade8bf2fa3451f9eca7ebaa39f792cc529438e

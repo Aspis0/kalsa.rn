@@ -1733,7 +1733,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    ml.init_mappings(params.mmap_prefetch >= 0, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -2235,6 +2235,35 @@ ggml_backend_buffer_type_t llama_model::select_buft(int il) const {
             });
 }
 
+bool llama_model::has_mtp_weights() const {
+    if (hparams.n_layer_nextn == 0) {
+        return false;
+    }
+
+    const uint32_t il0 = hparams.n_layer();
+    const uint32_t il1 = il0 + hparams.n_layer_nextn;
+    if (il1 > layers.size()) {
+        return false;
+    }
+
+    // eh_proj, enorm and hnorm are the trio every graph_mtp hard-asserts, and the
+    // one the loader skips together when load_mtp is false. The other three nextn
+    // tensors are not a usable signal: embed_tokens and shared_head_head always
+    // have a fallback, two architectures never create them at all, and three
+    // create them outside the load_mtp gate, so a model with those alone would
+    // pass a looser check and then abort in the graph. Every MTP block must be
+    // complete: eight of the fourteen builders index by hparams.n_layer() +
+    // nextn_layer_offset, so head 0 alone proves nothing.
+    for (uint32_t il = il0; il < il1; ++il) {
+        const auto & nextn = layers[il].nextn;
+        if (!nextn.eh_proj || !nextn.enorm || !nextn.hnorm) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }
@@ -2548,6 +2577,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
 
                 if (llm_arch_is_recurrent(arch)) {
+                    if (params.mem_other) {
+                        throw std::runtime_error("ctx_other is not supported for this architecture yet");
+                    }
+
                     res = new llama_memory_recurrent(
                             *this,
                             GGML_TYPE_F32,
@@ -2593,6 +2626,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     }
 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+                        if (params.mem_other) {
+                            throw std::runtime_error("ctx_other is not supported for hybrid-SWA memory yet");
+                        }
                         // Use hybrid-iswa for hybrid models with SWA
                         res = new llama_memory_hybrid_iswa(
                             /* model             */ *this,
@@ -2650,6 +2686,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* n_rs_seq          */ cparams.n_rs_seq,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
+                            /* mem_other         */ params.mem_other,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
                     }
@@ -2657,6 +2694,30 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     llama_kv_cache::layer_filter_cb filter = nullptr;
                     llama_memory_i::layer_reuse_cb reuse = nullptr;
                     llama_kv_cache::layer_share_cb share = nullptr;
+
+                    // Cells can only be shared with a memory of the same class: both
+                    // caches take mem_other through a dynamic_cast and throw when it is
+                    // something else ("cannot share KV cells", llama-kv-cache.cpp:93-94;
+                    // "cannot share iSWA cells", llama-kv-cache-iswa.cpp:96-98), which
+                    // makes llama_init_from_model fail. Two real pairings land here with a
+                    // llama_memory_hybrid target: a dense MTP head routed by
+                    // mtp_on_hybrid_qwen above, and a DFlash draft on Qwen3.5. Running the
+                    // constructors' own test here keeps the class list out of this file.
+                    // Geometry is still the constructors' business: a same-class memory
+                    // with a different kv_size or type still throws there.
+                    llama_memory_t mem_share_iswa =
+                        dynamic_cast<llama_kv_cache_iswa *>(params.mem_other) ? params.mem_other : nullptr;
+                    llama_memory_t mem_share_kv =
+                        dynamic_cast<llama_kv_cache *>(params.mem_other) ? params.mem_other : nullptr;
+
+                    if (params.mem_other && !mem_share_iswa && !mem_share_kv) {
+                        // The throw this replaces was caught and logged as an error, so
+                        // this stays at WARN: the binding maps anything below it to "info"
+                        // (jsi/RNLlamaJSI.cpp switch on the ggml log level) and the
+                        // degradation would read as routine chatter in logcat.
+                        LLAMA_LOG_WARN("%s: not sharing cells: the other context's memory is of "
+                                       "another class\n", __func__);
+                    }
 
                     if (arch == LLM_ARCH_GEMMA3N || arch == LLM_ARCH_GEMMA4) {
                         reuse = [&](uint32_t il) {
@@ -2729,7 +2790,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     cparams.n_seq_max,
                                     cparams.n_ubatch,
                                     1,
-                                    nullptr,
+                                    mem_share_iswa,
                                     filter,
                                     reuse,
                                     share);
@@ -2750,7 +2811,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 1,
                                 hparams.n_swa,
                                 hparams.swa_type,
-                                nullptr,
+                                mem_share_kv,
                                 filter,
                                 nullptr,
                                 nullptr);
@@ -2805,6 +2866,7 @@ llama_model_params llama_model_default_params() {
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
+        /*.mmap_prefetch               =*/ 0, // 0=auto (prefault on; zero-init reproduces historic behavior)
         /*.load_mtp                    =*/ false,
     };
 

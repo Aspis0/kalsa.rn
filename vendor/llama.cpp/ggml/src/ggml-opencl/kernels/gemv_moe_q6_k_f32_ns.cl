@@ -38,9 +38,10 @@ __kernel void kernel_gemv_moe_q6_k_f32_ns(
     uint sgid = get_local_id(1);
     uint slid = get_sub_group_local_id();
 
-    if (i01 >= ne01) {
-        return;
-    }
+    // All lanes must reach the reduction barrier; clamp padded lanes to a
+    // valid row and predicate only the final store.
+    const bool valid = (i01 < (uint)ne01);
+    const uint i01_load = valid ? i01 : ((uint)ne01 - 1u);
 
     uint i11 = i20 % ne11;
 
@@ -63,15 +64,15 @@ __kernel void kernel_gemv_moe_q6_k_f32_ns(
         uint j  = ib % 8;   // 32-element group within super-block
 
         // Load d for this super-block
-        half d_val = src0_d[expert_d_offset + sb * ne01 + i01];
+        half d_val = src0_d[expert_d_offset + sb * ne01 + i01_load];
 
         // Load 2 sub-block scales
-        global const char * sc = src0_s + (expert_id * ne01 + i01) * scales_per_row + sb * 16;
+        global const char * sc = src0_s + (expert_id * ne01 + i01_load) * scales_per_row + sb * 16;
         float scale0 = (float)d_val * (float)sc[j * 2];
         float scale1 = (float)d_val * (float)sc[j * 2 + 1];
 
         // Load 4 uints of ql
-        uint ql_base = expert_ql_offset + (ib * 4) * ne01 + i01;
+        uint ql_base = expert_ql_offset + (ib * 4) * ne01 + i01_load;
         uint4 regQL;
         regQL.s0 = src0_ql[ql_base];
         regQL.s1 = src0_ql[ql_base + ne01];
@@ -79,7 +80,7 @@ __kernel void kernel_gemv_moe_q6_k_f32_ns(
         regQL.s3 = src0_ql[ql_base + ne01 * 3];
 
         // Load 2 uints of qh
-        uint qh_base = expert_qh_offset + (ib * 2) * ne01 + i01;
+        uint qh_base = expert_qh_offset + (ib * 2) * ne01 + i01_load;
         uint2 regQH;
         regQH.s0 = src0_qh[qh_base];
         regQH.s1 = src0_qh[qh_base + ne01];
@@ -136,6 +137,8 @@ __kernel void kernel_gemv_moe_q6_k_f32_ns(
     // 1 output per thread in subgroup 0
     if (sgid == 0) {
         dst = dst + (offsetd >> 2);
-        dst[i01 + i20 * ne01] = sum;
+        if (valid) {
+            dst[i01 + i20 * ne01] = sum;
+        }
     }
 }

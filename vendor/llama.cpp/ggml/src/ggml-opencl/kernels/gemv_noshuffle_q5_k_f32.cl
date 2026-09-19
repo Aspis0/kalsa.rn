@@ -442,10 +442,18 @@ kernel void kernel_gemv_noshuffle_q5_k_f32_mc3(
         acc += reduceLM[SUBGROUP_SIZE * 2 + slid];
         dst = (global float*)((global char*)dst + offsetd);
         // dst is column-major [M rows x n_cols cols]: (row, col) at col*M + row
-        vstore2((float2)(acc.s0, acc.s1), 0, &(dst[0 * M + gid * 2]));
-        vstore2((float2)(acc.s2, acc.s3), 0, &(dst[1 * M + gid * 2]));
-        if (n_cols > 2) vstore2((float2)(acc.s4, acc.s5), 0, &(dst[2 * M + gid * 2]));
-        if (n_cols > 3) vstore2((float2)(acc.s6, acc.s7), 0, &(dst[3 * M + gid * 2]));
+        // The x-grid is padded to CEIL_DIV(M/2,64)*64, so when M is not a multiple of
+        // 128 the tail row-pair runs past row M. M is even on this path
+        // (use_adreno_kernels() bounds Q5_K weights to ne1 % 64 == 0, and the call site
+        // also requires enable_adreno_trans_weight_q5_K() -> ne1 % 4 == 0), so
+        // gid*2+1 < M covers both lanes of every vstore2; no-op / byte-identical when
+        // M % 128 == 0.
+        if (gid * 2 + 1 < M) {
+            vstore2((float2)(acc.s0, acc.s1), 0, &(dst[0 * M + gid * 2]));
+            vstore2((float2)(acc.s2, acc.s3), 0, &(dst[1 * M + gid * 2]));
+            if (n_cols > 2) vstore2((float2)(acc.s4, acc.s5), 0, &(dst[2 * M + gid * 2]));
+            if (n_cols > 3) vstore2((float2)(acc.s6, acc.s7), 0, &(dst[3 * M + gid * 2]));
+        }
     }
 }
 #undef MC_COL_Q5K

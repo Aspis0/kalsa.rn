@@ -54,7 +54,11 @@ kernel void kernel_gemm_noshuffle_q4_k_f32(
     int gx = get_global_id(1);
     int gx_2 = gx << 2;
 
-    half8 c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    // Mirrors the q4_0 fix: the half PRODUCT, not the accumulator, causes divergence.
+    // A float accumulator alone was measured not to fix it.
+    // The q4_K fidelity gain and speed cost are NOT measured for this kernel.
+    // Do not infer q4_K measurements from q4_0.
+    float8 c0 = 0, c1 = 0, c2 = 0, c3 = 0;
     half8 B;
     half4 dequantized_weights;
 
@@ -95,10 +99,10 @@ kernel void kernel_gemm_noshuffle_q4_k_f32(
             dequantized_weights.s1 = (bits4.s1 & 0x000F) * scale.s1 - mval.s1;
             dequantized_weights.s2 = (bits4.s2 & 0x000F) * scale.s2 - mval.s2;
             dequantized_weights.s3 = (bits4.s3 & 0x000F) * scale.s3 - mval.s3;
-            c0 += B * dequantized_weights.s0;
-            c1 += B * dequantized_weights.s1;
-            c2 += B * dequantized_weights.s2;
-            c3 += B * dequantized_weights.s3;
+            c0 += convert_float8(B) * (float)dequantized_weights.s0;
+            c1 += convert_float8(B) * (float)dequantized_weights.s1;
+            c2 += convert_float8(B) * (float)dequantized_weights.s2;
+            c3 += convert_float8(B) * (float)dequantized_weights.s3;
 
             // j=1
             B.s0123 = read_imageh(src1, gy*2   + (ki+1) * n_4);
@@ -107,10 +111,10 @@ kernel void kernel_gemm_noshuffle_q4_k_f32(
             dequantized_weights.s1 = ((bits4.s1 & 0x00F0) >> 4) * scale.s1 - mval.s1;
             dequantized_weights.s2 = ((bits4.s2 & 0x00F0) >> 4) * scale.s2 - mval.s2;
             dequantized_weights.s3 = ((bits4.s3 & 0x00F0) >> 4) * scale.s3 - mval.s3;
-            c0 += B * dequantized_weights.s0;
-            c1 += B * dequantized_weights.s1;
-            c2 += B * dequantized_weights.s2;
-            c3 += B * dequantized_weights.s3;
+            c0 += convert_float8(B) * (float)dequantized_weights.s0;
+            c1 += convert_float8(B) * (float)dequantized_weights.s1;
+            c2 += convert_float8(B) * (float)dequantized_weights.s2;
+            c3 += convert_float8(B) * (float)dequantized_weights.s3;
 
             // j=2
             B.s0123 = read_imageh(src1, gy*2   + (ki+2) * n_4);
@@ -119,10 +123,10 @@ kernel void kernel_gemm_noshuffle_q4_k_f32(
             dequantized_weights.s1 = ((bits4.s1 & 0x0F00) >> 8) * scale.s1 - mval.s1;
             dequantized_weights.s2 = ((bits4.s2 & 0x0F00) >> 8) * scale.s2 - mval.s2;
             dequantized_weights.s3 = ((bits4.s3 & 0x0F00) >> 8) * scale.s3 - mval.s3;
-            c0 += B * dequantized_weights.s0;
-            c1 += B * dequantized_weights.s1;
-            c2 += B * dequantized_weights.s2;
-            c3 += B * dequantized_weights.s3;
+            c0 += convert_float8(B) * (float)dequantized_weights.s0;
+            c1 += convert_float8(B) * (float)dequantized_weights.s1;
+            c2 += convert_float8(B) * (float)dequantized_weights.s2;
+            c3 += convert_float8(B) * (float)dequantized_weights.s3;
 
             // j=3
             B.s0123 = read_imageh(src1, gy*2   + (ki+3) * n_4);
@@ -131,10 +135,10 @@ kernel void kernel_gemm_noshuffle_q4_k_f32(
             dequantized_weights.s1 = ((bits4.s1 & 0xF000) >> 12) * scale.s1 - mval.s1;
             dequantized_weights.s2 = ((bits4.s2 & 0xF000) >> 12) * scale.s2 - mval.s2;
             dequantized_weights.s3 = ((bits4.s3 & 0xF000) >> 12) * scale.s3 - mval.s3;
-            c0 += B * dequantized_weights.s0;
-            c1 += B * dequantized_weights.s1;
-            c2 += B * dequantized_weights.s2;
-            c3 += B * dequantized_weights.s3;
+            c0 += convert_float8(B) * (float)dequantized_weights.s0;
+            c1 += convert_float8(B) * (float)dequantized_weights.s1;
+            c2 += convert_float8(B) * (float)dequantized_weights.s2;
+            c3 += convert_float8(B) * (float)dequantized_weights.s3;
         }
     }
 

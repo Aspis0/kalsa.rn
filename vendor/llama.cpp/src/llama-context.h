@@ -289,6 +289,18 @@ private:
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
+    // proactive KV pressure hook (see llama_memory_set_pressure_callback in
+    // llama-ext.h). Edge-triggered: fires once on crossing the threshold, and
+    // re-arms when utilization drops back below it (e.g. after compaction).
+    friend void llama_memory_set_pressure_callback(
+            llama_context * ctx,
+            llama_memory_pressure_cb cb,
+            void * user_data, float trigger_frac);
+    llama_memory_pressure_cb memory_pressure_cb = nullptr;
+    void * memory_pressure_user_data = nullptr;
+    float   memory_pressure_trigger = 2.0f; // above [0,1] = disabled by default
+    bool    memory_pressure_fired = false;
+
     llama_memory_ptr memory;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])

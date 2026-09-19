@@ -2921,6 +2921,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_FIT_CTX"));
     add_opt(common_arg(
+        {"--debug-kv-pressure"},
+        string_format("log KV utilization as it crosses 90%% (default: %s)", params.debug_kv_pressure ? "true" : "false"),
+        [](common_params & params) {
+            params.debug_kv_pressure = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON}));
+
+    add_opt(common_arg(
         {"--check-tensors"},
         string_format("check model tensor data for invalid values (default: %s)", params.check_tensors ? "true" : "false"),
         [](common_params & params) {

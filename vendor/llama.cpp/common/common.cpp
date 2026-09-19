@@ -6,6 +6,8 @@
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
+
+#include "../src/llama-ext.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
@@ -433,6 +435,9 @@ std::string common_params_get_system_info(const common_params & params) {
     os << " / " << std::thread::hardware_concurrency() << " | " << llama_print_system_info();
 #endif
 
+    // Compiled into librnllama.so (the jniLibs binary). RNLlamaJSI.cpp is the
+    // JNI wrapper — always built from source — and cannot prove this .so is ours.
+    os << " | kalsa-native-patches";
     return os.str();
 }
 
@@ -1452,6 +1457,17 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         return res;
     }
 
+    // debug harness for the proactive KV pressure hook: logs utilization
+    // crossings instead of taking action, so the trigger timing can be
+    // observed end-to-end before any app wires a real compaction callback
+    if (params.debug_kv_pressure) {
+        llama_memory_set_pressure_callback(lctx,
+            [](float used_frac, void * user_data) {
+                (void) user_data;
+                fprintf(stderr, "KALSA_KVPRESSURE used_frac=%.3f (>= 0.90, compaction window open)\n", used_frac);
+            }, nullptr, 0.90f);
+    }
+
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     if (params.ctx_shift && !llama_memory_can_shift(llama_get_memory(lctx))) {
@@ -1802,6 +1818,15 @@ void common_threadpools::init(llama_context * ctx, const common_params & params)
     auto * reg = ggml_backend_dev_backend_reg(cpu_dev);
     auto * ggml_threadpool_new_fn = (decltype(ggml_threadpool_new) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
     free_fn = (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free");
+    // A backend that does not export the threadpool API returns null here, and
+    // the first use below would be a null call. Same shape as the !cpu_dev exit
+    // above: warn and run without a threadpool, which every caller already
+    // tolerates (the destructor guards on free_fn for the same reason).
+    if (!ggml_threadpool_new_fn || !free_fn) {
+        COM_WRN("%s", "CPU backend does not export the threadpool API; running without one\n");
+        free_fn = nullptr;
+        return;
+    }
 
     struct ggml_threadpool_params tpp_batch =
             ggml_threadpool_params_from_cpu_params(params.cpuparams_batch);

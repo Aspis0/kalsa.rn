@@ -402,8 +402,15 @@ kernel void kernel_gemv_noshuffle_q6_K_f32_mc3(
         acc += reduce_lm[SUBGROUP_SIZE*2 + slid];
         dst = (global float*)((global char*)dst + offsetd);
         // dst column-major [ne01 rows x 3 cols]: (row, col) at col*ne01 + row
-        vstore2((float2)(acc.s0, acc.s1), 0, &(dst[0*ne01 + gid*2]));
-        vstore2((float2)(acc.s2, acc.s3), 0, &(dst[1*ne01 + gid*2]));
-        vstore2((float2)(acc.s4, acc.s5), 0, &(dst[2*ne01 + gid*2]));
+        // The x-grid is padded to CEIL_DIV(ne01/2,64)*64, so when ne01 is not a
+        // multiple of 128 the tail row-pairs run past row ne01. ne01 % 64 == 0 on
+        // this path (the noshuffle layout packs 2 rows per texel), so
+        // gid*2+1 < ne01 covers both lanes of the vstore2; no-op / byte-identical
+        // when ne01 % 128 == 0.
+        if (gid*2 + 1 < ne01) {
+            vstore2((float2)(acc.s0, acc.s1), 0, &(dst[0*ne01 + gid*2]));
+            vstore2((float2)(acc.s2, acc.s3), 0, &(dst[1*ne01 + gid*2]));
+            vstore2((float2)(acc.s4, acc.s5), 0, &(dst[2*ne01 + gid*2]));
+        }
     }
 }

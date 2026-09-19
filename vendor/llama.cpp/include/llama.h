@@ -346,6 +346,9 @@ extern "C" {
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
+        // Appended at end so existing field offsets stay stable for ABI consumers.
+        // 0 = auto (prefault on, historical behavior), 1 = forced prefault, -1 = prefault disabled
+        int32_t mmap_prefetch;
         bool load_mtp;        // whether to load MTP layers
     };
 

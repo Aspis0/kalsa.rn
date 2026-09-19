@@ -5,6 +5,7 @@ set(TARGET_NAME ggml-opencl)
 
 ggml_add_backend_library(${TARGET_NAME}
                          ggml-opencl.cpp
+                         ggml-opencl-kalsa-diag.cpp
                          cl-program-cache.cpp
                          cl-program-cache.h
                          ../../include/ggml-opencl.h)
@@ -120,6 +121,8 @@ set(GGML_OPENCL_KERNELS
     gemm_moe_q4_0_f32_ns
     gemm_moe_q4_0_q8_1_dp4a
     gemv_moe_q4_0_f32_ns
+    oracle_consumer_q4_0_gemv
+    oracle_consumer_q4_0_gemm
     gemm_moe_q8_0_f32_ns
     gemm_moe_q4_1_f32_ns
     gemv_moe_q4_1_f32_ns
@@ -145,6 +148,10 @@ set(GGML_OPENCL_KERNELS
     gemv_moe_q5_k_f32_ns
     gemm_moe_q6_k_f32_ns
     gemv_moe_q6_k_f32_ns
+    gemm_moe_q2_k_f32_ns
+    gemv_moe_q2_k_f32_ns
+    gemm_moe_q3_k_f32_ns
+    gemv_moe_q3_k_f32_ns
     gemm_moe_mxfp4_f32
     gemv_moe_mxfp4_f32
     gemm_moe_mxfp4_f32_ns

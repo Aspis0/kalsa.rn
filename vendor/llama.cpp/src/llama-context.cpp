@@ -142,13 +142,14 @@ llama_context::llama_context(
 
     cparams.ctx_other = nullptr;
 
-    // TODO: more generic
     if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
         if (params.ctx_other == nullptr) {
             // TODO: change from runtime_error to llama_exception to avoid printing error message
             throw std::runtime_error("Gemma4Assistant requires ctx_other to be set (this warning is normal during memory fitting)");
         }
+    }
 
+    if (params.ctx_other != nullptr) {
         cparams.ctx_other = params.ctx_other;
     }
 
@@ -1710,6 +1711,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
                             seq_id, seq_output_count[seq_id]);
                     return -1;
                 }
+            }
+        }
+    }
+
+    // report memory utilization BEFORE this batch is processed: once a batch
+    // no longer fits, proactive compaction is already too late
+    if (memory_pressure_cb) {
+        const float used_frac = memory->get_used_frac();
+        if (used_frac >= 0.0f) {
+            if (used_frac >= memory_pressure_trigger) {
+                if (!memory_pressure_fired) {
+                    memory_pressure_fired = true;
+                    memory_pressure_cb(used_frac, memory_pressure_user_data);
+                }
+            } else {
+                memory_pressure_fired = false;
             }
         }
     }
@@ -3378,10 +3395,16 @@ llama_perf_context_data llama_context::perf_get_data() const {
 }
 
 void llama_context::perf_reset() {
+    // Complete any queued backend work before dropping its timing state.  synchronize()
+    // clears n_queued_tokens and t_compute_start_us, so the work cannot be counted twice.
+    synchronize();
+
     t_start_us  = ggml_time_us();
     t_eval_us   = n_eval = 0;
     t_p_eval_us = n_p_eval = 0;
     n_reused    = 0;
+    t_compute_start_us = 0;
+    n_queued_tokens    = 0;
 }
 
 llama_memory_breakdown llama_context::memory_breakdown() const {
@@ -3773,6 +3796,19 @@ llama_context * llama_init_from_model(
     if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
         (model->hparams.n_layer_nextn == 0 || model->hparams.router_layer >= 0)) {
         LLAMA_LOG_WARN("%s: context type MTP requested but model doesn't contain MTP layers\n", __func__);
+        return nullptr;
+    }
+
+    // The metadata can promise an MTP block whose weights are not in memory:
+    // llama_model_params::load_mtp defaults to false and skips them. Every MTP
+    // graph builder then hard-asserts on nextn.eh_proj/enorm/hnorm, so without
+    // this the process aborts. Refusing instead gives the caller something it can
+    // act on: the RN binding falls back to plain decode, and a caller that treats
+    // null as fatal (tools/server) reports a clean error.
+    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && !model->has_mtp_weights()) {
+        LLAMA_LOG_WARN("%s: context type MTP requested but the MTP weights are not loaded "
+                       "(llama_model_params::load_mtp was false, or the file has the nextn "
+                       "metadata without the tensors)\n", __func__);
         return nullptr;
     }
 
@@ -4360,4 +4396,25 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+void llama_memory_set_pressure_callback(
+        llama_context * ctx,
+        llama_memory_pressure_cb cb,
+        void * user_data,
+        float trigger_frac) {
+    if (!ctx) {
+        return;
+    }
+    // [0, 1] are thresholds; anything else disables the hook rather than
+    // inventing a fire-now or never-fires surprise
+    if (!std::isfinite(trigger_frac) || trigger_frac > 1.0f) {
+        trigger_frac = 2.0f; // disabled
+    } else if (trigger_frac < 0.0f) {
+        trigger_frac = 0.0f;
+    }
+    ctx->memory_pressure_cb       = cb;
+    ctx->memory_pressure_user_data = user_data;
+    ctx->memory_pressure_trigger  = trigger_frac;
+    ctx->memory_pressure_fired    = false;
 }

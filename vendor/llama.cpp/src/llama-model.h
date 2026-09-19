@@ -750,6 +750,12 @@ struct llama_model {
 
     bool has_tensor_overrides() const;
 
+    // True when every MTP block carries the three tensors its graph asserts on.
+    // False above all when llama_model_params::load_mtp was false and the loader
+    // skipped them. It does not certify the whole block: an arch that also
+    // asserts nextn.shared_head_norm can still fail on a file missing only that.
+    bool has_mtp_weights() const;
+
     const struct ggml_tensor * get_tensor(const char * name) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;

@@ -1,3 +1,9 @@
+// KALSA 2026-08-19: mask-then-shift is miscompiled on Adreno 740 (driver 0676.73,
+// compiler E031.41.03.62): the masked value is treated as signed and shifted
+// arithmetically, so a set top bit smears ones into the neighbouring nibble. A later
+// mask does not rescue it -- the compiler drops that mask as dead by known-bits.
+// Shift FIRST, then mask, as gemv_moe_q6_k_f32_ns.cl already does (q6_K is the only
+// nibble-packed MoE type that passes on this device).
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 #pragma OPENCL EXTENSION cl_khr_subgroups : enable
 #pragma OPENCL EXTENSION cl_qcom_subgroup_uniform_load: enable
@@ -11,21 +17,21 @@
 
 #define dequantize_q4_0(q4, a_f16, scale) \
     a_f16.s0 = (half)((q4.s0 & 0x000F) - 8) * scale; \
-    a_f16.s1 = (half)(((q4.s0 & 0x00F0) >> 4) - 8) * scale; \
-    a_f16.s2 = (half)(((q4.s0 & 0x0F00) >> 8) - 8) * scale; \
-    a_f16.s3 = (half)(((q4.s0 & 0xF000) >> 12) - 8) * scale; \
+    a_f16.s1 = (half)(((q4.s0 >>  4) & 0x000F) - 8) * scale; \
+    a_f16.s2 = (half)(((q4.s0 >>  8) & 0x000F) - 8) * scale; \
+    a_f16.s3 = (half)(((q4.s0 >> 12) & 0x000F) - 8) * scale; \
     a_f16.s4 = (half)((q4.s1 & 0x000F) - 8) * scale; \
-    a_f16.s5 = (half)(((q4.s1 & 0x00F0) >> 4) - 8) * scale; \
-    a_f16.s6 = (half)(((q4.s1 & 0x0F00) >> 8) - 8) * scale; \
-    a_f16.s7 = (half)(((q4.s1 & 0xF000) >> 12) - 8) * scale; \
+    a_f16.s5 = (half)(((q4.s1 >>  4) & 0x000F) - 8) * scale; \
+    a_f16.s6 = (half)(((q4.s1 >>  8) & 0x000F) - 8) * scale; \
+    a_f16.s7 = (half)(((q4.s1 >> 12) & 0x000F) - 8) * scale; \
     a_f16.s8 = (half)((q4.s2 & 0x000F) - 8) * scale; \
-    a_f16.s9 = (half)(((q4.s2 & 0x00F0) >> 4) - 8) * scale; \
-    a_f16.sa = (half)(((q4.s2 & 0x0F00) >> 8) - 8) * scale; \
-    a_f16.sb = (half)(((q4.s2 & 0xF000) >> 12) - 8) * scale; \
+    a_f16.s9 = (half)(((q4.s2 >>  4) & 0x000F) - 8) * scale; \
+    a_f16.sa = (half)(((q4.s2 >>  8) & 0x000F) - 8) * scale; \
+    a_f16.sb = (half)(((q4.s2 >> 12) & 0x000F) - 8) * scale; \
     a_f16.sc = (half)((q4.s3 & 0x000F) - 8) * scale; \
-    a_f16.sd = (half)(((q4.s3 & 0x00F0) >> 4) - 8) * scale; \
-    a_f16.se = (half)(((q4.s3 & 0x0F00) >> 8) - 8) * scale; \
-    a_f16.sf = (half)(((q4.s3 & 0xF000) >> 12) - 8) * scale; \
+    a_f16.sd = (half)(((q4.s3 >>  4) & 0x000F) - 8) * scale; \
+    a_f16.se = (half)(((q4.s3 >>  8) & 0x000F) - 8) * scale; \
+    a_f16.sf = (half)(((q4.s3 >> 12) & 0x000F) - 8) * scale; \
 
 
 #define dotx16_reduce8(a_reg, b_lm, c_reg, lm_offset) \

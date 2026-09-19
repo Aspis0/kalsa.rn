@@ -64,10 +64,10 @@ grep -q 'mparams.vocab_only' "$common_cpp" \
 # 3. the commit string the phone reports
 build_info="$LLAMA/common/build-info.cpp"
 if [ -f "$build_info" ]; then
-  commit=$(sed -n 's/.*LLAMA_BUILD_COMMIT *= *"\([^"]*\)".*/\1/p' "$build_info")
-  [ -n "$commit" ] || fail "could not read LLAMA_BUILD_COMMIT from $build_info"
+  commit=$(sed -n 's/.*LLAMA_COMMIT *= *"\([^"]*\)".*/\1/p' "$build_info")
+  [ -n "$commit" ] || fail "could not read LLAMA_COMMIT from $build_info"
   [ "${#commit}" = "7" ] \
-    || fail "LLAMA_BUILD_COMMIT is '${commit}' (${#commit} chars, want 7): --short=7 grew on an ambiguous prefix"
+    || fail "LLAMA_COMMIT is '${commit}' (${#commit} chars, want 7): --short=7 grew on an ambiguous prefix"
 fi
 
 echo "assert-kalsa-vendor: ok (marker x1, kalsa_moe x1, upstream hunks present)"

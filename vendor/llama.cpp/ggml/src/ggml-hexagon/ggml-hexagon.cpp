@@ -4253,8 +4253,8 @@ static bool ggml_hexagon_matmul_is_hmx_eligible(
     const int ne12  = src1->ne[2];
     const int wtype = src0->type;
 
-    // HMX weight tile requires N to be 32-aligned.
-    if (ne01_padded % 32 != 0) {
+    // Host gate must match the DSP %32 contract on logical N (src0->ne[1]), not just padded N.
+    if (ne01_padded % 32 != 0 || src0->ne[1] % 32 != 0) {
         return false;
     }
 
@@ -5943,6 +5943,10 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
     for (const auto & node : *nodes_ptr) {
         sess->enqueue_op(node);
     }
+
+    // Wait until all pending ops complete; last_error is only updated during
+    // flush_pending, so it must be drained before the status is decided.
+    sess->flush_sync();
 
     if (sess->last_error > HTP_STATUS_OK) {
         return GGML_STATUS_FAILED;

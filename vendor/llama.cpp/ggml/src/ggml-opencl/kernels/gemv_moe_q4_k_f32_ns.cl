@@ -7,18 +7,26 @@
 #define N_SIMDGROUP 4
 #define SIMDGROUP_WIDTH 64
 
+// Pass the bitmasks as kernel arguments instead of literal constants: the
+// Qualcomm Adreno E031 compiler miscompiles the literal-mask form of this
+// helper (device-verified on Adreno 740: all MUL_MAT_ID q4_K/q5_K cases fail
+// with literals, pass with arguments; same workaround as the dense noshuffle
+// kernels).
 inline void get_scale_min_k4(
     int j,
     global const uchar * q,
     uchar * d,
-    uchar * m
+    uchar * m,
+    uchar mask_d6,
+    uchar mask_d4,
+    uchar mask_hi2
 ) {
     if (j < 4) {
-        *d = q[j]   & 63;
-        *m = q[j+4] & 63;
+        *d = q[j]   & mask_d6;
+        *m = q[j+4] & mask_d6;
     } else {
-        *d = (q[j+4] & 0x0F) | ((q[j-4] & 0xC0) >> 2);
-        *m = ((q[j+4] >> 4) & 0x0F) | ((q[j]   & 0xC0) >> 2);
+        *d = (q[j+4] & mask_d4) | ((q[j-4] & mask_hi2) >> 2);
+        *m = ((q[j+4] >> 4) & mask_d4) | ((q[j]   & mask_hi2) >> 2);
     }
 }
 
@@ -47,16 +55,20 @@ __kernel void kernel_gemv_moe_q4_k_f32_ns(
     ulong                   offsetd,
     int                     ne00,
     int                     ne01,
-    int                     ne11
+    int                     ne11,
+    uchar                   mask_d6,
+    uchar                   mask_d4,
+    uchar                   mask_hi2
 ) {
     uint i01  = get_global_id(0);
     uint i20  = get_global_id(2);
     uint sgid = get_local_id(1);
     uint slid = get_sub_group_local_id();
 
-    if (i01 >= ne01) {
-        return;
-    }
+    // All lanes must reach the reduction barrier; clamp padded lanes to a
+    // valid row and predicate only the final store.
+    const bool valid = (i01 < (uint)ne01);
+    const uint i01_load = valid ? i01 : ((uint)ne01 - 1u);
 
     uint i11 = i20 % ne11;
 
@@ -78,19 +90,19 @@ __kernel void kernel_gemv_moe_q4_k_f32_ns(
         uint j  = ib % 8;
 
         // Load d and dmin for this super-block
-        half d_val   = src0_d[expert_d_offset + sb * ne01 + i01];
-        half dm_val  = src0_dm[expert_d_offset + sb * ne01 + i01];
+        half d_val   = src0_d[expert_d_offset + sb * ne01 + i01_load];
+        half dm_val  = src0_dm[expert_d_offset + sb * ne01 + i01_load];
 
         // Load sub-block scale and min
-        global const uchar * sc = src0_s + (expert_id * ne01 + i01) * scales_per_row + sb * K_SCALE_SIZE;
+        global const uchar * sc = src0_s + (expert_id * ne01 + i01_load) * scales_per_row + sb * K_SCALE_SIZE;
         uchar sv, mn;
-        get_scale_min_k4(j, sc, &sv, &mn);
+        get_scale_min_k4(j, sc, &sv, &mn, mask_d6, mask_d4, mask_hi2);
 
         float scale = (float)d_val * (float)sv;
         float minv  = (float)dm_val * (float)mn;
 
         // Load 4 uints of quants (32 nibbles = 32 elements)
-        uint q_base = expert_q_offset + ib * ne01 * 4 + i01;
+        uint q_base = expert_q_offset + ib * ne01 * 4 + i01_load;
 
         uint4 regQ;
         regQ.s0 = src0_q[q_base];
@@ -150,7 +162,9 @@ __kernel void kernel_gemv_moe_q4_k_f32_ns(
     // 1 output per thread in subgroup 0
     if (sgid == 0) {
         dst = dst + (offsetd >> 2);
-        dst[i01 + i20 * ne01] = sum;
+        if (valid) {
+            dst[i01 + i20 * ne01] = sum;
+        }
     }
 }
 
@@ -166,7 +180,10 @@ __kernel void kernel_gemv_moe_q4_k_f32_ns_wimg(
     ulong                   offsetd,
     int                     ne00,
     int                     ne01,
-    int                     ne11
+    int                     ne11,
+    uchar                   mask_d6,
+    uchar                   mask_d4,
+    uchar                   mask_hi2
 ) {
     uint i01  = get_global_id(0);
     uint i20  = get_global_id(2);
@@ -199,7 +216,7 @@ __kernel void kernel_gemv_moe_q4_k_f32_ns_wimg(
 
         global const uchar * sc = src0_s + (expert_id * ne01 + i01) * scales_per_row + sb * K_SCALE_SIZE;
         uchar sv, mn;
-        get_scale_min_k4(j, sc, &sv, &mn);
+        get_scale_min_k4(j, sc, &sv, &mn, mask_d6, mask_d4, mask_hi2);
 
         float scale = (float)d_val * (float)sv;
         float minv  = (float)dm_val * (float)mn;

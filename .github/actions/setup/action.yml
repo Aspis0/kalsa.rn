@@ -27,13 +27,19 @@ runs:
         npm ci
       shell: bash
 
-    # `npm run bootstrap` is what downloads the Hexagon SDK into
-    # ~/.hexagon-sdk, and build:android-libs starts with build-hexagon-htp.sh,
-    # which exits 1 without it. It was dropped from this step back when
-    # bootstrap.sh also rewrote the engine tree with the lm_ symbol prefix and
-    # running it here would have corrupted the checkout. It no longer renames
-    # anything: it fetches the SDK and generates the gitignored Metal embed
-    # assembly, so it is safe again -- and required.
+    # `npm run bootstrap` downloads the Hexagon SDK into ~/.hexagon-sdk and
+    # generates the Metal embed assembly; without it build:android-libs exits 1
+    # in build-hexagon-htp.sh, and every iOS link fails on undefined
+    # _ggml_metallib_* symbols. It was dropped from this step back when
+    # bootstrap.sh also rewrote the engine tree with the lm_ symbol prefix, and
+    # running it here would have corrupted the checkout. That rewrite is gone,
+    # so it belongs here again.
+    #
+    # It is not side-effect-free, and CI is the only place it should run
+    # unattended: scripts/bootstrap.sh:106 runs `npm install` in example/ and
+    # :176 runs `npm run pods` on macOS, and BOTH example/package-lock.json and
+    # example/ios/Podfile.lock are tracked. On an ephemeral runner that is
+    # nothing; on a developer machine it dirties two tracked lockfiles.
     - name: Bootstrap & Build
       run: npm run bootstrap && npm run build
       shell: bash

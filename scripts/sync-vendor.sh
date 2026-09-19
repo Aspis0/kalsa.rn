@@ -208,9 +208,10 @@ log() { printf '\n==> %s\n' "$*"; }
 
 # Clone once into the cache, then only fetch when the pinned ref is unknown.
 # A previous submodule checkout under .git/modules seeds the clone so nothing
-# is downloaded twice.
+# is downloaded twice. The fourth argument, when it is "required", asserts the
+# clone is complete: the caller numbers this dependency with rev-list --count.
 ensure_repo() {
-  local name="$1" url="$2" ref="$3"
+  local name="$1" url="$2" ref="$3" full_history="${4:-}"
   local repo="$CACHE_DIR/$name"
 
   # The cache is keyed on the dependency NAME, so the clone survives a change
@@ -233,6 +234,19 @@ ensure_repo() {
     else
       git clone --quiet --no-checkout "$url" "$repo"
     fi
+  fi
+
+  # "required" callers number their dependency with `git rev-list --count`,
+  # which counts the whole graph: a shallow clone would number a truncated
+  # history. Checked after the clone above so a depth-1 cache left behind by
+  # hand and a fresh clone of a shallow source are both covered, and before the
+  # caller exports the subset or records the pin, so a refusal writes nothing.
+  # Dependencies pinned by sha and only exported with git archive do not ask
+  # for it, so they stay usable from a shallow cache.
+  if [ "$full_history" = "required" ] \
+     && [ "$(git -C "$repo" rev-parse --is-shallow-repository)" = "true" ]; then
+    echo "$repo is a shallow clone: rev-list --count would number a truncated graph" >&2
+    exit 1
   fi
 
   local commit=""
@@ -300,12 +314,12 @@ record_commit() {
   mv "$tmp" "$VENDOR_DIR/VERSIONS"
 }
 
-sync_dep() {
-  local name="$1" prefix="$2"
+sync_dep() {  # <name> <PREFIX> [full-history]
+  local name="$1" prefix="$2" full_history="${3:-}"
   local repo_var="${prefix}_REPO" ref_var="${prefix}_REF"
 
   log "Syncing $name @ ${!ref_var}"
-  ensure_repo "$name" "${!repo_var}" "${!ref_var}"
+  ensure_repo "$name" "${!repo_var}" "${!ref_var}" "$full_history"
   echo "  commit: $RESOLVED_COMMIT"
   export_subset "$name" "$RESOLVED_COMMIT" "$prefix"
   apply_patches "$name"
@@ -320,12 +334,8 @@ generate_llama_cpp_version_files() {
   local commit
   commit="$(sed -n 's/^LLAMA_CPP_COMMIT=//p' "$VENDOR_DIR/VERSIONS")"
 
-  # The build number is a count over history, so a truncated (shallow) graph
-  # would be numbered as if the tree had always been that small. Refuse it.
-  if [ "$(git -C "$repo" rev-parse --is-shallow-repository)" = "true" ]; then
-    echo "$repo is a shallow clone: rev-list --count would number a truncated graph" >&2
-    exit 1
-  fi
+  # The count below covers the whole graph, so it needs a complete clone:
+  # ensure_repo refused a shallow $repo before anything was exported.
   local build_number build_commit
   build_number="$(git -C "$repo" rev-list --count "$commit")"
   # Pure truncation, not --short=7: that is a MINIMUM and grows on an ambiguous
@@ -369,7 +379,7 @@ export const BUILD_COMMIT = '$build_commit'
 TS
 }
 
-sync_dep llama.cpp LLAMA_CPP
+sync_dep llama.cpp LLAMA_CPP required
 generate_llama_cpp_version_files
 sync_dep codec.cpp CODEC_CPP
 sync_dep OpenCL-Headers OPENCL_HEADERS

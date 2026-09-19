@@ -11,7 +11,10 @@
 #   2. the upstream hunks that share those two files are still there --
 #      our patches are the UNION with upstream's, and regenerating ours
 #      from a tree that lacks theirs would silently delete four features
-#   3. build-info's commit string is exactly 7 characters
+#   3. build-info.cpp exists and its commit string is exactly 7 characters
+#   4. the fork-only governor sources are under src/ -- everything in (1)
+#      and (2) comes from OUR patches, so (4) is what separates the
+#      kalsallama pin from a plain ggml-org tree with the same patches
 #
 # (3) is the post-condition of a guard the old sync-kalsallama.sh enforced at
 # the source: it wrote ${sha:0:7} rather than `git rev-parse --short=7`,
@@ -58,16 +61,31 @@ grep -q 'bool vocab_only' "$common_h" \
   || fail "upstream's vocab_only is gone from common.h"
 grep -q 'llama_progress_callback progress_callback' "$common_h" \
   || fail "upstream's progress_callback is gone from common.h"
+# Pin the 'void *' too: load_progress_callback_user_data shares the suffix,
+# and a bare-substring grep would pass on the wrong field.
+grep -q 'void \* progress_callback_user_data' "$common_h" \
+  || fail "upstream's progress_callback_user_data is gone from common.h"
 grep -q 'mparams.vocab_only' "$common_cpp" \
   || fail "upstream's vocab_only wiring is gone from common.cpp"
 
-# 3. the commit string the phone reports
+# 3. the commit string the phone reports. A missing build-info.cpp is exactly
+# what a broken sync produces, so absence is a failure, never a skip.
 build_info="$LLAMA/common/build-info.cpp"
-if [ -f "$build_info" ]; then
-  commit=$(sed -n 's/.*LLAMA_COMMIT *= *"\([^"]*\)".*/\1/p' "$build_info")
-  [ -n "$commit" ] || fail "could not read LLAMA_COMMIT from $build_info"
-  [ "${#commit}" = "7" ] \
-    || fail "LLAMA_COMMIT is '${commit}' (${#commit} chars, want 7): --short=7 grew on an ambiguous prefix"
-fi
+[ -f "$build_info" ] || fail "missing $build_info -- a broken sync produces exactly this"
+commit=$(sed -n 's/.*LLAMA_COMMIT *= *"\([^"]*\)".*/\1/p' "$build_info")
+[ -n "$commit" ] || fail "could not read LLAMA_COMMIT from $build_info"
+[ "${#commit}" = "7" ] \
+  || fail "LLAMA_COMMIT is '${commit}' (${#commit} chars, want 7): --short=7 grew on an ambiguous prefix"
 
-echo "assert-kalsa-vendor: ok (marker x1, kalsa_moe x1, upstream hunks present)"
+# 4. the engine itself is ours, not just the two patched files. The governor
+# sources exist only in the kalsallama fork -- no patch under scripts/patches/
+# creates them -- so a plain ggml-org tree with our patches applied fails here.
+for f in llama-governor.cpp llama-governor.h \
+         llama-governor-metrics.cpp llama-governor-metrics.h \
+         llama-governor-policy.cpp llama-governor-policy.h \
+         llama-governor-runtime.cpp; do
+  [ -f "$LLAMA/src/$f" ] \
+    || fail "fork-only engine source missing: src/$f -- this is not the kalsallama pin"
+done
+
+echo "assert-kalsa-vendor: ok (marker x1, kalsa_moe x1, upstream hunks present, governor src present)"

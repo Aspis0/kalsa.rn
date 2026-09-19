@@ -27007,6 +27007,14 @@ static void lm_ggml_cl_mul_mat_id(lm_ggml_backend_t backend, const lm_ggml_tenso
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(int),    &ne00));
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(int),    &ne01));
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(int),    &backend_ctx->adreno_use_moe_ragged_dp4));
+                        {
+                            cl_uchar mask_d6  = 0x3F;
+                            cl_uchar mask_d4  = 0x0F;
+                            cl_uchar mask_hi2 = 0xC0;
+                            CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_uchar), &mask_d6));
+                            CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_uchar), &mask_d4));
+                            CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_uchar), &mask_hi2));
+                        }
 
                         size_t dp_global[3] = { 64, (size_t)((ne01 + 63) / 64), (size_t)max_post_router_tile };
                         size_t dp_local[3]  = { 64, 1, 1 };

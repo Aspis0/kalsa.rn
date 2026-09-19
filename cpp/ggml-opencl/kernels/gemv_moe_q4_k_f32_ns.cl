@@ -180,7 +180,10 @@ __kernel void kernel_gemv_moe_q4_k_f32_ns_wimg(
     ulong                   offsetd,
     int                     ne00,
     int                     ne01,
-    int                     ne11
+    int                     ne11,
+    uchar                   mask_d6,
+    uchar                   mask_d4,
+    uchar                   mask_hi2
 ) {
     uint i01  = get_global_id(0);
     uint i20  = get_global_id(2);
@@ -213,7 +216,7 @@ __kernel void kernel_gemv_moe_q4_k_f32_ns_wimg(
 
         global const uchar * sc = src0_s + (expert_id * ne01 + i01) * scales_per_row + sb * K_SCALE_SIZE;
         uchar sv, mn;
-        get_scale_min_k4(j, sc, &sv, &mn);
+        get_scale_min_k4(j, sc, &sv, &mn, mask_d6, mask_d4, mask_hi2);
 
         float scale = (float)d_val * (float)sv;
         float minv  = (float)dm_val * (float)mn;

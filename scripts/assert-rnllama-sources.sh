@@ -113,6 +113,12 @@ echo "assert-rnllama-sources: ok ($count explicitly-named paths resolve)"
 # <rnllama/name.h> spelling behind RNLLAMA_USE_FRAMEWORK_HEADERS. That accepts
 # both shapes already in the tree -- the shared block in JSINativeHeaders.h and
 # the local #if in JSIParams.cpp -- and needs no exemption list.
+#
+# Known limit, deliberate: this does not evaluate preprocessor conditionals. A
+# file that puts the two spellings in the WRONG branches, or hides one in `#if
+# 0`, passes. Parsing #if from shell is the wrong tool; this is a cheap net
+# that turns a thirty-minute iOS failure into a one-second one, and
+# build-ios-frameworks remains the proof.
 
 # A line-oriented match cannot tell code from a comment, and an #include inside
 # /* ... */ is not an include. Strip comments first. (assert-kalsa-vendor.sh
@@ -122,6 +128,7 @@ code_only() {
   perl -0777 -pe 's{/\*.*?\*/}{}gs; s{//[^\n]*}{}g' "$1"
 }
 
+jsi_root="$(cd "$ROOT_DIR/cpp/jsi" && pwd -P)"
 jsi_files="$(find "$ROOT_DIR/cpp/jsi" -type f \( -name '*.cpp' -o -name '*.h' -o -name '*.hpp' \) | sort)"
 [ -n "$jsi_files" ] \
   || fail "found no sources under cpp/jsi -- the layout changed, fix this check"
@@ -135,9 +142,16 @@ while IFS= read -r f; do
   includes="$(sed -n 's/^[[:space:]]*#[[:space:]]*include[[:space:]]*"\([^"]*\)".*/\1/p' <<< "$body")"
   while IFS= read -r h; do
     [ -n "$h" ] || continue
-    if [ -e "$ROOT_DIR/cpp/jsi/$h" ]; then
-      continue
+    # Resolve against the including file's own directory, not against cpp/jsi:
+    # a sibling in a subdirectory is fine, and "../name.h" escapes and is not.
+    cand="$(dirname "$f")/$h"
+    resolved=""
+    if [ -e "$cand" ]; then
+      resolved="$(cd "$(dirname "$cand")" >/dev/null 2>&1 && pwd -P || true)"
     fi
+    case "$resolved" in
+      "$jsi_root" | "$jsi_root"/*) continue ;;
+    esac
     case "$body" in
       *"<rnllama/$h>"*) ;;
       *)

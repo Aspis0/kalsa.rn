@@ -197,8 +197,7 @@ function(build_rnllama_library target_name arch cpu_flags)
 
         target_include_directories(${target_name} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
         target_sources(${target_name} PRIVATE
-            ${RNLLAMA_GGML_OPENCL_DIR}/ggml-opencl.cpp
-            ${RNLLAMA_GGML_OPENCL_DIR}/cl-program-cache.cpp
+            ${RNLLAMA_GGML_OPENCL_SOURCES}
             ${GGML_OPENCL_KERNEL_HEADERS}
         )
         target_compile_options(${target_name} PRIVATE

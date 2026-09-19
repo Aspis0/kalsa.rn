@@ -62,8 +62,7 @@ if(ENABLE_OPENCL)
     endforeach()
 
     target_sources(kv_cache_reuse_test PRIVATE
-        ${RNLLAMA_GGML_OPENCL_DIR}/ggml-opencl.cpp
-        ${RNLLAMA_GGML_OPENCL_DIR}/cl-program-cache.cpp
+        ${RNLLAMA_GGML_OPENCL_SOURCES}
         ${GGML_OPENCL_KERNEL_HEADERS})
     target_include_directories(kv_cache_reuse_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
     target_compile_definitions(kv_cache_reuse_test PRIVATE
@@ -125,8 +124,7 @@ target_include_directories(kv_cache_bench PRIVATE ${RNLLAMA_INCLUDE_DIRS})
 target_compile_definitions(kv_cache_bench PRIVATE KV_BENCH_HAS_STATE_CACHE)
 if(ENABLE_OPENCL)
     target_sources(kv_cache_bench PRIVATE
-        ${RNLLAMA_GGML_OPENCL_DIR}/ggml-opencl.cpp
-        ${RNLLAMA_GGML_OPENCL_DIR}/cl-program-cache.cpp)
+        ${RNLLAMA_GGML_OPENCL_SOURCES})
     target_include_directories(kv_cache_bench PRIVATE
         ${RNLLAMA_OPENCL_HEADERS_DIR} ${CMAKE_CURRENT_BINARY_DIR})
     target_compile_definitions(kv_cache_bench PRIVATE

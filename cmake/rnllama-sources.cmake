@@ -78,6 +78,11 @@ file(GLOB _metal_asm CONFIGURE_DEPENDS ${_ggml}/ggml-metal/*.s)
 set_source_files_properties(${_metal_asm} PROPERTIES LANGUAGE ASM)
 file(GLOB RNLLAMA_GGML_BLAS_SOURCES CONFIGURE_DEPENDS ${_ggml}/ggml-blas/*.cpp)
 set(RNLLAMA_GGML_OPENCL_DIR  "${_ggml}/ggml-opencl")
+# Every consumer of the OpenCL backend compiles the same set, so glob it once
+# here: a hand-written list drifts silently at the next engine bump, and it did
+# -- ggml-opencl-kalsa-diag.cpp was missing from all three call sites and only
+# the link step noticed. The engine's own CMakeLists builds this whole directory.
+file(GLOB RNLLAMA_GGML_OPENCL_SOURCES CONFIGURE_DEPENDS ${RNLLAMA_GGML_OPENCL_DIR}/*.cpp)
 set(RNLLAMA_GGML_HEXAGON_DIR "${_ggml}/ggml-hexagon")
 
 # --- llama, common, mtmd ------------------------------------------------------

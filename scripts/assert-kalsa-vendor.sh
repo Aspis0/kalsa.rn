@@ -64,11 +64,14 @@ grep -q 'bool vocab_only' "$common_h" \
   || fail "upstream's vocab_only is gone from common.h"
 grep -q 'llama_progress_callback progress_callback' "$common_h" \
   || fail "upstream's progress_callback is gone from common.h"
-# Pin the 'void *' too -- load_progress_callback_user_data shares the suffix,
-# and a bare-substring grep would pass on the wrong field -- and anchor the
-# end of the declaration as well: progress_callback_user_data_fake satisfies
-# an unanchored pattern, which is exactly the drift this check exists to catch.
-grep -q '^[ \t]*void \* progress_callback_user_data *= *nullptr;$' "$common_h" \
+# Anchor BOTH ends of the identifier. The prefix matters because
+# load_progress_callback_user_data shares the suffix; the suffix matters
+# because progress_callback_user_data_fake satisfies an unanchored pattern,
+# which is exactly the drift this check exists to catch. What follows the
+# name is deliberately left open ([=;]): pinning `= nullptr` would turn an
+# upstream initializer change into a false alarm on a bump, and the point of
+# this whole tree is that bumps stay cheap.
+grep -qE '^[[:space:]]*void \* progress_callback_user_data[[:space:]]*[=;]' "$common_h" \
   || fail "upstream's progress_callback_user_data is gone from common.h"
 grep -q 'mparams.vocab_only' "$common_cpp" \
   || fail "upstream's vocab_only wiring is gone from common.cpp"

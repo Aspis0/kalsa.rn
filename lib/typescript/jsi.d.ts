@@ -1,20 +1,34 @@
-import type { NativeContextParams, NativeCompletionParams, NativeParallelCompletionParams, NativeCompletionResult, NativeTokenizeResult, NativeEmbeddingResult, NativeSessionLoadResult, NativeRerankResult, JinjaFormattedChatResult, ParallelStatus, GovernorThermoProfile, GovernorStats } from './types';
+import type { NativeContextParams, NativeCompletionParams, NativeParallelCompletionParams, NativeCompletionResult, NativeTokenizeResult, NativeEmbeddingParams, NativeSessionLoadResult, NativeRerankParams, GovernorThermoProfile, GovernorStats, NativeRerankResult, NativeBackendDeviceInfo, NativeBenchResult, JinjaFormattedChatResult, ParallelStatus } from './types';
 declare global {
     var llamaInitContext: (contextId: number, params: NativeContextParams, onProgress?: (progress: number) => void) => Promise<any>;
     var llamaReleaseContext: (contextId: number) => Promise<void>;
     var llamaReleaseAllContexts: () => Promise<void>;
     var llamaModelInfo: (path: string, skip: string[]) => Promise<object>;
-    var llamaGetBackendDevicesInfo: () => Promise<string>;
+    var llamaGetBackendDevicesInfo: () => Promise<NativeBackendDeviceInfo[]>;
     var llamaSetGovernorThermo: (contextId: number, profile: GovernorThermoProfile) => Promise<boolean>;
     var llamaGetGovernorStats: (contextId: number) => Promise<GovernorStats>;
     var llamaLoadSession: (contextId: number, path: string) => Promise<NativeSessionLoadResult>;
     var llamaSaveSession: (contextId: number, path: string, size: number) => Promise<number>;
     var llamaTokenize: (contextId: number, text: string, mediaPaths?: string[]) => Promise<NativeTokenizeResult>;
     var llamaDetokenize: (contextId: number, tokens: number[]) => Promise<string>;
-    var llamaGetFormattedChat: (contextId: number, messages: string, chatTemplate?: string, params?: object) => Promise<string | JinjaFormattedChatResult>;
-    var llamaEmbedding: (contextId: number, text: string, params: object) => Promise<NativeEmbeddingResult>;
-    var llamaRerank: (contextId: number, query: string, documents: string[], params: object) => Promise<NativeRerankResult[]>;
-    var llamaBench: (contextId: number, pp: number, tg: number, pl: number, nr: number) => Promise<string>;
+    var llamaGetFormattedChat: (contextId: number, messages: string, chatTemplate?: string, params?: {
+        jinja: boolean;
+        json_schema?: string;
+        tools?: string;
+        parallel_tool_calls?: boolean;
+        tool_choice?: string;
+        enable_thinking?: boolean;
+        reasoning_format?: string;
+        add_generation_prompt?: boolean;
+        now?: string | number;
+        chat_template_kwargs?: Record<string, string | number | boolean>;
+        force_pure_content?: boolean;
+    }) => Promise<string | JinjaFormattedChatResult>;
+    var llamaEmbedding: (contextId: number, text: string, params: NativeEmbeddingParams) => Promise<{
+        embedding: Float32Array;
+    }>;
+    var llamaRerank: (contextId: number, query: string, documents: string[], params: NativeRerankParams) => Promise<NativeRerankResult[]>;
+    var llamaBench: (contextId: number, pp: number, tg: number, pl: number, nr: number) => Promise<NativeBenchResult>;
     var llamaToggleNativeLog: (enabled: boolean, onLog?: (level: string, text: string) => void) => Promise<void>;
     var llamaSetContextLimit: (limit: number) => Promise<void>;
     var llamaCompletion: (contextId: number, params: NativeCompletionParams, onToken?: (token: any) => void) => Promise<NativeCompletionResult>;
@@ -43,14 +57,55 @@ declare global {
     var llamaInitVocoder: (contextId: number, params: {
         path: string;
         n_batch?: number;
+        use_gpu?: boolean;
     }) => Promise<boolean>;
     var llamaIsVocoderEnabled: (contextId: number) => Promise<boolean>;
-    var llamaGetFormattedAudioCompletion: (contextId: number, speaker: string, text: string) => Promise<{
+    var llamaGetFormattedAudioCompletion: (contextId: number, speaker: Record<string, any> | null, text: string, speakerId?: number) => Promise<{
         prompt: string;
         grammar?: string;
+        embedding: boolean;
+        flow: 'tokens' | 'continuous_embd' | '';
     }>;
-    var llamaGetAudioCompletionGuideTokens: (contextId: number, text: string) => Promise<number[]>;
-    var llamaDecodeAudioTokens: (contextId: number, tokens: number[]) => Promise<number[]>;
+    var llamaGetTTSCapabilities: (contextId: number) => Promise<{
+        type: number;
+        promptKind: 'outetts_legacy' | 'outetts_v0_3' | 'outetts_v1_0' | 'soprano' | 'neutts' | 'csm' | 'qwen3_tts' | 'moss_tts_realtime' | 'moss_ttsd' | 'chatterbox' | 'chatterbox_multilingual' | 'bluemagpie' | '';
+        family: 'outetts' | 'soprano' | 'neutts' | 'csm' | 'qwen3_tts' | 'moss_tts' | 'moss_ttsd' | 'chatterbox' | 'bluemagpie' | '';
+        requiresPhonemes: boolean;
+        defaultLanguage: string;
+    }>;
+    var llamaDecodeAudioTokens: (contextId: number, tokens: Int32Array | number[]) => Promise<Float32Array>;
+    var llamaGenerateAudioCodes: (contextId: number, opts: {
+        prompt: string;
+        maxFrames?: number;
+        temperature?: number;
+        topP?: number;
+        topK?: number;
+        seed?: number;
+    }, onFrame?: (step: number, codes: number[]) => void) => Promise<{
+        codes: number[];
+        nCodebook: number;
+        nFrames: number;
+        stoppedOnEos: boolean;
+        aborted: boolean;
+    }>;
+    var llamaCreateSpeaker: (contextId: number, pcm: Float32Array | number[], opts: {
+        inputSampleRate: number;
+        refText: string;
+        bake: boolean;
+        emotion?: number;
+    }) => Promise<{
+        id: number;
+        family: string;
+        rows: number;
+        baked: boolean;
+    }>;
+    var llamaBakeSpeaker: (contextId: number, speakerId: number) => Promise<{
+        rows: number;
+        baked: boolean;
+    }>;
+    var llamaReleaseSpeaker: (contextId: number, speakerId: number) => Promise<void>;
+    var llamaDecodeAudioEmbeddings: (contextId: number, embeddings: Float32Array | number[], embeddingDim: number) => Promise<Float32Array>;
+    var llamaGetAudioSampleRate: (contextId: number) => Promise<number>;
     var llamaReleaseVocoder: (contextId: number) => Promise<void>;
     var llamaClearCache: (contextId: number, clearData: boolean) => Promise<void>;
     var llamaEnableParallelMode: (contextId: number, params: {
@@ -62,10 +117,10 @@ declare global {
         requestId: number;
     }>;
     var llamaCancelRequest: (contextId: number, requestId: number) => Promise<void>;
-    var llamaQueueEmbedding: (contextId: number, text: string, params: object, onResult: (result: number[]) => void) => Promise<{
+    var llamaQueueEmbedding: (contextId: number, text: string, params: NativeEmbeddingParams, onResult: (result: Float32Array) => void) => Promise<{
         requestId: number;
     }>;
-    var llamaQueueRerank: (contextId: number, query: string, documents: string[], params: object, onResult: (result: NativeRerankResult[]) => void) => Promise<{
+    var llamaQueueRerank: (contextId: number, query: string, documents: string[], params: NativeRerankParams, onResult: (result: NativeRerankResult[]) => void) => Promise<{
         requestId: number;
     }>;
     var llamaGetParallelStatus: (contextId: number) => Promise<ParallelStatus>;

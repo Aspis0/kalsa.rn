@@ -33,6 +33,15 @@ export type NativeSpeculativeParams = {
     };
 };
 export type NativeSpeculativeConfig = NativeSpeculativeParams | NativeSpeculativeType | boolean;
+export type GovernorThermoProfile = {
+    batt_temp_tenths_c: number;
+    batt_level_pct: number;
+    plugged: boolean;
+    sensor_valid: boolean;
+    t_idle_valid?: boolean;
+    t_idle_c?: number;
+    trend_c_per_min?: number;
+};
 export type NativeContextParams = {
     model: string;
     /**
@@ -77,7 +86,9 @@ export type NativeContextParams = {
      */
     n_gpu_layers?: number;
     /**
-     * Backend devices choice to use. Default equals to result of `getBackendDevicesInfo.
+     * Backend devices to use. If omitted, llama.rn uses the platform default selection.
+     * On Android, Hexagon is opt-in: use `['HTP0']` for one session, select multiple
+     * HTP devices explicitly, or use `['HTP*']` for every available HTP session.
      */
     devices?: Array<string>;
     /**
@@ -195,15 +206,6 @@ export type NativeContextParams = {
         reload_budget_available?: boolean;
         thermo: GovernorThermoProfile;
     };
-};
-export type GovernorThermoProfile = {
-    batt_temp_tenths_c: number;
-    batt_level_pct: number;
-    plugged: boolean;
-    sensor_valid: boolean;
-    t_idle_valid?: boolean;
-    t_idle_c?: number;
-    trend_c_per_min?: number;
 };
 export type GovernorStats = {
     active: boolean;
@@ -410,11 +412,11 @@ export type NativeCompletionParams = {
      */
     seed?: number;
     /**
-     * Guide tokens for the completion.
-     * Help prevent hallucinations by forcing the TTS to use the correct words.
-     * Default: `[]`
+     * Output token embeddings during generation.
+     * When enabled, completion results include generated token embeddings and their dimension.
+     * Default: `false`
      */
-    guide_tokens?: Array<number>;
+    embedding?: boolean;
     emit_partial_completion: boolean;
 };
 /**
@@ -518,6 +520,8 @@ export type NativeCompletionResult = {
     timings: NativeCompletionResultTimings;
     completion_probabilities?: Array<NativeCompletionTokenProb>;
     generated_token_ids?: Array<number>;
+    embeddings?: Array<number>;
+    embedding_dim?: number;
     audio_tokens?: Array<number>;
 };
 export type NativeTokenizeResult = {
@@ -635,6 +639,26 @@ export type NativeRerankParams = {
 export type NativeRerankResult = {
     score: number;
     index: number;
+};
+export type NativeBenchResult = {
+    n_kv_max: number;
+    n_batch: number;
+    n_ubatch: number;
+    flash_attn: number;
+    is_pp_shared: number;
+    n_gpu_layers: number;
+    n_threads: number;
+    n_threads_batch: number;
+    pp: number;
+    tg: number;
+    pl: number;
+    n_kv: number;
+    t_pp: number;
+    speed_pp: number;
+    t_tg: number;
+    speed_tg: number;
+    t: number;
+    speed: number;
 };
 export type NativeBackendDeviceInfo = {
     backend: string;

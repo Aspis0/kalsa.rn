@@ -1,5 +1,6 @@
 import './jsi';
 import type { NativeContextParams, NativeLlamaContext, NativeCompletionParams, NativeParallelCompletionParams, NativeCompletionTokenProb, NativeCompletionResult, NativeTokenizeResult, NativeEmbeddingResult, NativeSessionLoadResult, GovernorThermoProfile, GovernorStats, NativeEmbeddingParams, NativeRerankParams, NativeRerankResult, NativeCompletionTokenProbItem, NativeCompletionResultTimings, JinjaFormattedChatResult, FormattedChatResult, NativeImageProcessingResult, NativeBackendDeviceInfo, NativeSpeculativeConfig, NativeSpeculativeParams, NativeSpeculativeType, ParallelStatus, ParallelRequestStatus } from './types';
+import type { SpeakerPayload } from './tts-voices';
 export type RNLlamaMessagePart = {
     type: string;
     text?: string;
@@ -19,6 +20,9 @@ export type RNLlamaOAICompatibleMessage = {
 };
 export type { NativeContextParams, NativeLlamaContext, NativeCompletionParams, NativeParallelCompletionParams, NativeCompletionTokenProb, NativeCompletionResult, NativeTokenizeResult, NativeEmbeddingResult, NativeSessionLoadResult, GovernorThermoProfile, GovernorStats, NativeEmbeddingParams, NativeRerankParams, NativeRerankResult, NativeCompletionTokenProbItem, NativeCompletionResultTimings, FormattedChatResult, JinjaFormattedChatResult, NativeImageProcessingResult, NativeBackendDeviceInfo, NativeSpeculativeConfig, NativeSpeculativeParams, NativeSpeculativeType, ParallelStatus, ParallelRequestStatus, };
 export declare const RNLLAMA_MTMD_DEFAULT_MEDIA_MARKER = "<__media__>";
+export type { TTSCapabilities } from './tts';
+export { lookupVoice as getTTSVoice, listVoices as listTTSVoices, listLanguages as listTTSLanguages, } from './tts-voices';
+export type { OuteTTSWord, OuteTTSSpeaker, NeuTTSSpeaker, SpeakerPayload, } from './tts-voices';
 export declare const installJsi: () => Promise<void>;
 export type ToolCall = {
     type: 'function';
@@ -71,7 +75,7 @@ export type CompletionBaseParams = {
     chat_template?: string;
     jinja?: boolean;
     tools?: object;
-    parallel_tool_calls?: object;
+    parallel_tool_calls?: boolean;
     tool_choice?: string;
     response_format?: CompletionResponseFormat;
     media_paths?: string | string[];
@@ -117,6 +121,21 @@ export type BenchResult = {
     t: number;
     speed: number;
 };
+export declare class LlamaSpeaker {
+    readonly id: number;
+    readonly family: string;
+    rows: number;
+    baked: boolean;
+    private ctxId;
+    constructor(ctxId: number, h: {
+        id: number;
+        family: string;
+        rows: number;
+        baked: boolean;
+    });
+    bake(): Promise<void>;
+    release(): Promise<void>;
+}
 export declare class LlamaContext {
     id: number;
     gpu: boolean;
@@ -135,7 +154,7 @@ export declare class LlamaContext {
          * @param onToken Callback fired for each generated token
          * @returns Promise resolving to object with requestId, promise (resolves to completion result), and stop function
          */
-        completion: (params: ParallelCompletionParams, onToken?: ((requestId: number, data: TokenData) => void) | undefined) => Promise<{
+        completion: (params: ParallelCompletionParams, onToken?: (requestId: number, data: TokenData) => void) => Promise<{
             requestId: number;
             promise: Promise<NativeCompletionResult>;
             stop: () => Promise<void>;
@@ -197,7 +216,7 @@ export declare class LlamaContext {
         jinja?: boolean;
         response_format?: CompletionResponseFormat;
         tools?: object;
-        parallel_tool_calls?: object;
+        parallel_tool_calls?: boolean;
         tool_choice?: string;
         enable_thinking?: boolean;
         reasoning_format?: 'none' | 'auto' | 'deepseek';
@@ -206,7 +225,9 @@ export declare class LlamaContext {
         chat_template_kwargs?: ChatTemplateKwargs;
         force_pure_content?: boolean;
     }): Promise<FormattedChatResult | JinjaFormattedChatResult>;
-    completion(params: CompletionParams, callback?: (data: TokenData) => void): Promise<NativeCompletionResult>;
+    completion(params: CompletionParams & {
+        speaker?: LlamaSpeaker;
+    }, callback?: (data: TokenData) => void): Promise<NativeCompletionResult>;
     stopCompletion(): Promise<void>;
     tokenize(text: string, { media_paths: mediaPaths, }?: {
         media_paths?: string[];
@@ -245,17 +266,92 @@ export declare class LlamaContext {
         audio: boolean;
     }>;
     releaseMultimodal(): Promise<void>;
-    initVocoder({ path, n_batch: nBatch, }: {
+    /**
+     * Attach a codec / vocoder GGUF to this context, enabling the TTS API.
+     *
+     * **Experimental:** the TTS API may change without a major version bump, and
+     * output quality varies by model family and backend. See the "Tested models"
+     * table in the README.
+     */
+    initVocoder({ path, n_batch: nBatch, use_gpu: useGpu, }: {
         path: string;
         n_batch?: number;
+        use_gpu?: boolean;
     }): Promise<boolean>;
     isVocoderEnabled(): Promise<boolean>;
-    getFormattedAudioCompletion(speaker: object | null, textToSpeak: string): Promise<{
+    getTTSCapabilities(): Promise<import('./tts').TTSCapabilities>;
+    /**
+     * Build a formatted prompt for the loaded TTS model.
+     *
+     * Breaking change: takes an options object — the previous `(speaker, text)`
+     * positional signature has been removed.
+     *
+     * - `prompt` — text to speak. Phonemized if `phonemizer` is supplied.
+     * - `speaker` — built-in voice name (string), a structured speaker object
+     *   (shape depends on the model family — see `OuteTTSSpeaker` /
+     *   `NeuTTSSpeaker`), or `undefined` to fall back to the family default.
+     * - `phonemizer` — optional `(text, language) => string | Promise<string>`.
+     *   When set, `prompt` and `speaker.ref_text` (if missing `ref_phones`) go
+     *   through it. Models that need phonemes (NeuTTS) get off-distribution
+     *   text otherwise — caller's call.
+     * - `language` — phonemizer hook hint; defaults to capabilities.defaultLanguage.
+     */
+    getFormattedAudioCompletion(options: {
+        prompt: string;
+        speaker?: string | LlamaSpeaker | SpeakerPayload;
+        phonemizer?: (text: string, language: string) => string | Promise<string>;
+        language?: string;
+    }): Promise<{
         prompt: string;
         grammar?: string;
+        embedding: boolean;
+        flow: 'tokens' | 'continuous_embd' | '';
     }>;
-    getAudioCompletionGuideTokens(textToSpeak: string): Promise<Array<number>>;
-    decodeAudioTokens(tokens: number[]): Promise<Array<number>>;
+    decodeAudioTokens(tokens: number[] | Int32Array): Promise<Array<number>>;
+    /**
+     * DEPRECATED: source-compat wrapper for codec_lm-AR TTS.
+     *
+     * As of the "one completion API" refactor, codec_lm-AR models (CSM /
+     * Qwen3-TTS / MOSS-TTSD / MOSS-TTS-Realtime / Chatterbox) run through
+     * the standard `completion` loop with `flow = 'tokens'` and
+     * `embedding = true`.  The per-step codec_lm state machine that used
+     * to live inside this call is now a hook on the completion loop
+     * (`tryCodecLmAudioStep`); the codes get appended to
+     * `result.audio_tokens` the same way OuteTTS / Soprano / NeuTTS do.
+     *
+     * This method still works — internally it just primes params +
+     * speaker prefix, runs `completion`, and drains `audio_tokens` — but
+     * new callers should skip it and use `completion()` +
+     * `decodeAudioTokens` directly.
+     *
+     * `onFrame` (optional) fires after each AR step with that frame's
+     * codes for streaming UIs. It is fire-and-forget — its return value
+     * isn't read.
+     */
+    generateAudioCodes(options: {
+        prompt: string;
+        maxFrames?: number;
+        temperature?: number;
+        topP?: number;
+        topK?: number;
+        seed?: number;
+        onFrame?: (step: number, codes: number[]) => void;
+    }): Promise<{
+        codes: number[];
+        nCodebook: number;
+        nFrames: number;
+        stoppedOnEos: boolean;
+        aborted: boolean;
+    }>;
+    createSpeaker(config: {
+        refAudio: Float32Array | number[];
+        refAudioSampleRate: number;
+        refText?: string;
+        emotion?: number;
+        bake?: boolean;
+    }): Promise<LlamaSpeaker>;
+    decodeAudioEmbeddings(embeddings: number[] | Float32Array, embeddingDim: number): Promise<Array<number>>;
+    getAudioSampleRate(): Promise<number>;
     releaseVocoder(): Promise<void>;
     /**
      * Clear the KV cache and reset conversation state

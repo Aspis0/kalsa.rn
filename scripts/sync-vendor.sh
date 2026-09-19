@@ -86,6 +86,9 @@ LLAMA_CPP_PATHS=(
   ggml/src/ggml-cpu/ops.h
   ggml/src/ggml-cpu/quants.c
   ggml/src/ggml-cpu/quants.h
+  # kalsa addition (kalsallama): included by ggml-cpu.c, repack.cpp and
+  # traits.cpp, so a tree exported without it does not build.
+  ggml/src/ggml-cpu/repack-q23k.h
   ggml/src/ggml-cpu/repack.cpp
   ggml/src/ggml-cpu/repack.h
   ggml/src/ggml-cpu/simd-gemm.h
@@ -210,6 +213,17 @@ ensure_repo() {
   local name="$1" url="$2" ref="$3"
   local repo="$CACHE_DIR/$name"
 
+  # The cache is keyed on the dependency NAME, so the clone survives a change
+  # of $url: after repointing LLAMA_CPP_REPO (ggml-org -> our fork) a tag pin
+  # still resolves in the old clone, and the sync would populate vendor/ from
+  # the wrong repo with no error at all. Reuse only a clone of the same URL.
+  local cached_url
+  cached_url="$(git -C "$repo" remote get-url origin 2>/dev/null || true)"
+  if [ -n "$cached_url" ] && [ "$cached_url" != "$url" ]; then
+    log "Cache $repo is from $cached_url, not $url; re-cloning"
+    rm -rf "$repo"
+  fi
+
   if [ ! -d "$repo/.git" ]; then
     log "Cloning $url into $repo"
     mkdir -p "$CACHE_DIR"
@@ -306,9 +320,18 @@ generate_llama_cpp_version_files() {
   local commit
   commit="$(sed -n 's/^LLAMA_CPP_COMMIT=//p' "$VENDOR_DIR/VERSIONS")"
 
+  # The build number is a count over history, so a truncated (shallow) graph
+  # would be numbered as if the tree had always been that small. Refuse it.
+  if [ "$(git -C "$repo" rev-parse --is-shallow-repository)" = "true" ]; then
+    echo "$repo is a shallow clone: rev-list --count would number a truncated graph" >&2
+    exit 1
+  fi
   local build_number build_commit
   build_number="$(git -C "$repo" rev-list --count "$commit")"
-  build_commit="$(git -C "$repo" rev-parse --short=7 "$commit")"
+  # Pure truncation, not --short=7: that is a MINIMUM and grows on an ambiguous
+  # prefix. llama_commit() reports this string from the phone, so a longer one
+  # is a build that misreports which engine it is.
+  build_commit="${commit:0:7}"
 
   cmake_version() {  # <CMakeLists.txt path in upstream> <PREFIX>
     local file="$1" prefix="$2" major minor patch

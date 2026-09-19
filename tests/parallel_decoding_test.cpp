@@ -168,7 +168,15 @@ bool test_slot_mtp_params_and_reset() {
         slot.params_storage = params;
         slot.params = &slot.params_storage;
 
-        if (!slot.should_use_mtp()) return false;
+        // Diverges from upstream on purpose. Upstream's should_use_mtp() is a
+        // question about params alone, so a detached slot can answer it. Ours
+        // also answers "does the runtime permit MTP right now": it consults
+        // parent_ctx->hasGovernor() and the model's encoder/recurrent/hybrid
+        // capabilities, so it returns false without a context rather than
+        // dereferencing a null one. A detached slot therefore never claims
+        // MTP, and that is the property worth asserting here; the configured
+        // -> true case needs a loaded model and lives in the completion tests.
+        if (slot.should_use_mtp()) return false;
 
         slot.num_draft_tokens = 8;
         slot.num_draft_tokens_accepted = 6;

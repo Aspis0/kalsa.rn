@@ -14,6 +14,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  vendor:
+    # Unconditional on purpose: vendor/ is checked in and must stay valid on
+    # every branch, including `kalsa`, where the build jobs below are gated
+    # off. No `if:` here, so no gating is inherited or widened -- this job
+    # simply always runs, and it is the cheapest one in the file (a checkout
+    # and two shell assertions, no node setup).
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Assert the vendored engine tree
+        run: |
+          ./scripts/assert-kalsa-vendor.sh
+
   lint:
     runs-on: ubuntu-latest
     steps:

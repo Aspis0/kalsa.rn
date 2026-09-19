@@ -69,11 +69,14 @@ grep -q 'mparams.vocab_only' "$common_cpp" \
   || fail "upstream's vocab_only wiring is gone from common.cpp"
 
 # 3. the commit string the phone reports. A missing build-info.cpp is exactly
-# what a broken sync produces, so absence is a failure, never a skip.
+# what a broken sync produces, so absence is a failure, never a skip. The
+# statement is matched whole and anchored at both ends: a line that merely
+# contains LLAMA_COMMIT = "..." (a comment, a mention) is not a declaration.
 build_info="$LLAMA/common/build-info.cpp"
 [ -f "$build_info" ] || fail "missing $build_info -- a broken sync produces exactly this"
-commit=$(sed -n 's/.*LLAMA_COMMIT *= *"\([^"]*\)".*/\1/p' "$build_info")
-[ -n "$commit" ] || fail "could not read LLAMA_COMMIT from $build_info"
+commit=$(sed -n 's/^char const \* LLAMA_COMMIT *= *"\([^"]*\)";$/\1/p' "$build_info")
+[ -n "$commit" ] \
+  || fail "could not read LLAMA_COMMIT from $build_info -- the LLAMA_COMMIT declaration is gone"
 [ "${#commit}" = "7" ] \
   || fail "LLAMA_COMMIT is '${commit}' (${#commit} chars, want 7): --short=7 grew on an ambiguous prefix"
 

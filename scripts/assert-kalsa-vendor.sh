@@ -15,6 +15,9 @@
 #   4. the fork-only governor sources are under src/ -- everything in (1)
 #      and (2) comes from OUR patches, so (4) is what separates the
 #      kalsallama pin from a plain ggml-org tree with the same patches
+#   5. the committed lib/ output agrees with src/version.ts -- lib/ is what
+#      npm consumers read, and it has already drifted to a commit the pin
+#      had left behind
 #
 # (3) is the post-condition of a guard the old flattened-tree sync enforced at
 # the source: it wrote ${sha:0:7} rather than `git rev-parse --short=7`,
@@ -61,9 +64,11 @@ grep -q 'bool vocab_only' "$common_h" \
   || fail "upstream's vocab_only is gone from common.h"
 grep -q 'llama_progress_callback progress_callback' "$common_h" \
   || fail "upstream's progress_callback is gone from common.h"
-# Pin the 'void *' too: load_progress_callback_user_data shares the suffix,
-# and a bare-substring grep would pass on the wrong field.
-grep -q 'void \* progress_callback_user_data' "$common_h" \
+# Pin the 'void *' too -- load_progress_callback_user_data shares the suffix,
+# and a bare-substring grep would pass on the wrong field -- and anchor the
+# end of the declaration as well: progress_callback_user_data_fake satisfies
+# an unanchored pattern, which is exactly the drift this check exists to catch.
+grep -q '^[ \t]*void \* progress_callback_user_data *= *nullptr;$' "$common_h" \
   || fail "upstream's progress_callback_user_data is gone from common.h"
 grep -q 'mparams.vocab_only' "$common_cpp" \
   || fail "upstream's vocab_only wiring is gone from common.cpp"
@@ -87,8 +92,39 @@ for f in llama-governor.cpp llama-governor.h \
          llama-governor-metrics.cpp llama-governor-metrics.h \
          llama-governor-policy.cpp llama-governor-policy.h \
          llama-governor-runtime.cpp; do
-  [ -f "$LLAMA/src/$f" ] \
-    || fail "fork-only engine source missing: src/$f -- this is not the kalsallama pin"
+  p="$LLAMA/src/$f"
+  # -f follows symlinks, and an empty file has no content to be wrong. The
+  # claim being made is "this engine is our fork", and a filename does not
+  # make it: require a real, non-symlink, non-empty file that names the
+  # symbol the fork adds.
+  [ -f "$p" ] && [ ! -L "$p" ] && [ -s "$p" ] \
+    || fail "fork-only engine source missing, a symlink, or empty: src/$f -- this is not the kalsallama pin"
+  grep -q 'llama_governor' "$p" \
+    || fail "src/$f contains no llama_governor symbol -- a file with the right name alone is not the fork"
 done
 
-echo "assert-kalsa-vendor: ok (marker x1, kalsa_moe x1, upstream hunks present, governor src present)"
+# 5. the committed lib/ identity. src/version.ts is what the sync writes; lib/
+# is what package.json points consumers at, and it has already drifted once to
+# a commit the pin had left behind. This gate only compares -- npm run build
+# is the one generator, and a gate that regenerated would be a second one.
+lib_val() {
+  # First BUILD_<key> value in a file. The three generated version files quote
+  # differently (' in the JS, " in the .d.ts) and commonjs re-exports, so match
+  # any quoting after the key rather than a fixed layout.
+  sed -n "s/.*$2 *= *['\"]\([^'\"]*\)['\"].*/\1/p" "$1" | head -n 1
+}
+version_ts="$ROOT_DIR/src/version.ts"
+[ -f "$version_ts" ] || fail "missing $version_ts"
+src_number=$(lib_val "$version_ts" BUILD_NUMBER)
+src_commit=$(lib_val "$version_ts" BUILD_COMMIT)
+[ -n "$src_number" ] && [ -n "$src_commit" ] \
+  || fail "could not read BUILD_NUMBER/BUILD_COMMIT from $version_ts"
+for rel in lib/commonjs/version.js lib/module/version.js lib/typescript/version.d.ts; do
+  f="$ROOT_DIR/$rel"
+  [ -f "$f" ] || fail "missing $rel -- run npm run build to regenerate lib/"
+  [ "$(lib_val "$f" BUILD_NUMBER)" = "$src_number" ] \
+    && [ "$(lib_val "$f" BUILD_COMMIT)" = "$src_commit" ] \
+    || fail "$rel disagrees with src/version.ts (want $src_number/$src_commit) -- run npm run build"
+done
+
+echo "assert-kalsa-vendor: ok (marker x1, kalsa_moe x1, upstream hunks present, governor src real, lib/ matches src/version.ts)"

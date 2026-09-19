@@ -32,6 +32,25 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Every content check below is a line-oriented grep, and a grep cannot tell a
+# declaration from the same text sitting inside a comment. A hostile audit made
+# three of them pass against trees whose real declaration had been deleted and
+# replaced by a commented-out copy -- a file holding only `// llama_governor`
+# satisfied the fork check. So the checks read code, not text.
+#
+# perl is the only tool here that can span lines for /* ... */, and it is
+# present on both runners we use. Known limit, stated rather than hidden: a
+# literal "/*" inside a string would start a comment this filter believes in.
+# That direction fails loudly (the check stops matching), never silently.
+#
+# Callers must NOT pipe this into `grep -q`. `grep -q` exits at the first
+# match, perl takes SIGPIPE, and `set -o pipefail` above turns that into a
+# failed pipeline: a gate that goes red at random. Observed once in 26 runs
+# before this note existed. Feed a herestring or match in the shell instead.
+code_only() {
+  perl -0777 -pe 's{/\*.*?\*/}{}gs; s{//[^\n]*}{}g' "$1"
+}
 LLAMA="$ROOT_DIR/vendor/llama.cpp"
 
 fail() { echo "assert-kalsa-vendor: $*" >&2; exit 1; }
@@ -71,7 +90,8 @@ grep -q 'llama_progress_callback progress_callback' "$common_h" \
 # name is deliberately left open ([=;]): pinning `= nullptr` would turn an
 # upstream initializer change into a false alarm on a bump, and the point of
 # this whole tree is that bumps stay cheap.
-grep -qE '^[[:space:]]*void \* progress_callback_user_data[[:space:]]*[=;]' "$common_h" \
+grep -qE '^[[:space:]]*void \* progress_callback_user_data[[:space:]]*[=;]' \
+  <<< "$(code_only "$common_h")" \
   || fail "upstream's progress_callback_user_data is gone from common.h"
 grep -q 'mparams.vocab_only' "$common_cpp" \
   || fail "upstream's vocab_only wiring is gone from common.cpp"
@@ -102,8 +122,8 @@ for f in llama-governor.cpp llama-governor.h \
   # symbol the fork adds.
   [ -f "$p" ] && [ ! -L "$p" ] && [ -s "$p" ] \
     || fail "fork-only engine source missing, a symlink, or empty: src/$f -- this is not the kalsallama pin"
-  grep -q 'llama_governor' "$p" \
-    || fail "src/$f contains no llama_governor symbol -- a file with the right name alone is not the fork"
+  [[ "$(code_only "$p")" == *llama_governor* ]] \
+    || fail "src/$f names no llama_governor outside comments -- a file with the right name alone is not the fork"
 done
 
 # 5. the committed lib/ identity. src/version.ts is what the sync writes; lib/
@@ -114,7 +134,7 @@ lib_val() {
   # First BUILD_<key> value in a file. The three generated version files quote
   # differently (' in the JS, " in the .d.ts) and commonjs re-exports, so match
   # any quoting after the key rather than a fixed layout.
-  sed -n "s/.*$2 *= *['\"]\([^'\"]*\)['\"].*/\1/p" "$1" | head -n 1
+  sed -n "s/.*$2 *= *['\"]\([^'\"]*\)['\"].*/\1/p" <<< "$(code_only "$1")" | head -n 1
 }
 version_ts="$ROOT_DIR/src/version.ts"
 [ -f "$version_ts" ] || fail "missing $version_ts"

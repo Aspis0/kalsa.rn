@@ -5,6 +5,7 @@
 #include <rnllama/rn-completion.h>
 #include <rnllama/rn-slot.h>
 #include <rnllama/rn-slot-manager.h>
+#include <rnllama/rn-governor-params.h>
 #include <rnllama/chat.h>
 #include <rnllama/gguf.h>
 #include <rnllama/ggml-backend.h>
@@ -20,6 +21,7 @@
 #include "rn-completion.h"
 #include "rn-slot.h"
 #include "rn-slot-manager.h"
+#include "rn-governor-params.h"
 #include "chat.h"
 #include "gguf.h"
 #include "ggml-backend.h"

@@ -9,7 +9,6 @@
 #include "JSIRequestManager.h"
 #include "JSITaskManager.h"
 #include "JSINativeHeaders.h"
-#include "rn-governor-params.h"
 #include "llama-ext.h"
 #include "JSIJson.h"
 

@@ -1,7 +1,10 @@
 #!/bin/bash
 #
-# Asserts manifest coverage: every explicitly-named path the build compiles
-# exists in the tree.
+# Asserts two things about how the build is wired:
+#
+#   1. manifest coverage -- every explicitly-named path the build compiles
+#      exists in the tree;
+#   2. include style under cpp/jsi -- see the second block at the bottom.
 #
 # sync-vendor.sh exports whole directories AND explicitly-named files, so a
 # file upstream added that no pathspec names is silently absent from vendor/
@@ -98,3 +101,28 @@ EOF
   || fail "$missing of $count explicitly-named paths are absent from the tree"
 
 echo "assert-rnllama-sources: ok ($count explicitly-named paths resolve)"
+
+# With a prebuilt xcframework the pod compiles only cpp/jsi/**, and every engine
+# header comes from the framework, where the spelling is <rnllama/name.h> and
+# not "name.h". JSINativeHeaders.h is the single place that carries both forms.
+# A bare include anywhere else under cpp/jsi builds fine from source and fails
+# only in build-ios-frameworks, half an hour later and far from its cause.
+jsi_checked=0
+jsi_bad=0
+while IFS= read -r f; do
+  case "$(basename "$f")" in JSINativeHeaders.h) continue ;; esac
+  jsi_checked=$((jsi_checked + 1))
+  while IFS= read -r h; do
+    if [ -e "$ROOT_DIR/cpp/$h" ] && [ ! -e "$ROOT_DIR/cpp/jsi/$h" ]; then
+      echo "assert-rnllama-sources: cpp/jsi/$(basename "$f") includes \"$h\", a cpp/ root header" >&2
+      jsi_bad=$((jsi_bad + 1))
+    fi
+  done < <(sed -n 's/^[[:space:]]*#include[[:space:]]*"\([^"/]*\.h\)".*/\1/p' "$f")
+done < <(find "$ROOT_DIR/cpp/jsi" -maxdepth 1 -type f \( -name '*.cpp' -o -name '*.h' \))
+
+[ "$jsi_checked" -ge 1 ] \
+  || fail "found no sources under cpp/jsi -- the layout changed, fix this check"
+[ "$jsi_bad" = 0 ] \
+  || fail "$jsi_bad bare include(s) of a cpp/ root header under cpp/jsi -- route them through JSINativeHeaders.h, both branches"
+
+echo "assert-rnllama-sources: ok ($jsi_checked cpp/jsi sources use framework-safe includes)"

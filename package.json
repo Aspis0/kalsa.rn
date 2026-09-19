@@ -121,7 +121,6 @@
     "modulePathIgnorePatterns": [
       "<rootDir>/example/node_modules",
       "<rootDir>/lib/",
-      "<rootDir>/third_party/",
       "<rootDir>/tmp/",
       "<rootDir>/vendor/"
     ],
@@ -241,7 +240,6 @@
     "*.d.ts",
     "tests/build/",
     "tests/build-metal/",
-    "third_party/",
     "tmp/",
     "vendor/",
     "build/",

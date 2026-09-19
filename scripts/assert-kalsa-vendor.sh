@@ -16,7 +16,7 @@
 #      and (2) comes from OUR patches, so (4) is what separates the
 #      kalsallama pin from a plain ggml-org tree with the same patches
 #
-# (3) is the post-condition of a guard the old sync-kalsallama.sh enforced at
+# (3) is the post-condition of a guard the old flattened-tree sync enforced at
 # the source: it wrote ${sha:0:7} rather than `git rev-parse --short=7`,
 # because --short=7 is a MINIMUM and grows on an ambiguous prefix. The phone
 # reports this string through llama_commit(), so a drift there is a build that

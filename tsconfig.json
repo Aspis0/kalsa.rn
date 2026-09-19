@@ -31,7 +31,6 @@
   "exclude": [
     "**/node_modules",
     "**/Pods",
-    "third_party",
     "tests",
     "tmp",
     "vendor",

@@ -385,8 +385,9 @@ sync_dep codec.cpp CODEC_CPP
 sync_dep OpenCL-Headers OPENCL_HEADERS
 sync_dep OpenCL-ICD-Loader OPENCL_ICD_LOADER
 
-# Gate the result: the assertion grades the vendored tree itself, so a bad
+# Gate the result: the assertions grade the vendored tree itself, so a bad
 # sync is loud here instead of surfacing as a build failure far from its cause.
 "$ROOT_DIR/scripts/assert-kalsa-vendor.sh"
+"$ROOT_DIR/scripts/assert-rnllama-sources.sh"
 
 log "Done. Review with: git status vendor src/version.ts"

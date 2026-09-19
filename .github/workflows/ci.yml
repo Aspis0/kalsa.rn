@@ -28,6 +28,7 @@ jobs:
       - name: Assert the vendored engine tree
         run: |
           ./scripts/assert-kalsa-vendor.sh
+          ./scripts/assert-rnllama-sources.sh
 
   lint:
     runs-on: ubuntu-latest

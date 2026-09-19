@@ -987,7 +987,7 @@ void RouterHook::build_spec_lists(const std::vector<float> & scores,
 
 // At the topk of layer il, with the routing ids in hand: sample the watchdog, then submit the
 // prediction job for layer il+2 built from THIS layer's gate input.
-void RouterHook::predict_at_topk(ggml_tensor * t, int il, int nu, int nt) {
+void RouterHook::predict_at_topk(int il, int nu, int nt) {
     if (!predict_prefetch_ || wd_tripped_ || batch_phase_ != 1 || !source_) return;
     if (il < 0 || il >= n_layer_ || nu <= 0 || nu > predict_max_k || nt <= 0) return;
     ggml_tensor * h = h_t_[il];
@@ -1444,7 +1444,7 @@ bool RouterHook::on_eval(ggml_tensor * t, bool ask) {
         // Watchdog sample + submit the il+2 prediction job. Before the load flow on purpose: the
         // snapshot must precede load_layer, whose staging would otherwise count this layer's own
         // reads into the residency picture the job carries.
-        predict_at_topk(t, il, nu, nt);
+        predict_at_topk(il, nu, nt);
 
         // Open the layer for the drop policy. Deferring the load is only safe once this layer's
         // terminal weight node is known — otherwise there is no callback left to decide in, and the

@@ -27,7 +27,11 @@
 #ifndef MAP_NORESERVE
 #define MAP_NORESERVE 0 // absent on some BSDs; the mapping is simply charged as usual there
 #endif
-#if defined(__ANDROID__)
+// AHardwareBuffer_* carry an availability attribute: the NDK rejects a call to them
+// when __ANDROID_API__ is below 26, and llama.rn builds at minSdk 23. Below that the
+// #else branch of the pinned_* block reports "unsupported" and callers fall back to an
+// ordinary allocation, which is the contract this file already documents.
+#if defined(__ANDROID__) && __ANDROID_API__ >= 26
 #include <android/hardware_buffer.h> // reclaim-exempt allocation; see pinned_alloc
 #endif
 #endif
@@ -368,7 +372,7 @@ bool file_mapped_regions(const char * basename, std::vector<MappedRegion> & out)
 // Shared across platforms because only Android has one: everywhere else this reports "unsupported"
 // and callers fall back to an ordinary allocation. Declared in the header with the measured
 // properties and the reason the ceiling is a lock boundary rather than an allocation one.
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) && __ANDROID_API__ >= 26
 
 size_t pinned_max_bytes() {
     // The lock path uses a signed 32-bit type: AHardwareBuffer_lock returns EINVAL at exactly 2^31

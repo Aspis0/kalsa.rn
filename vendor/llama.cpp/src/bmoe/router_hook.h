@@ -403,7 +403,7 @@ private:
                                  std::vector<int32_t> & keep);
     void predict_at_logits(ggml_tensor * logits, int il);
     void score_layer(int il, const int32_t * actual, int nu);
-    void predict_at_topk(ggml_tensor * t, int il, int nu, int nt); // watchdog + job submission
+    void predict_at_topk(int il, int nu, int nt); // watchdog + job submission
     void predict_after_load(int il);                               // collect + issue once il's load is behind us
 
     // The probe's maximum prediction width. A routing wider than this would be scored against a

@@ -16,9 +16,8 @@ concurrency:
 jobs:
   vendor:
     # Unconditional on purpose: vendor/ is checked in and must stay valid on
-    # every branch, including `kalsa`, where the build jobs below are gated
-    # off. No `if:` here, so no gating is inherited or widened -- this job
-    # simply always runs, and it is the cheapest one in the file (a checkout
+    # every branch. No `if:` here, so no gating is inherited or widened -- this
+    # job simply always runs, and it is the cheapest one in the file (a checkout
     # and two shell assertions, no node setup).
     runs-on: ubuntu-latest
     steps:
@@ -59,24 +58,12 @@ jobs:
       - name: Run ts unit tests
         run: npm test -- --maxWorkers=2 --coverage
 
-      # Red on `kalsa` for one reason now; this commit closes the other. Run
-      # 35360547883 died on `cpp/llama-kv-cache-iswa.cpp:97: error:
-      # 'runtime_error' is not a member of 'std'` — the file missed <stdexcept>,
-      # which clang forgives and GCC does not — and the pin bump in this commit
-      # brings kalsallama's fixed copy (src/llama-kv-cache-iswa.cpp:9).
-      #
-      # What is left is structural and cannot be fixed from inside this repo.
-      # tests/CMakeLists.txt:91 puts cpp/rn-llama.cpp in RNLLAMA_COMMON_SOURCES,
-      # so every test target compiles it, and cpp/rn-llama.cpp:2 includes
-      # "bmoe_stream.h" — a header that lives in the app repo (native/bmoe/rn)
-      # by design and is not checked out here. Two TUs are missing besides: that
-      # file's globs take llama*.cpp but nothing lists cpp/rn-governor.cpp or
-      # cpp/rn-governor-params.cpp, so rn_governor would fail at link even with
-      # the header. Un-gating therefore means putting a private sibling repo
-      # inside this job — a PAT or deploy key in this repo's secrets — which is
-      # Marco's call, not a side effect of a pin bump.
+      # Un-gated now that the engine is fully vendored: bmoe_stream.h/.cpp live
+      # in cpp/, the engine core in vendor/llama.cpp/src/bmoe/. For the record,
+      # run 35360547883 died on llama-kv-cache-iswa.cpp:97 — 'runtime_error' is
+      # not a member of 'std', the file missed <stdexcept>, which clang forgives
+      # and GCC does not; the live vendored copy carries the include (line 9).
       - name: Run c++ unit tests
-        if: github.ref != 'refs/heads/kalsa'
         run: |
           cd tests
           chmod +x build_and_test.sh run_tests.sh
@@ -84,9 +71,6 @@ jobs:
           ./run_tests.sh
 
   build-ios-from-source:
-    # `github.ref` is refs/pull/<n>/merge on a PR, so the ref test alone lets a
-    # kalsa -> main PR run these against the kalsallama cpp/ they cannot build.
-    if: github.head_ref != 'kalsa' && github.ref != 'refs/heads/kalsa'
     runs-on: macos-26
     steps:
       - name: Checkout
@@ -120,9 +104,6 @@ jobs:
           npm run build:ios
 
   build-ios-frameworks:
-    # `github.ref` is refs/pull/<n>/merge on a PR, so the ref test alone lets a
-    # kalsa -> main PR run these against the kalsallama cpp/ they cannot build.
-    if: github.head_ref != 'kalsa' && github.ref != 'refs/heads/kalsa'
     runs-on: macos-26
     steps:
       - name: Checkout
@@ -162,9 +143,6 @@ jobs:
           npm run build:ios
 
   build-android-from-source:
-    # `github.ref` is refs/pull/<n>/merge on a PR, so the ref test alone lets a
-    # kalsa -> main PR run these against the kalsallama cpp/ they cannot build.
-    if: github.head_ref != 'kalsa' && github.ref != 'refs/heads/kalsa'
     runs-on: ubuntu-latest
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
@@ -235,9 +213,6 @@ jobs:
           ccache --show-stats
 
   build-android-libs:
-    # `github.ref` is refs/pull/<n>/merge on a PR, so the ref test alone lets a
-    # kalsa -> main PR run these against the kalsallama cpp/ they cannot build.
-    if: github.head_ref != 'kalsa' && github.ref != 'refs/heads/kalsa'
     runs-on: ubuntu-latest
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache

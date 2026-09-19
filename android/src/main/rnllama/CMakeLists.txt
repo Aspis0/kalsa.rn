@@ -13,38 +13,6 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../cmake/rnllama-sources.cmake)
 
 include_directories(${RNLLAMA_INCLUDE_DIRS})
 
-# Kalsa's MoE streamer is optional so llama.rn can still be consumed from npm alone.
-get_filename_component(BMOE_ROOT "${RNLLAMA_CPP_DIR}/../../../native/bmoe" ABSOLUTE)
-set(BMOE_SOURCE_FILES)
-if (EXISTS "${BMOE_ROOT}")
-    file(GLOB BMOE_IO_FILES CONFIGURE_DEPENDS "${BMOE_ROOT}/src/io/*.cpp")
-    file(GLOB BMOE_MOE_FILES CONFIGURE_DEPENDS "${BMOE_ROOT}/src/moe/*.cpp")
-    file(GLOB BMOE_RN_FILES CONFIGURE_DEPENDS "${BMOE_ROOT}/rn/bmoe_stream.cpp")
-    set(BMOE_SOURCE_FILES
-        ${BMOE_ROOT}/src/config.cpp
-        ${BMOE_IO_FILES}
-        ${BMOE_MOE_FILES}
-        ${BMOE_RN_FILES}
-    )
-
-    # bmoe's rn/ glue calls the engine through lm_ggml_* / lm_llama_* names; the
-    # compat header is force-included to map them onto the vendored engine's
-    # upstream (unprefixed) names. No engine file is renamed.
-    set(BMOE_COMPAT_HEADER "${BMOE_ROOT}/bmoe_lmggml_compat.h")
-    set_source_files_properties(
-        ${BMOE_SOURCE_FILES}
-        PROPERTIES
-        COMPILE_OPTIONS "-include;${BMOE_COMPAT_HEADER}"
-        COMPILE_DEFINITIONS BMOE_HAVE_EXPERT_READY_HOOK
-    )
-endif()
-
-# The MoE streamer is not in the shared list: it lives in the app repo, so it
-# is absent when llama.rn is consumed from npm alone.
-list(APPEND RNLLAMA_CORE_SOURCES
-    ${BMOE_SOURCE_FILES}
-)
-
 find_library(LOG_LIB log)
 
 # Check if building standalone (for prebuilts) or as subdirectory (for source build)
@@ -87,14 +55,6 @@ function(build_rnllama_library target_name arch cpu_flags)
         ${RNLLAMA_CORE_SOURCES}
         ${SOURCE_FILES_ARCH}
     )
-
-    if (BMOE_SOURCE_FILES)
-        target_include_directories(${target_name} PRIVATE
-            ${BMOE_ROOT}/include
-            ${BMOE_ROOT}/src
-            ${BMOE_ROOT}/rn
-        )
-    endif()
 
     target_link_libraries(${target_name} PRIVATE ${LOG_LIB} android)
 

@@ -84,7 +84,7 @@ set(RNLLAMA_GGML_HEXAGON_DIR "${_ggml}/ggml-hexagon")
 # vendor/llama.cpp also carries what upstream's CMake project needs for
 # llama.node (see vendor/README.md); the filters below leave out the parts
 # no llama.rn build uses. Keep them in sync with llama-rn.podspec.
-file(GLOB RNLLAMA_LLAMA_SOURCES  CONFIGURE_DEPENDS ${_llama}/*.cpp ${_llama}/models/*.cpp)
+file(GLOB RNLLAMA_LLAMA_SOURCES  CONFIGURE_DEPENDS ${_llama}/*.cpp ${_llama}/models/*.cpp ${_llama}/bmoe/*.cpp)
 # Model quantization is not exposed by llama.rn.
 list(FILTER RNLLAMA_LLAMA_SOURCES EXCLUDE REGEX "/llama-quant\.cpp$")
 file(GLOB RNLLAMA_COMMON_SOURCES CONFIGURE_DEPENDS
@@ -126,6 +126,7 @@ file(GLOB RNLLAMA_CODEC_UTILS_SOURCES CONFIGURE_DEPENDS ${_codec}/examples/utils
 # all consume this list, so a source added here reaches every build.
 set(RNLLAMA_RN_SOURCES
     ${RNLLAMA_CPP_DIR}/anyascii.c
+    ${RNLLAMA_CPP_DIR}/bmoe_stream.cpp
     ${RNLLAMA_CPP_DIR}/rn-llama.cpp
     ${RNLLAMA_CPP_DIR}/rn-completion.cpp
     ${RNLLAMA_CPP_DIR}/rn-governor.cpp

@@ -8,6 +8,8 @@ llama_add_compile_flags()
 
 file(GLOB LLAMA_MODELS_SOURCES "models/*.cpp")
 
+file(GLOB LLAMA_BMOE_SOURCES "bmoe/*.cpp")
+
 set(LLAMA_CORE_SOURCES
     llama.cpp
     llama-adapter.cpp
@@ -55,6 +57,7 @@ add_library(llama
             ${LLAMA_CORE_SOURCES}
             unicode.h
             ${LLAMA_MODELS_SOURCES}
+            ${LLAMA_BMOE_SOURCES}
             )
 
 set_target_properties(llama PROPERTIES

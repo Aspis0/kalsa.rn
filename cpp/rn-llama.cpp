@@ -20,6 +20,10 @@
 #include <fstream>
 #include <stdexcept>
 
+#if defined(__ANDROID__)
+#include <android/set_abort_message.h>
+#endif
+
 namespace rnllama {
 
 namespace {
@@ -146,35 +150,107 @@ bool load_governor_models(llama_rn_context & owner,
 
 } // namespace
 
-std::string get_backend_devices_info() {
+size_t backend_dev_count() {
+    return ggml_backend_dev_count();
+}
+
+ggml_backend_dev_t backend_dev_get(size_t index) {
+    return ggml_backend_dev_get(index);
+}
+
+const char * backend_dev_name(ggml_backend_dev_t dev) {
+    return dev ? ggml_backend_dev_name(dev) : nullptr;
+}
+
+enum ggml_backend_dev_type backend_dev_type(ggml_backend_dev_t dev) {
+    return ggml_backend_dev_type(dev);
+}
+
+const char * backend_dev_reg_name(ggml_backend_dev_t dev) {
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    return reg ? ggml_backend_reg_name(reg) : nullptr;
+}
+
+std::string backend_dev_device_id(ggml_backend_dev_t dev) {
+    if (!dev) {
+        return "";
+    }
+    ggml_backend_dev_props props;
+    ggml_backend_dev_get_props(dev, &props);
+    return props.device_id ? props.device_id : "";
+}
+
+ggml_backend_buffer_type_t backend_cpu_buffer_type() {
+    return ggml_backend_cpu_buffer_type();
+}
+
+bool read_gguf_file_info(const std::string & path, gguf_file_info & info) {
+    struct gguf_init_params params = {
+        /*.no_alloc = */ false,
+        /*.ctx      = */ NULL,
+    };
+    struct gguf_context * ctx = gguf_init_from_file(path.c_str(), params);
+    if (!ctx) {
+        return false;
+    }
+    info.version = gguf_get_version(ctx);
+    info.alignment = gguf_get_alignment(ctx);
+    info.data_offset = gguf_get_data_offset(ctx);
+    const int n_kv = gguf_get_n_kv(ctx);
+    info.kv.clear();
+    info.kv.reserve(n_kv);
+    for (int i = 0; i < n_kv; ++i) {
+        info.kv.emplace_back(gguf_get_key(ctx, i), gguf_kv_to_str(ctx, i));
+    }
+    gguf_free(ctx);
+    return true;
+}
+
+json get_backend_devices_info() {
     return backend_devices_info();
 }
 
-static const std::vector<lm_ggml_type> kv_cache_types = {
-    LM_GGML_TYPE_F32,
-    LM_GGML_TYPE_F16,
-    LM_GGML_TYPE_BF16,
-    LM_GGML_TYPE_Q8_0,
-    LM_GGML_TYPE_Q4_0,
-    LM_GGML_TYPE_Q4_1,
-    LM_GGML_TYPE_IQ4_NL,
-    LM_GGML_TYPE_Q5_0,
-    LM_GGML_TYPE_Q5_1,
+// ggml only prints its fatal assertion message to stderr, which logcat does not capture, so an
+// Android crash report would carry just a SIGABRT backtrace. Forward the message to the platform
+// log (and to the tombstone) before the process aborts.
+static void ggml_abort_log_callback(const char *message) {
+    log("ERROR", "ggml_abort", 0, "%s", message);
+#if defined(__ANDROID__)
+    android_set_abort_message(message);
+#else
+    fprintf(stderr, "%s\n", message);
+#endif
+}
+
+void install_ggml_abort_handler() {
+    ggml_set_abort_callback(ggml_abort_log_callback);
+}
+
+static const std::vector<ggml_type> kv_cache_types = {
+    GGML_TYPE_F32,
+    GGML_TYPE_F16,
+    GGML_TYPE_BF16,
+    GGML_TYPE_Q8_0,
+    GGML_TYPE_Q4_0,
+    GGML_TYPE_Q4_1,
+    GGML_TYPE_IQ4_NL,
+    GGML_TYPE_Q5_0,
+    GGML_TYPE_Q5_1,
 };
 
-lm_ggml_type kv_cache_type_from_str(const std::string & s) {
+ggml_type kv_cache_type_from_str(const std::string & s) {
     if (s.empty()) {
-        return LM_GGML_TYPE_F16; // Default to F16 if empty string
+        return GGML_TYPE_F16; // Default to F16 if empty string
     }
 
     for (const auto & type : kv_cache_types) {
-        if (lm_ggml_type_name(type) == s) {
+        if (ggml_type_name(type) == s) {
             return type;
         }
     }
 
     // Return default type instead of throwing to avoid crashes
-    return LM_GGML_TYPE_F16;
+    return GGML_TYPE_F16;
 }
 
 enum llama_flash_attn_type flash_attn_type_from_str(const std::string & s) {
@@ -476,12 +552,12 @@ void llama_rn_context::cleanupThreadpools() {
     }
 
     if (threadpool_batch != nullptr) {
-        lm_ggml_threadpool_free(threadpool_batch);
+        ggml_threadpool_free(threadpool_batch);
         threadpool_batch = nullptr;
     }
 
     if (threadpool != nullptr) {
-        lm_ggml_threadpool_free(threadpool);
+        ggml_threadpool_free(threadpool);
         threadpool = nullptr;
     }
 }
@@ -494,7 +570,7 @@ bool llama_rn_context::attachThreadpoolsIfAvailable() {
         return false;
     }
 
-    lm_ggml_backend_dev_t cpu_dev = lm_ggml_backend_dev_by_type(LM_GGML_BACKEND_DEVICE_TYPE_CPU);
+    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (cpu_dev == nullptr) {
         LOG_WARNING("No CPU backend available; skipping threadpool attachment");
         return false;
@@ -502,10 +578,10 @@ bool llama_rn_context::attachThreadpoolsIfAvailable() {
 
     cleanupThreadpools();
 
-    lm_ggml_threadpool_params tpp =
-        lm_ggml_threadpool_params_from_cpu_params(params.cpuparams);
-    lm_ggml_threadpool_params tpp_batch =
-        lm_ggml_threadpool_params_from_cpu_params(params.cpuparams_batch);
+    ggml_threadpool_params tpp =
+        ggml_threadpool_params_from_cpu_params(params.cpuparams);
+    ggml_threadpool_params tpp_batch =
+        ggml_threadpool_params_from_cpu_params(params.cpuparams_batch);
 
     if (tpp.n_threads <= 0) {
         LOG_WARNING("Skipping threadpool attachment (n_threads = %d)", tpp.n_threads);
@@ -513,11 +589,11 @@ bool llama_rn_context::attachThreadpoolsIfAvailable() {
     }
 
     bool need_batch_pool =
-        !lm_ggml_threadpool_params_match(&tpp, &tpp_batch) && tpp_batch.n_threads > 0;
+        !ggml_threadpool_params_match(&tpp, &tpp_batch) && tpp_batch.n_threads > 0;
 
-    lm_ggml_threadpool *new_batch = nullptr;
+    ggml_threadpool *new_batch = nullptr;
     if (need_batch_pool) {
-        new_batch = lm_ggml_threadpool_new(&tpp_batch);
+        new_batch = ggml_threadpool_new(&tpp_batch);
         if (new_batch == nullptr) {
             LOG_WARNING("Failed to create batch threadpool (n_threads=%d)", tpp_batch.n_threads);
             return false;
@@ -525,11 +601,11 @@ bool llama_rn_context::attachThreadpoolsIfAvailable() {
         tpp.paused = true;
     }
 
-    lm_ggml_threadpool *new_threadpool = lm_ggml_threadpool_new(&tpp);
+    ggml_threadpool *new_threadpool = ggml_threadpool_new(&tpp);
     if (new_threadpool == nullptr) {
         LOG_WARNING("Failed to create threadpool (n_threads=%d)", tpp.n_threads);
         if (new_batch != nullptr) {
-            lm_ggml_threadpool_free(new_batch);
+            ggml_threadpool_free(new_batch);
         }
         return false;
     }
@@ -655,6 +731,13 @@ bool llama_rn_context::loadModel(
     }
     draft_model.reset();
     params = params_;
+
+    // common_init_from_params() now creates its threadpools directly, so CPU
+    // defaults must be resolved just as the upstream CLI parser resolves them.
+    // In particular, n_threads_batch=-1 means "inherit n_threads"; passing -1
+    // to ggml_threadpool_new underflows its worker count.
+    postprocess_cpu_params(params.cpuparams);
+    postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
 
     // Ensure n_parallel is set to a reasonable default for parallel decoding support
     // This sets n_seq_max in the context, which cannot be changed later
@@ -1054,9 +1137,9 @@ void llama_rn_context::setMediaHashes(const std::vector<std::string> &hashes) {
     }
 }
 
-bool llama_rn_context::initVocoder(const std::string &vocoder_model_path, int batch_size) {
+bool llama_rn_context::initVocoder(const std::string &vocoder_model_path, int batch_size, bool use_gpu) {
     try {
-        tts_wrapper = new llama_rn_context_tts(vocoder_model_path, batch_size);
+        tts_wrapper = new llama_rn_context_tts(vocoder_model_path, batch_size, use_gpu);
         has_vocoder = true;
         return true;
     } catch (const std::exception& e) {

@@ -33,6 +33,11 @@
     "**/Pods",
     "third_party",
     "tests",
-    "tmp"
+    "tmp",
+    "vendor",
+    "build",
+    "build-host",
+    "example/android",
+    "example/ios"
   ]
 }

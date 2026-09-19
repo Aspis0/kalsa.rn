@@ -85,6 +85,8 @@ struct llama_rn_context_completion {
     bool has_next_token = false;
     std::string prefill_text;
     std::string generated_text;
+    std::vector<float> embeddings;
+    int embedding_dim = 0;
     utf8_stream_gate utf8_gate;
     std::vector<llama_token> generated_token_ids;
     int32_t bench_raw_probs = 0;
@@ -230,7 +232,7 @@ struct llama_rn_context_completion {
     std::vector<float> rerank(const std::string &query, const std::vector<std::string> &documents);
 
     // Benchmarking methods
-    std::string bench(int pp, int tg, int pl, int nr);
+    json bench(int pp, int tg, int pl, int nr);
 
     // Multimodal processing methods
     void processMedia(

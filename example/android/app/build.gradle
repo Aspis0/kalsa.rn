@@ -7,11 +7,15 @@ def rnllamaBuildFromSource = project.findProperty("rnllamaBuildFromSource")?.toS
 
 if (rnllamaBuildFromSource) {
     def openCLScript = new File(repoRootDir, "scripts/build-opencl.sh")
-    def openCLArtifacts = [new File(repoRootDir, "bin/arm64-v8a/libOpenCL.so")]
+    // The opencl variant links the libOpenCL.so stub that build-opencl.sh
+    // produces from the vendored OpenCL-ICD-Loader.
+    def openCLArtifacts = [
+        new File(repoRootDir, "bin/arm64-v8a/libOpenCL.so"),
+    ]
 
     tasks.register("prepareOpenCL", Exec) {
         group = "build"
-        description = "Builds the OpenCL loader when libOpenCL.so is not present."
+        description = "Builds the OpenCL loader when libOpenCL.so or its headers are missing."
         workingDir(repoRootDir)
         commandLine(openCLScript.absolutePath)
         onlyIf {
@@ -20,19 +24,26 @@ if (rnllamaBuildFromSource) {
     }
 
     def htpScript = new File(repoRootDir, "scripts/build-hexagon-htp.sh")
+    def htpSourceDir = new File(repoRootDir, "vendor/llama.cpp/ggml/src/ggml-hexagon/htp")
     def htpInputs = files(
         htpScript,
-        new File(repoRootDir, "cpp/ggml-hexagon/htp/CMakeLists.txt"),
-        new File(repoRootDir, "cpp/ggml-hexagon/htp/htp_iface.idl"),
+        new File(htpSourceDir, "CMakeLists.txt"),
+        new File(htpSourceDir, "htp_iface.idl"),
     )
     def htpArtifacts = files(
         new File(repoRootDir, "bin/arm64-v8a/libggml-htp-v73.so"),
         new File(repoRootDir, "bin/arm64-v8a/libggml-htp-v75.so"),
         new File(repoRootDir, "bin/arm64-v8a/libggml-htp-v79.so"),
         new File(repoRootDir, "bin/arm64-v8a/libggml-htp-v81.so"),
-        new File(repoRootDir, "cpp/ggml-hexagon/htp/v73/htp_iface.h"),
-        new File(repoRootDir, "cpp/ggml-hexagon/htp/v73/htp_iface_stub.c"),
+        new File(htpSourceDir, "v73/htp_iface.h"),
+        new File(htpSourceDir, "v73/htp_iface_stub.c"),
     )
+
+    // A fresh CI runner has no Gradle task history, so prepareHTP would rebuild the
+    // DSP libraries even when a cache already restored artifacts built from these
+    // exact inputs. CI sets this after a cache hit, where the cache key is the hash
+    // of htpInputs; local builds keep the normal up-to-date checks.
+    def htpArtifactsUpToDate = project.findProperty("rnllamaHtpArtifactsUpToDate")?.toString()?.toBoolean() ?: false
 
     tasks.register("prepareHTP", Exec) {
         group = "build"
@@ -41,11 +52,13 @@ if (rnllamaBuildFromSource) {
         commandLine(htpScript.absolutePath)
         inputs.files(htpInputs)
         outputs.files(htpArtifacts)
+        onlyIf {
+            !(htpArtifactsUpToDate && htpArtifacts.files.every { it.exists() })
+        }
     }
 
     tasks.named("preBuild").configure {
         dependsOn("prepareOpenCL", "prepareHTP")
-        delete(repoRootDir.absolutePath + "android/.cxx") // Clear cache of llama.rn
     }
 }
 

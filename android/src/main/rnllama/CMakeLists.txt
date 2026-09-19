@@ -2,37 +2,19 @@ cmake_minimum_required(VERSION 3.12)
 
 project(rnllama)
 
+include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/rnllama-build-options.cmake)
+
 option(HEXAGON_SDK_ROOT "Hexagon SDK root directory" OFF)
 option(HEXAGON_TOOLS_ROOT "Hexagon SDK toolchain directory" OFF)
 
 find_package(Python3 REQUIRED)
 set(CMAKE_CXX_STANDARD 17)
-# Use CMAKE_CURRENT_SOURCE_DIR to work correctly both standalone and as subdirectory
-set(RNLLAMA_LIB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../../cpp)
+include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../cmake/rnllama-sources.cmake)
 
-include_directories(
-    ${RNLLAMA_LIB_DIR}
-    ${RNLLAMA_LIB_DIR}/common
-    ${RNLLAMA_LIB_DIR}/common/jinja
-    ${RNLLAMA_LIB_DIR}/ggml-cpu
-    # vendored sha256.c includes "rotate-bits/rotate-bits.h" from the hash root
-    ${RNLLAMA_LIB_DIR}/hash
-    ${RNLLAMA_LIB_DIR}/tools/mtmd
-)
-
-# Collect source files using glob patterns
-file(GLOB MODEL_FILES CONFIGURE_DEPENDS ${RNLLAMA_LIB_DIR}/models/*.cpp)
-file(GLOB GGML_CPU_C_FILES CONFIGURE_DEPENDS ${RNLLAMA_LIB_DIR}/ggml-cpu/*.c)
-file(GLOB GGML_CPU_CPP_FILES CONFIGURE_DEPENDS ${RNLLAMA_LIB_DIR}/ggml-cpu/*.cpp)
-file(GLOB GGML_CPU_AMX_FILES CONFIGURE_DEPENDS ${RNLLAMA_LIB_DIR}/ggml-cpu/amx/*.cpp)
-file(GLOB LLAMA_FILES CONFIGURE_DEPENDS ${RNLLAMA_LIB_DIR}/llama*.cpp)
-file(GLOB MTMD_FILES CONFIGURE_DEPENDS ${RNLLAMA_LIB_DIR}/tools/mtmd/*.cpp)
-file(GLOB MTMD_MODEL_FILES CONFIGURE_DEPENDS ${RNLLAMA_LIB_DIR}/tools/mtmd/models/*.cpp)
-file(GLOB COMMON_FILES CONFIGURE_DEPENDS ${RNLLAMA_LIB_DIR}/common/*.cpp)
-file(GLOB JINJA_FILES CONFIGURE_DEPENDS ${RNLLAMA_LIB_DIR}/common/jinja/*.cpp)
+include_directories(${RNLLAMA_INCLUDE_DIRS})
 
 # Kalsa's MoE streamer is optional so llama.rn can still be consumed from npm alone.
-get_filename_component(BMOE_ROOT "${RNLLAMA_LIB_DIR}/../../../native/bmoe" ABSOLUTE)
+get_filename_component(BMOE_ROOT "${RNLLAMA_CPP_DIR}/../../../native/bmoe" ABSOLUTE)
 set(BMOE_SOURCE_FILES)
 if (EXISTS "${BMOE_ROOT}")
     file(GLOB BMOE_IO_FILES CONFIGURE_DEPENDS "${BMOE_ROOT}/src/io/*.cpp")
@@ -45,7 +27,9 @@ if (EXISTS "${BMOE_ROOT}")
         ${BMOE_RN_FILES}
     )
 
-    # The vendored engine uses upstream ggml names while llama.rn exports lm_* symbols.
+    # bmoe's rn/ glue calls the engine through lm_ggml_* / lm_llama_* names; the
+    # compat header is force-included to map them onto the vendored engine's
+    # upstream (unprefixed) names. No engine file is renamed.
     set(BMOE_COMPAT_HEADER "${BMOE_ROOT}/bmoe_lmggml_compat.h")
     set_source_files_properties(
         ${BMOE_SOURCE_FILES}
@@ -55,64 +39,11 @@ if (EXISTS "${BMOE_ROOT}")
     )
 endif()
 
-# Source files for rnllama library (excluding jni.cpp and jni-utils)
-set(
-    RNLLAMA_SOURCE_FILES
-    # Core GGML files
-    ${RNLLAMA_LIB_DIR}/ggml.c
-    ${RNLLAMA_LIB_DIR}/ggml-alloc.c
-    ${RNLLAMA_LIB_DIR}/ggml-backend.cpp
-    ${RNLLAMA_LIB_DIR}/ggml-backend-dl.cpp
-    ${RNLLAMA_LIB_DIR}/ggml-backend-meta.cpp
-    ${RNLLAMA_LIB_DIR}/ggml-backend-reg.cpp
-    ${RNLLAMA_LIB_DIR}/ggml-opt.cpp
-    ${RNLLAMA_LIB_DIR}/ggml-threading.cpp
-    ${RNLLAMA_LIB_DIR}/ggml-quants.c
-    ${RNLLAMA_LIB_DIR}/gguf.cpp
-
-    # GGML CPU files (globbed)
-    ${GGML_CPU_C_FILES}
-    ${GGML_CPU_CPP_FILES}
-    ${GGML_CPU_AMX_FILES}
-
-    # Llama files (globbed)
-    ${LLAMA_FILES}
-    ${RNLLAMA_LIB_DIR}/unicode-data.cpp
-    ${RNLLAMA_LIB_DIR}/unicode.cpp
-
-    # Common utilities
-    ${COMMON_FILES}
-
-    ${RNLLAMA_LIB_DIR}/anyascii.c
-
-    # mtmd-helper.cpp keys its bitmap cache with hash_sha256_hex
-    # (hash/hash.cpp), which calls sha256_hash (hash/sha256/sha256.c); neither
-    # was in the target, so the arm64 link ended in "undefined symbol:
-    # hash_sha256_hex". The rest of the vendored hash tree (sha1, xxhash)
-    # ships with no caller among the compiled sources and stays out.
-    ${RNLLAMA_LIB_DIR}/hash/hash.cpp
-    ${RNLLAMA_LIB_DIR}/hash/sha256/sha256.c
-
-    # Jinja template engine
-    ${JINJA_FILES}
-
-    # Multimodal support (globbed)
-    ${MTMD_MODEL_FILES}
-    ${MTMD_FILES}
-
-    # React Native llama APIs
-    ${RNLLAMA_LIB_DIR}/rn-llama.cpp
-    ${RNLLAMA_LIB_DIR}/rn-governor.cpp
-    ${RNLLAMA_LIB_DIR}/rn-governor-params.cpp
-    ${RNLLAMA_LIB_DIR}/rn-completion.cpp
-    ${RNLLAMA_LIB_DIR}/rn-tts.cpp
-    ${RNLLAMA_LIB_DIR}/rn-slot.cpp
-    ${RNLLAMA_LIB_DIR}/rn-slot-manager.cpp
-
-    # Model implementations (globbed)
-    ${MODEL_FILES}
-
-    # Kalsa MoE expert streaming (optional, outside node_modules)
+# Sources llama.rn adds on top of the shared list in cmake/rnllama-sources.cmake:
+# the governor binding and, when present, the optional MoE streamer.
+list(APPEND RNLLAMA_CORE_SOURCES
+    ${RNLLAMA_CPP_DIR}/rn-governor.cpp
+    ${RNLLAMA_CPP_DIR}/rn-governor-params.cpp
     ${BMOE_SOURCE_FILES}
 )
 
@@ -128,6 +59,12 @@ else()
 endif()
 
 function(build_rnllama_library target_name arch cpu_flags)
+    rnllama_variant_enabled(${target_name} VARIANT_ENABLED)
+    if (NOT VARIANT_ENABLED)
+        message(STATUS "Skipping ${target_name} - not in RNLLAMA_ANDROID_VARIANTS")
+        return()
+    endif()
+
     set(ENABLE_OPENCL OFF)
     if (${target_name} MATCHES ".*_opencl$")
         set(ENABLE_OPENCL ON)
@@ -140,8 +77,8 @@ function(build_rnllama_library target_name arch cpu_flags)
 
     if (NOT ${arch} STREQUAL "generic")
         set(SOURCE_FILES_ARCH
-            ${RNLLAMA_LIB_DIR}/ggml-cpu/arch/${arch}/quants.c
-            ${RNLLAMA_LIB_DIR}/ggml-cpu/arch/${arch}/repack.cpp
+            ${RNLLAMA_GGML_CPU_ARCH_DIR}/${arch}/quants.c
+            ${RNLLAMA_GGML_CPU_ARCH_DIR}/${arch}/repack.cpp
         )
     endif ()
 
@@ -149,7 +86,7 @@ function(build_rnllama_library target_name arch cpu_flags)
     add_library(
         ${target_name}
         SHARED
-        ${RNLLAMA_SOURCE_FILES}
+        ${RNLLAMA_CORE_SOURCES}
         ${SOURCE_FILES_ARCH}
     )
 
@@ -164,10 +101,13 @@ function(build_rnllama_library target_name arch cpu_flags)
     target_link_libraries(${target_name} PRIVATE ${LOG_LIB} android)
 
     if (${arch} STREQUAL "generic")
-        target_compile_options(${target_name} PRIVATE -DLM_GGML_CPU_GENERIC)
+        target_compile_options(${target_name} PRIVATE -DGGML_CPU_GENERIC)
     endif ()
 
-    target_compile_options(${target_name} PRIVATE -DLM_GGML_USE_CPU -DLM_GGML_USE_CPU_REPACK -pthread ${cpu_flags} -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE)
+    # ThinLTO rather than monolithic LTO: linking is parallel and incremental, and
+    # peak memory stays low enough that several variants can link concurrently
+    # (full LTO here OOM-killed 16 GB CI runners).
+    target_compile_options(${target_name} PRIVATE -DGGML_USE_CPU -DGGML_USE_CPU_REPACK -pthread ${cpu_flags} -fvectorize -ffp-model=fast -fno-finite-math-only -flto=thin -D_GNU_SOURCE)
 
     if (CMAKE_BUILD_TYPE AND CMAKE_BUILD_TYPE STREQUAL "Debug")
         target_compile_options(${target_name} PRIVATE -DRNLLAMA_ANDROID_ENABLE_LOGGING)
@@ -197,14 +137,14 @@ function(build_rnllama_library target_name arch cpu_flags)
         if (HEXAGON_SDK_AVAILABLE)
             # Add host-side hexagon sources
             target_sources(${target_name} PRIVATE
-                ${RNLLAMA_LIB_DIR}/ggml-hexagon/ggml-hexagon.cpp
-                ${RNLLAMA_LIB_DIR}/ggml-hexagon/htp-drv.cpp
+                ${RNLLAMA_GGML_HEXAGON_DIR}/ggml-hexagon.cpp
+                ${RNLLAMA_GGML_HEXAGON_DIR}/htp-drv.cpp
             )
 
             # The Android host build consumes generated QAIC artifacts copied by
             # scripts/build-hexagon-htp.sh. Keep the failure mode explicit when
             # they have not been generated yet.
-            set(HEXAGON_PREBUILT_HTP_DIR "${RNLLAMA_LIB_DIR}/ggml-hexagon/htp/v73/")
+            set(HEXAGON_PREBUILT_HTP_DIR "${RNLLAMA_GGML_HEXAGON_DIR}/htp/v73/")
             set(HEXAGON_HOST_STUB "${HEXAGON_PREBUILT_HTP_DIR}/htp_iface_stub.c")
             set(HEXAGON_HOST_HEADER "${HEXAGON_PREBUILT_HTP_DIR}/htp_iface.h")
 
@@ -223,8 +163,8 @@ function(build_rnllama_library target_name arch cpu_flags)
                 ${HEXAGON_SDK_ROOT}/incs/stddef
                 ${HEXAGON_SDK_ROOT}/ipc/fastrpc/rpcmem/inc
                 ${HEXAGON_SDK_ROOT}/utils/examples
-                ${RNLLAMA_LIB_DIR}/ggml-hexagon
-                ${RNLLAMA_LIB_DIR}/ggml-hexagon/htp
+                ${RNLLAMA_GGML_HEXAGON_DIR}
+                ${RNLLAMA_GGML_HEXAGON_DIR}/htp
                 ${HEXAGON_PREBUILT_HTP_DIR}
                 ${CMAKE_CURRENT_BINARY_DIR}
             )
@@ -237,7 +177,7 @@ function(build_rnllama_library target_name arch cpu_flags)
             message(STATUS "Linking Hexagon cdsprpc library: ${CDSPRPC_LIB}")
 
             target_compile_options(${target_name} PRIVATE
-                -DLM_GGML_USE_HEXAGON
+                -DGGML_USE_HEXAGON
             )
 
             message(STATUS "Hexagon backend enabled for ${target_name}")
@@ -256,18 +196,16 @@ function(build_rnllama_library target_name arch cpu_flags)
 
     # OpenCL only for the special target
     if (ENABLE_OPENCL)
-        include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../../../../third_party/OpenCL-Headers)
+        include_directories(${RNLLAMA_OPENCL_HEADERS_DIR})
 
-        # Exactly the set of kernels the fork ships, by construction: file(GLOB)
-        # over cpp/ggml-opencl/kernels/*.cl, embedded via embed_kernel.py into the
-        # <name>.cl.h files ggml-opencl.cpp #includes (181 .cl files at this pin;
-        # its 183 #include lines hit two of them -- gemm_moe_q4_0_f32_ns,
-        # gemv_moe_q4_0_f32_ns -- twice). The previous hand-written list named 156
-        # and drifted 25 names behind the overlay, so the arm64 OpenCL target
-        # failed at build time; the glob cannot drift, and a .cl.h include with no
-        # matching .cl file is the include scan's failure, not configure's.
+        # The embedded set is derived from the shipped kernels. A hand-maintained
+        # name list drifts from ggml-opencl.cpp's #include set -- it did, and the
+        # arm64 OpenCL target failed at build time -- while the globbed path is
+        # also the input path the loop below takes NAME_WE from. Do not replace
+        # this with a list of names.
         file(GLOB GGML_OPENCL_KERNELS CONFIGURE_DEPENDS
-            ${RNLLAMA_LIB_DIR}/ggml-opencl/kernels/*.cl)
+            ${RNLLAMA_GGML_OPENCL_DIR}/kernels/*.cl)
+        set(GGML_OPENCL_KERNEL_DIR ${RNLLAMA_GGML_OPENCL_DIR}/kernels)
         set(GGML_OPENCL_KERNEL_HEADERS "")
 
         foreach(kernel_path ${GGML_OPENCL_KERNELS})
@@ -278,16 +216,16 @@ function(build_rnllama_library target_name arch cpu_flags)
             add_custom_command(
                 OUTPUT ${output_file}
                 COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/..
-                        ${Python3_EXECUTABLE} ${RNLLAMA_LIB_DIR}/ggml-opencl/kernels/embed_kernel.py
+                        ${Python3_EXECUTABLE} ${GGML_OPENCL_KERNEL_DIR}/embed_kernel.py
                         ${input_file} ${output_file}
-                DEPENDS ${input_file} ${RNLLAMA_LIB_DIR}/ggml-opencl/kernels/embed_kernel.py
+                DEPENDS ${input_file} ${GGML_OPENCL_KERNEL_DIR}/embed_kernel.py
                 COMMENT "Embedding OpenCL kernel: ${kernel}.cl"
             )
 
             list(APPEND GGML_OPENCL_KERNEL_HEADERS ${output_file})
         endforeach()
 
-        set(OPENCL_STUB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../../bin/${ANDROID_ABI})
+        set(OPENCL_STUB_DIR ${RNLLAMA_ROOT_DIR}/bin/${ANDROID_ABI})
         set(OPENCL_STUB     ${OPENCL_STUB_DIR}/libOpenCL.so)
 
         if (EXISTS ${OPENCL_STUB})
@@ -301,19 +239,16 @@ function(build_rnllama_library target_name arch cpu_flags)
 
         target_include_directories(${target_name} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
         target_sources(${target_name} PRIVATE
-            ${RNLLAMA_LIB_DIR}/ggml-opencl/ggml-opencl.cpp
-            # cl-program-cache.cpp backs the program cache ggml-opencl.cpp uses
-            # (cl_program_cache_state program_cache, cl_program_cache_init /
-            # try_load / try_save); leaving it out is a link-time failure.
-            ${RNLLAMA_LIB_DIR}/ggml-opencl/cl-program-cache.cpp
+            ${RNLLAMA_GGML_OPENCL_DIR}/ggml-opencl.cpp
+            ${RNLLAMA_GGML_OPENCL_DIR}/cl-program-cache.cpp
             ${GGML_OPENCL_KERNEL_HEADERS}
         )
         target_compile_options(${target_name} PRIVATE
-            -DLM_GGML_USE_OPENCL
-            -DLM_GGML_OPENCL_USE_ADRENO_KERNELS
-            -DLM_GGML_OPENCL_EMBED_KERNELS
-            -DLM_GGML_OPENCL_SOA_Q
-            -DLM_GGML_OPENCL_TARGET_VERSION=300
+            -DGGML_USE_OPENCL
+            -DGGML_OPENCL_USE_ADRENO_KERNELS
+            -DGGML_OPENCL_EMBED_KERNELS
+            -DGGML_OPENCL_SOA_Q
+            -DGGML_OPENCL_TARGET_VERSION=300
         )
     endif ()
 
@@ -322,7 +257,11 @@ function(build_rnllama_library target_name arch cpu_flags)
     target_compile_options(${target_name} PRIVATE -ffunction-sections -fdata-sections)
 
     target_link_options(${target_name} PRIVATE -Wl,--gc-sections)
-    target_link_options(${target_name} PRIVATE -flto)
+    # ggml/llama symbols keep upstream names. Bind this library's own references
+    # at link time so a second ggml copy in the process (e.g. whisper.rn) can
+    # never be picked up via the dynamic linker's global lookup.
+    target_link_options(${target_name} PRIVATE -Wl,-Bsymbolic)
+    target_link_options(${target_name} PRIVATE -flto=thin)
 endfunction()
 
 # Default target (no specific CPU features)

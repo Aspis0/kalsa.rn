@@ -2,11 +2,14 @@
 {
   "extends": "./tsconfig",
   "exclude": [
+    "node_modules",
+    "Pods",
     "example",
     "tmp",
     "tests",
-    "third_party/llama.cpp",
-    "third_party/OpenCL-Headers",
-    "third_party/OpenCL-ICD-Loader"
+    "scripts",
+    "build",
+    "build-host",
+    "vendor"
   ],
 }

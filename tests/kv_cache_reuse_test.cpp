@@ -352,13 +352,22 @@ std::vector<Check> run_model(const std::string &key, const std::string &path,
         print_turn(tm);
         append_turns.push_back(tm);
     }
-    // From turn 2 on there is a large shared prefix; we expect to reuse most of it.
+    // From turn 2 on, checkpoint reuse must keep the reprocessed part of the
+    // shared prefix bounded. A percentage threshold is unstable here: output
+    // tokenization can change across llama.cpp builds while the checkpoint lag
+    // remains the same fixed-size tail.
+    const size_t max_shared_reprocess =
+        (size_t) sim.ctx.completion->state_ckpt_min_gap;
     for (size_t t = 1; t < append_turns.size(); t++) {
         const auto &tm = append_turns[t];
-        bool pass = tm.reusable > 0 && tm.reused >= (size_t) (0.5 * tm.reusable);
+        const size_t shared_reprocessed =
+            tm.reusable > tm.reused ? tm.reusable - tm.reused : 0;
+        bool pass = tm.reused > 0 && shared_reprocessed <= max_shared_reprocess;
         checks.push_back({key + ": append reuse " + tm.label, pass,
                           "reused " + std::to_string(tm.reused) + "/" +
-                          std::to_string(tm.reusable) + " reusable",
+                          std::to_string(tm.reusable) + " reusable (shared tail " +
+                          std::to_string(shared_reprocessed) + ", max " +
+                          std::to_string(max_shared_reprocess) + ")",
                           /*fix_target*/ true});
     }
 
@@ -651,12 +660,14 @@ std::vector<Check> run_model_mtp(const std::string &key, const std::string &path
         "Can you name a famous river?",
         "Thanks, that was helpful.",
     };
+    std::vector<TurnMetric> turns;
     std::vector<size_t> reprocessed;
     std::vector<double> accept_rate;
     try {
         for (int t = 0; t < 4; t++) {
             sim.user(user_msgs[t]);
             TurnMetric tm = sim.assistant_turn("turn" + std::to_string(t + 1), /*max_new*/ 24);
+            turns.push_back(tm);
             size_t rp = sim.ctx.completion->mtp_prompt_reprocessed;
             reprocessed.push_back(rp);
             // Draft acceptance per turn: a collapse on reused-prefix turns would
@@ -682,8 +693,11 @@ std::vector<Check> run_model_mtp(const std::string &key, const std::string &path
     // a full reprocess each turn to avoid a corrupt state. Assert that safe
     // fallback here; only non-mem-shared drafts (qwen35) get bounded reprocess.
     const bool mem_shared = sim.ctx.completion->mtp_draft_mem_shared;
+    const size_t max_shared_reprocess =
+        (size_t) sim.ctx.completion->state_ckpt_min_gap;
     for (size_t t = 1; t < reprocessed.size(); t++) {
-        const size_t np = sim.ctx.completion->num_prompt_tokens;
+        // evalMTPPrompt excludes the final prompt token, which seeds generation.
+        const size_t np = turns[t].prompt_tokens > 0 ? turns[t].prompt_tokens - 1 : 0;
         if (mem_shared) {
             // Full reprocess is correct here (the guard). Just require no crash /
             // non-degenerate: it reprocessed roughly the whole prompt.
@@ -692,10 +706,19 @@ std::vector<Check> run_model_mtp(const std::string &key, const std::string &path
                               "reprocessed " + std::to_string(reprocessed[t]) + "/" + std::to_string(np) +
                               " (reuse safely disabled)", /*fix_target*/ false});
         } else {
-            bool pass = reprocessed[t] * 2 < np;
+            const size_t reused = std::min(turns[t].reused, np);
+            const size_t shared_reprocessed =
+                turns[t].reusable > reused ? turns[t].reusable - reused : 0;
+            const bool mtp_honored_reuse = reprocessed[t] == np - reused;
+            bool pass = reused > 0 && mtp_honored_reuse &&
+                        shared_reprocessed <= max_shared_reprocess;
             checks.push_back({key + " [MTP]: bounded reprocess turn" + std::to_string(t + 1), pass,
                               "reprocessed " + std::to_string(reprocessed[t]) + "/" + std::to_string(np) +
-                              " prompt tokens", /*fix_target*/ true});
+                              ", reused " + std::to_string(reused) + "/" +
+                              std::to_string(turns[t].reusable) + " reusable (shared tail " +
+                              std::to_string(shared_reprocessed) + ", max " +
+                              std::to_string(max_shared_reprocess) + ")",
+                              /*fix_target*/ true});
         }
     }
     // Canary: on reused-prefix turns acceptance must not collapse vs the cold
@@ -2279,8 +2302,8 @@ std::vector<Check> run_slot_media_test(const std::string &key, const std::string
     }
 
     // Drive the slot manager to completion (update_slots does the work per call).
-    const int64_t t0 = lm_ggml_time_us();
-    while (!completed && (lm_ggml_time_us() - t0) < 180LL * 1000 * 1000) {
+    const int64_t t0 = ggml_time_us();
+    while (!completed && (ggml_time_us() - t0) < 180LL * 1000 * 1000) {
         ctx.slot_manager->update_slots();
     }
 
@@ -2328,8 +2351,8 @@ std::vector<Check> run_slot_state_file_test(const std::string &key, const std::s
     std::vector<llama_token> generated_ids;
 
     auto drive = [](llama_rn_context &ctx, bool &completed) {
-        const int64_t t0 = lm_ggml_time_us();
-        while (!completed && (lm_ggml_time_us() - t0) < 120LL * 1000 * 1000) {
+        const int64_t t0 = ggml_time_us();
+        while (!completed && (ggml_time_us() - t0) < 120LL * 1000 * 1000) {
             ctx.slot_manager->update_slots();
         }
     };
@@ -2462,9 +2485,9 @@ std::vector<Check> run_slot_media_concurrent_test(const std::string &key, const 
         [&](const completion_token_output &out) { media_reply += out.text; },
         [&](llama_rn_slot *s) { media_completed = true; media_incomplete = s->incomplete; });
 
-    const int64_t t0 = lm_ggml_time_us();
+    const int64_t t0 = ggml_time_us();
     while ((!media_completed || !text_completed) &&
-           (lm_ggml_time_us() - t0) < 180LL * 1000 * 1000) {
+           (ggml_time_us() - t0) < 180LL * 1000 * 1000) {
         ctx.slot_manager->update_slots();
     }
 
@@ -2507,8 +2530,8 @@ std::vector<Check> run_slot_prompt_state_regen_test(const std::string &key, cons
     params.sampling.top_k = 1;
 
     auto drive = [](llama_rn_context &ctx, bool &completed) {
-        const int64_t t0 = lm_ggml_time_us();
-        while (!completed && (lm_ggml_time_us() - t0) < 120LL * 1000 * 1000) {
+        const int64_t t0 = ggml_time_us();
+        while (!completed && (ggml_time_us() - t0) < 120LL * 1000 * 1000) {
             ctx.slot_manager->update_slots();
         }
     };
@@ -2637,8 +2660,8 @@ std::vector<Check> run_slot_media_state_file_test(const std::string &key, const 
                 incomplete = s->incomplete;
                 cache_n = s->n_prompt_tokens_cache;
             });
-        const int64_t t0 = lm_ggml_time_us();
-        while (!completed && (lm_ggml_time_us() - t0) < 180LL * 1000 * 1000) {
+        const int64_t t0 = ggml_time_us();
+        while (!completed && (ggml_time_us() - t0) < 180LL * 1000 * 1000) {
             ctx.slot_manager->update_slots();
         }
     };

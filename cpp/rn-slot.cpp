@@ -497,7 +497,7 @@ void llama_rn_slot::init_mtp() {
 
     eval_mtp_prompt();
 
-    const int64_t t_now = lm_ggml_time_us();
+    const int64_t t_now = ggml_time_us();
     t_start_generation = t_now;
     t_prompt_processing = (t_start_generation - t_start_process) / 1e6;
     prompt_processing_finished = false;
@@ -833,15 +833,15 @@ bool llama_rn_slot::load_state() {
         return false;
     }
 
-#ifdef LM_GGML_USE_OPENCL
-    const auto &model_devices = parent_ctx->model->devices;
+#ifdef GGML_USE_OPENCL
+    const auto &model_devices = parent_ctx->llama_init->model()->devices;
     auto has_opencl = false;
     for (const auto &dev_info : model_devices) {
         auto dev = dev_info.dev;
         if (dev == nullptr) {
             continue;
         }
-        const char *dev_name = lm_ggml_backend_dev_name(dev);
+        const char *dev_name = ggml_backend_dev_name(dev);
         if (strncmp(dev_name, "GPUOpenCL", 9) == 0) {
             has_opencl = true;
         }
@@ -865,7 +865,7 @@ bool llama_rn_slot::load_state() {
     LOG_INFO("Slot %d: Loading state from: %s", id, load_state_path.c_str());
 
     // Start timing
-    const int64_t t_load_start = lm_ggml_time_us();
+    const int64_t t_load_start = ggml_time_us();
 
     const llama_model * model = llama_get_model(parent_ctx->active_ctx());
     const bool is_recurrent_or_hybrid = llama_model_is_recurrent(model) || llama_model_is_hybrid(model);
@@ -929,7 +929,7 @@ bool llama_rn_slot::load_state() {
     cache_tokens = std::move(state_tokens);
 
     // Calculate elapsed time
-    const int64_t t_load_end = lm_ggml_time_us();
+    const int64_t t_load_end = ggml_time_us();
     const double t_load_ms = (t_load_end - t_load_start) / 1000.0;
 
     LOG_INFO("Slot %d: Loaded %zu tokens (%.2f ms, %.2f KB)",
@@ -945,15 +945,15 @@ bool llama_rn_slot::save_prompt_state_checkpoint() {
         return false;
     }
 
-#ifdef LM_GGML_USE_OPENCL
-    const auto &model_devices = parent_ctx->model->devices;
+#ifdef GGML_USE_OPENCL
+    const auto &model_devices = parent_ctx->llama_init->model()->devices;
     auto has_opencl = false;
     for (const auto &dev_info : model_devices) {
         auto dev = dev_info.dev;
         if (dev == nullptr) {
             continue;
         }
-        const char *dev_name = lm_ggml_backend_dev_name(dev);
+        const char *dev_name = ggml_backend_dev_name(dev);
         if (strncmp(dev_name, "GPUOpenCL", 9) == 0) {
             has_opencl = true;
         }
@@ -1003,8 +1003,8 @@ bool llama_rn_slot::save_prompt_state_checkpoint() {
         return false;
     }
 
-    const char * cache_k = lm_ggml_type_name(parent_ctx->params.cache_type_k);
-    const char * cache_v = lm_ggml_type_name(parent_ctx->params.cache_type_v);
+    const char * cache_k = ggml_type_name(parent_ctx->params.cache_type_k);
+    const char * cache_v = ggml_type_name(parent_ctx->params.cache_type_v);
     llama_pos pos_min = -1;
     llama_pos pos_max = -1;
     if (parent_ctx && parent_ctx->active_ctx()) {
@@ -1068,15 +1068,15 @@ bool llama_rn_slot::save_state() {
     }
 
 
-#ifdef LM_GGML_USE_OPENCL
-    const auto &model_devices = parent_ctx->model->devices;
+#ifdef GGML_USE_OPENCL
+    const auto &model_devices = parent_ctx->llama_init->model()->devices;
     auto has_opencl = false;
     for (const auto &dev_info : model_devices) {
         auto dev = dev_info.dev;
         if (dev == nullptr) {
             continue;
         }
-        const char *dev_name = lm_ggml_backend_dev_name(dev);
+        const char *dev_name = ggml_backend_dev_name(dev);
         if (strncmp(dev_name, "GPUOpenCL", 9) == 0) {
             has_opencl = true;
         }
@@ -1100,7 +1100,7 @@ bool llama_rn_slot::save_state() {
     LOG_INFO("Slot %d: Saving state to: %s", id, save_state_path.c_str());
 
     // Start timing
-    const int64_t t_save_start = lm_ggml_time_us();
+    const int64_t t_save_start = ggml_time_us();
 
     // Check if model is recurrent/hybrid for save behavior
     const llama_model * model = llama_get_model(parent_ctx->active_ctx());
@@ -1176,8 +1176,8 @@ bool llama_rn_slot::save_state() {
         actual_save_size
     );
 
-    const char * cache_k = lm_ggml_type_name(parent_ctx->params.cache_type_k);
-    const char * cache_v = lm_ggml_type_name(parent_ctx->params.cache_type_v);
+    const char * cache_k = ggml_type_name(parent_ctx->params.cache_type_k);
+    const char * cache_v = ggml_type_name(parent_ctx->params.cache_type_v);
     llama_pos pos_min = -1;
     llama_pos pos_max = -1;
     if (parent_ctx && parent_ctx->active_ctx()) {
@@ -1217,7 +1217,7 @@ bool llama_rn_slot::save_state() {
                      media_retained ? bitmap_past_hashes : std::vector<std::string>{});
 
     // Calculate elapsed time
-    const int64_t t_save_end = lm_ggml_time_us();
+    const int64_t t_save_end = ggml_time_us();
     const double t_save_ms = (t_save_end - t_save_start) / 1000.0;
 
     LOG_INFO("Slot %d: Saved %zu tokens (%.2f ms, %.2f KB)",

@@ -66,10 +66,10 @@ Developer environment only; it never touches `vendor/` contents:
 
 ### Kalsa engine
 
-The engine this fork builds is kalsallama (`kalsallama.pin`). Its changes reach the build through
-`scripts/patches/llama.cpp/`, which holds the union of our hunks with upstream's features, and
-`scripts/assert-kalsa-vendor.sh` grades `vendor/llama.cpp` after `npm run sync:vendor`: every kalsa
-marker and every upstream hunk exactly once, plus a 7-character build commit.
+The engine this fork builds comes from the `LLAMA_CPP_REPO` / `LLAMA_CPP_REF` pins in
+`vendor/VERSIONS`, applied by `scripts/sync-vendor.sh` into `vendor/llama.cpp`. `scripts/assert-kalsa-vendor.sh`
+checks that vendored tree after `npm run sync:vendor`: every kalsa marker and every upstream hunk
+exactly once, plus a 7-character build commit.
 
 ### Platform Builds
 

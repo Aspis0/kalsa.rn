@@ -74,7 +74,7 @@ bool rn_governor::set_thermo_profile(const llama_governor_thermo_profile & profi
         return false;
     }
     profile_valid_ = llama_governor_set_thermo_profile(
-        governor_, profile, lm_ggml_time_us() / 1000);
+        governor_, profile, ggml_time_us() / 1000);
     return profile_valid_;
 }
 

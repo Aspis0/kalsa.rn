@@ -767,7 +767,7 @@ bool llama_rn_context::loadModel(
     // from the values as given. It drops two things:
     //  - an unresolved -1 (the cpuparams_batch default, meaning "use cpuparams"
     //    per common.cpp:1746) reached ggml raw: ggml-cpu.c:4204 computed
-    //    workers_size = 544 * -1, lm_ggml_aligned_malloc failed and the memset
+    //    workers_size = 544 * -1, ggml_aligned_malloc failed and the memset
     //    at :4207 of (size_t)-544 faulted on the first model load
     //    (e2e run 35307242869, batch pool first);
     //  - an explicit 0 survives postprocess_cpu_params, which rescues only

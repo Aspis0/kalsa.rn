@@ -39,11 +39,9 @@ if (EXISTS "${BMOE_ROOT}")
     )
 endif()
 
-# Sources llama.rn adds on top of the shared list in cmake/rnllama-sources.cmake:
-# the governor binding and, when present, the optional MoE streamer.
+# The MoE streamer is not in the shared list: it lives in the app repo, so it
+# is absent when llama.rn is consumed from npm alone.
 list(APPEND RNLLAMA_CORE_SOURCES
-    ${RNLLAMA_CPP_DIR}/rn-governor.cpp
-    ${RNLLAMA_CPP_DIR}/rn-governor-params.cpp
     ${BMOE_SOURCE_FILES}
 )
 

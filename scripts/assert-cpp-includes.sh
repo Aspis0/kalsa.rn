@@ -153,7 +153,7 @@ PY
 #       KALSA_BMOE_DIR (= <app>/native/bmoe/rn).
 #
 # Known non-parsed TUs (never silently): the ggml-hexagon host sources need
-# the Hexagon SDK headers and -DLM_GGML_USE_HEXAGON (HEXAGON_SDK_ROOT).
+# the Hexagon SDK headers and -DGGML_USE_HEXAGON (HEXAGON_SDK_ROOT).
 # android/src/main/RNLlamaJSI.cpp needs <android/log.h> and the fbjni prefab
 # headers -- the cpp/jsi TUs it links carry the drift risk. Everything else
 # the build compiles is parsed: the .c sources (ggml.c, ggml-alloc.c,
@@ -379,10 +379,10 @@ parse_group -- "$CPP"/ggml-cpu/*.cpp "$CPP"/ggml-cpu/amx/*.cpp \
 # ENABLE_OPENCL block), with its compile shape: the OpenCL-Headers tree plus
 # the embedded kernel headers, and the same defines CMake passes.
 parse_group -I "$ROOT/third_party/OpenCL-Headers" -I "$KERNEL_EMBED_DIR" \
-  -DLM_GGML_USE_CPU -DLM_GGML_USE_CPU_REPACK -D_GNU_SOURCE \
-  -DLM_GGML_USE_OPENCL -DLM_GGML_OPENCL_USE_ADRENO_KERNELS \
-  -DLM_GGML_OPENCL_EMBED_KERNELS -DLM_GGML_OPENCL_SOA_Q \
-  -DLM_GGML_OPENCL_TARGET_VERSION=300 -- \
+  -DGGML_USE_CPU -DGGML_USE_CPU_REPACK -D_GNU_SOURCE \
+  -DGGML_USE_OPENCL -DGGML_OPENCL_USE_ADRENO_KERNELS \
+  -DGGML_OPENCL_EMBED_KERNELS -DGGML_OPENCL_SOA_Q \
+  -DGGML_OPENCL_TARGET_VERSION=300 -- \
   "$CPP"/ggml-opencl/ggml-opencl.cpp "$CPP"/ggml-opencl/cl-program-cache.cpp
 if [ ${#RN_JSI_INCS[@]} -gt 0 ]; then
   parse_group -I "${RN_JSI_INCS[0]}" -I "${RN_JSI_INCS[1]}" -- "$CPP"/jsi/*.cpp
@@ -399,15 +399,16 @@ fi
 if [ -z "$partial" ]; then
   # The APK compiles these with the backends the app turns on (ENABLE_OPENCL in
   # android/src/main/CMakeLists.txt); rn-slot.cpp guards three blocks on
-  # LM_GGML_USE_OPENCL, and without the define this gate never sees them.
-  parse_group -I "$KALSA_BMOE_DIR" -DLM_GGML_USE_OPENCL -- "$CPP"/rn-*.cpp
+  # GGML_USE_OPENCL, which android/src/main/rnllama/CMakeLists.txt:247 defines;
+  # without the define this gate never sees them.
+  parse_group -I "$KALSA_BMOE_DIR" -DGGML_USE_OPENCL -- "$CPP"/rn-*.cpp
 fi
 
 for t in "$CPP"/ggml-hexagon/ggml-hexagon.cpp "$CPP"/ggml-hexagon/htp-drv.cpp \
          "$ROOT"/android/src/main/RNLlamaJSI.cpp; do
   [ -f "$t" ] || continue
   case "$t" in
-    */ggml-hexagon/*) r="Hexagon variant only: needs Hexagon SDK headers + -DLM_GGML_USE_HEXAGON (HEXAGON_SDK_ROOT)" ;;
+    */ggml-hexagon/*) r="Hexagon variant only: needs Hexagon SDK headers + -DGGML_USE_HEXAGON (HEXAGON_SDK_ROOT)" ;;
     */android/src/main/RNLlamaJSI.cpp) r="JNI wrapper: needs <android/log.h> (NDK) and fbjni prefab headers; the cpp/jsi TUs it links are parsed" ;;
     *) r="not parsed by this gate" ;;
   esac

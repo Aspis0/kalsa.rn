@@ -30,14 +30,6 @@ endif ()
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/rnllama-sources.cmake)
 
-# Sources llama.rn adds on top of the shared list: the governor binding.
-# cmake/rnllama-sources.cmake and llama-rn.podspec are the other two lists;
-# keep them in sync.
-list(APPEND RNLLAMA_CORE_SOURCES
-    ${RNLLAMA_CPP_DIR}/rn-governor.cpp
-    ${RNLLAMA_CPP_DIR}/rn-governor-params.cpp
-)
-
 if (CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
     set(SOURCE_FILES_ARCH
         ${RNLLAMA_GGML_CPU_ARCH_DIR}/arm/quants.c

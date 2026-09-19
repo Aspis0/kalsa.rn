@@ -121,10 +121,15 @@ file(GLOB RNLLAMA_CODEC_SOURCES CONFIGURE_DEPENDS
 file(GLOB RNLLAMA_CODEC_UTILS_SOURCES CONFIGURE_DEPENDS ${_codec}/examples/utils/*.cpp)
 
 # --- llama.rn -----------------------------------------------------------------
+# One home for the sources llama.rn adds to the engine: the callers
+# (ios/CMakeLists.txt, android/src/main/rnllama/CMakeLists.txt) and the tests
+# all consume this list, so a source added here reaches every build.
 set(RNLLAMA_RN_SOURCES
     ${RNLLAMA_CPP_DIR}/anyascii.c
     ${RNLLAMA_CPP_DIR}/rn-llama.cpp
     ${RNLLAMA_CPP_DIR}/rn-completion.cpp
+    ${RNLLAMA_CPP_DIR}/rn-governor.cpp
+    ${RNLLAMA_CPP_DIR}/rn-governor-params.cpp
     ${RNLLAMA_CPP_DIR}/rn-slot.cpp
     ${RNLLAMA_CPP_DIR}/rn-slot-manager.cpp
     ${RNLLAMA_CPP_DIR}/rn-tts.cpp

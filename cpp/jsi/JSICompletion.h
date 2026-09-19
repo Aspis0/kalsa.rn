@@ -163,6 +163,16 @@ namespace rnllama_jsi {
         }
 
         res["completion_probabilities"] = completionProbabilitiesJson(ctx, c.generated_token_probs);
+        if (!c.generated_token_ids.empty()) {
+            // Bounded on purpose: the app's bench harness reads the first 32
+            // ids, and the full list stays in the completion.
+            const size_t count = std::min<size_t>(32, c.generated_token_ids.size());
+            json ids = json::array();
+            for (size_t i = 0; i < count; ++i) {
+                ids.push_back((int) c.generated_token_ids[i]);
+            }
+            res["generated_token_ids"] = std::move(ids);
+        }
         res["tokens_predicted"] = c.num_tokens_predicted;
         res["tokens_evaluated"] = c.num_prompt_tokens;
         res["draft_tokens"] = c.num_draft_tokens;
@@ -184,7 +194,10 @@ namespace rnllama_jsi {
             res["embedding_dim"] = c.embedding_dim;
         }
 
-        const auto perf = llama_perf_context(ctx->ctx);
+        // Perf counters are folded in only on synchronize.
+        // A zero-token completion never fetches logits.
+        llama_synchronize(ctx->active_ctx());
+        const auto perf = llama_perf_context(ctx->active_ctx());
         rnllama::slot_timings t;
         t.cache_n = c.n_past;
         // Kalsa: with a governor the prompt is preflighted on the governor's

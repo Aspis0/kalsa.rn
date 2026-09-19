@@ -684,6 +684,11 @@ namespace rnllama_jsi {
                     }
 
                     auto ctx = new rnllama::llama_rn_context();
+                    // The map owns the context from addContext() on; until then
+                    // this guard does, so a throw in between (model load
+                    // failure, the encoder/decoder check, governor validation)
+                    // frees it instead of leaking it.
+                    std::unique_ptr<rnllama::llama_rn_context> ctxOwner(ctx);
                     // Prompt state cache tuning (multi-turn KV reuse on
                     // recurrent/hybrid/SWA models). Budget in MiB; 0 disables it.
                     {
@@ -737,6 +742,9 @@ namespace rnllama_jsi {
                          }
 
                          addContext(contextId, (long)ctx);
+                         // Ownership is the map's now; the guard only covered
+                         // the failure paths above.
+                         ctxOwner.release();
 
                          std::string androidLibName = "";
                          #if defined(__ANDROID__)

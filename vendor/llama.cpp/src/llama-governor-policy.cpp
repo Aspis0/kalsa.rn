@@ -60,7 +60,10 @@ bool llama_governor_policy::profile_is_valid(const llama_governor_thermo_profile
     if (!profile.plugged) {
         return true;
     }
-    return profile.t_idle_valid && std::isfinite(profile.t_idle_c) && profile.t_idle_c + 1.0f < 42.0f;
+    // 0 C or colder is not a real baseline (dumpsys reads 0.0 for no data);
+    // the removed app gate refused it, and this gate owns that rule now.
+    return profile.t_idle_valid && std::isfinite(profile.t_idle_c) && profile.t_idle_c > 0.0f &&
+           profile.t_idle_c + 1.0f < 42.0f;
 }
 
 llama_governor_thermal_state llama_governor_policy::classify(float temperature) const {
@@ -105,6 +108,9 @@ bool llama_governor_policy::update_thermal(const llama_governor_thermo_profile &
             state_since_ms_ = now_ms;
             return false;
         }
+    } else {
+        // An unplug ends the plugged baseline; the next plug latches a fresh one.
+        have_t_idle_reference_ = false;
     }
 
     profile_valid_ = true;
@@ -160,7 +166,10 @@ llama_governor_engine llama_governor_policy::prefill_engine() const {
     }
     // measured: ALIVE #38: 8 Elite GPU prefill, G ttft 1434/1470 ms vs
     // C 16476/14412 ms (>=9.8x); decode 25.3/24.2 t/s >= C's.
-    if ((params_.generation == llama_governor_generation::V75 ||
+    // V73 carries the owner's 2026-09-21 enablement decision, not a measurement.
+    // The generation list is duplicated in the app; the form refactor should carry it once.
+    if ((params_.generation == llama_governor_generation::V73 ||
+         params_.generation == llama_governor_generation::V75 ||
          params_.generation == llama_governor_generation::V79) &&
         params_.gpu_fit == llama_governor_fit::Fit && params_.gpu_prefill_measured) {
         return llama_governor_engine::GPU;

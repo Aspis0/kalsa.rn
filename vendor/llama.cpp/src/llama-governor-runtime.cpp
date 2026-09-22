@@ -50,25 +50,18 @@ int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {
     if (admission.decision == llama_governor_decision::Abort) {
         return fail("prefill admission aborted");
     }
-    const bool cpu_fallback = admission.decision == llama_governor_decision::CPUFallback &&
-        policy_.thermal_state() != llama_governor_thermal_state::FAST;
-    if (prefill_route_ == prefill_route::Undecided &&
-        (admission.decision == llama_governor_decision::Wait || cpu_fallback)) {
-        prefill_route_ = prefill_route::CPU;
-        stats_.prefill_engine = llama_governor_engine::CPU;
-        stats_.prefill_chunks[0] = '\0';
-        if (admission.decision == llama_governor_decision::Wait) {
-            LLAMA_LOG_WARN("%s: prefill admission is waiting; routing this turn to CPU\n", __func__);
-        }
-        return 0;
+    if (admission.decision == llama_governor_decision::Wait) {
+        // No chunk fits under the thermal ceiling. Reducing tokens is the only
+        // allowed fallback; never switch to another engine. Pause this turn.
+        LLAMA_LOG_WARN("%s: no safe prefill chunk under the thermal ceiling; pausing\n", __func__);
+        return -2;
     }
     if (prefill_route_ == prefill_route::Undecided) {
-        prefill_route_ = prefill_route::GPU;
+        prefill_route_ = requested == llama_governor_engine::CPU ? prefill_route::CPU : prefill_route::GPU;
         stats_.prefill_engine = requested;
     }
-    if (admission.decision == llama_governor_decision::Wait ||
-        admission.decision == llama_governor_decision::CPUFallback) {
-        // The first batch selected GPU; keep this turn on that context.
+    if (admission.decision == llama_governor_decision::CPUFallback) {
+        // The policy already reduced the request to a table row that fits.
         return 0;
     }
     if (admission.tokens >= static_cast<uint32_t>(batch.n_tokens)) {

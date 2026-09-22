@@ -21,11 +21,14 @@
 //          CL_DEVICE_NAME || '\x00' ||
 //          CL_DRIVER_VERSION || '\x00' ||
 //          CL_PLATFORM_VERSION || '\x00' ||
+//          GGML_OPENCL_KERNEL_SET_ID || '\x00' ||
 //          CL_PROGRAM_CACHE_FORMAT_VERSION)
 //
 // The key fully captures everything that can affect the produced binary,
 // without needing the host source revision (a kernel source change shows up
 // in source_bytes; a compile-option change shows up in compile_opts).
+// The verdict key folds the same suffix, including the kernel-set identity, so
+// a kernel fix invalidates a stale fail even when source_bytes are cached.
 //
 // File layout per cache entry: <cache_dir>/<sha256-hex>.clbin
 //   bytes [0..7]   : magic "GGMLCLBC"
@@ -50,12 +53,32 @@
 // require bumping this; the source bytes already capture those.
 #define CL_PROGRAM_CACHE_FORMAT_VERSION 1u
 
+// A recorded fail is only trusted for this long. One transient build failure
+// (for example CL_OUT_OF_HOST_MEMORY) must not disable a working device
+// forever, so a stale fail is ignored and the kernel set is built again.
+#define CL_PROGRAM_CACHE_VERDICT_FAIL_TTL_SECONDS (15 * 60)
+
 struct cl_program_cache_state {
     // Empty string means cache is disabled.
     std::string dir;
-    // Concatenated device/driver/platform identity + cache format version,
-    // computed once at init and folded into every key.
+    // Concatenated device/driver/platform identity, kernel-set identity and
+    // cache format version, computed once at init and folded into every key.
     std::string key_suffix;
+};
+
+// Outcome of building the kernel set on one (device, driver, platform) triple.
+// Written beside the compiled binaries so a later process can disable a device
+// whose kernel set does not compile instead of rebuilding and failing again.
+struct cl_program_cache_verdict {
+    bool        ok = false;
+    std::string vendor;
+    std::string device_name;
+    std::string driver_version;
+    size_t      global_mem_size = 0;
+    bool        has_integer_dot = false;
+    // Unix seconds when the verdict was written; 0 in the struct means
+    // "stamp at save time", and an unparsed 0 in a file counts as expired.
+    uint64_t    written = 0;
 };
 
 cl_program_cache_state cl_program_cache_init(cl_device_id device);
@@ -73,3 +96,7 @@ void cl_program_cache_try_save(
     cl_device_id                   device,
     const char *                   source,
     const std::string &            compile_opts);
+
+// Both are no-ops (load returns false) when the cache is disabled.
+void cl_program_cache_save_verdict(const cl_program_cache_state & state, const cl_program_cache_verdict & verdict);
+bool cl_program_cache_load_verdict(const cl_program_cache_state & state, cl_program_cache_verdict & verdict);

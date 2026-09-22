@@ -51,6 +51,7 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
 #include <mutex>
 #include <regex>
 #include <set>
+#include <stdexcept>
 #include <unordered_set>
 
 #undef MIN
@@ -648,6 +649,10 @@ struct ggml_backend_opencl_context {
     bool kernels_loaded_argsort = false;
     // rest of the kernels are currently always loaded in alloc_buffer.
     bool kernels_loaded = false;
+    // Set when the bulk kernel set failed to compile. The device stays disabled
+    // for the rest of the process (supports_op false, alloc_buffer fails) so a
+    // single bad kernel degrades to CPU instead of aborting the process.
+    bool kernel_build_failed = false;
 
     std::string driver_version;
 
@@ -1394,6 +1399,33 @@ static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev,
     return NULL;
 }
 
+// Records the kernel-set build outcome beside the program cache. The record is
+// keyed on device and driver, so a driver update invalidates it. A failed
+// record disables the device early in the next process instead of recompiling.
+static void ggml_opencl_record_verdict(ggml_backend_opencl_context * backend_ctx, bool ok) {
+    if (!backend_ctx->program_cache_initialized) {
+        return;
+    }
+
+    cl_program_cache_verdict v;
+    v.ok               = ok;
+    v.device_name      = backend_ctx->device_name;
+    v.driver_version   = backend_ctx->driver_version;
+    v.global_mem_size  = backend_ctx->global_mem_size;
+    v.has_integer_dot  = backend_ctx->has_integer_dot;
+
+    size_t vendor_size = 0;
+    if (clGetDeviceInfo(backend_ctx->device, CL_DEVICE_VENDOR, 0, NULL, &vendor_size) == CL_SUCCESS && vendor_size > 0) {
+        std::string vendor(vendor_size, '\0');
+        if (clGetDeviceInfo(backend_ctx->device, CL_DEVICE_VENDOR, vendor_size, &vendor[0], NULL) == CL_SUCCESS) {
+            if (!vendor.empty() && vendor.back() == '\0') { vendor.pop_back(); }
+            v.vendor = vendor;
+        }
+    }
+
+    cl_program_cache_save_verdict(backend_ctx->program_cache, v);
+}
+
 static cl_program build_program_from_source(ggml_backend_opencl_context * backend_ctx, const char* program_buffer, const std::string &compile_opts) {
     cl_context   ctx = backend_ctx->context;
     cl_device_id dev = backend_ctx->device;
@@ -1406,12 +1438,17 @@ static cl_program build_program_from_source(ggml_backend_opencl_context * backen
         return p_cached;
     }
 
-    cl_program p = build_program_from_source_ex(ctx, dev, program_buffer, compile_opts, /*fatal=*/true);
+    cl_program p = build_program_from_source_ex(ctx, dev, program_buffer, compile_opts, /*fatal=*/false);
+    if (p == nullptr) {
+        // Poison the (device, driver) pair, not the process: the caller stops
+        // loading kernels and the scheduler falls back to CPU.
+        backend_ctx->kernel_build_failed = true;
+        ggml_opencl_record_verdict(backend_ctx, false);
+        return nullptr;
+    }
 
     // Best-effort save of the freshly-built binary (no-op if cache disabled).
-    if (p != nullptr) {
-        cl_program_cache_try_save(backend_ctx->program_cache, p, dev, program_buffer, compile_opts);
-    }
+    cl_program_cache_try_save(backend_ctx->program_cache, p, dev, program_buffer, compile_opts);
     return p;
 }
 
@@ -1450,7 +1487,7 @@ static void load_cl_kernels_argsort(ggml_backend_opencl_context *backend_ctx) {
                                " -cl-finite-math-only -cl-fast-relaxed-math";
 
     // argsort
-    if (!backend_ctx->kernels_loaded_argsort) {
+    if (!backend_ctx->kernels_loaded_argsort && !backend_ctx->kernel_build_failed) {
         cl_int err;
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
@@ -1461,6 +1498,7 @@ static void load_cl_kernels_argsort(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_argsort_f32_i32 =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_argsort_f32_i32 = clCreateKernel(backend_ctx->program_argsort_f32_i32, "kernel_argsort_f32_i32", &err), err));
         backend_ctx->kernels_loaded_argsort = true;
@@ -1505,8 +1543,26 @@ static bool use_adreno_bin_kernels(ggml_backend_opencl_context * backend_ctx) {
 #endif // GGML_OPENCL_USE_ADRENO_BIN_KERNELS
 }
 
+// KALSA_Q6K_DENSE=f32|dp4a: dense q6_K prefill GEMM path, default f32.
+// f32 = transpose + noshuffle f32 GEMM (no activation quantization);
+// dp4a = stock int8 path (kernel_quant_a_q8_1 + q8_1 dp4a GEMM), for A/B.
+inline bool kalsa_q6k_dense_f32() {
+    static const bool value = [] {
+        const char * e = getenv("KALSA_Q6K_DENSE");
+        if (e && strcmp(e, "dp4a") == 0) {
+            return false;
+        }
+        if (e && *e && strcmp(e, "f32") != 0) {
+            GGML_LOG_ERROR("ggml_opencl: unrecognized KALSA_Q6K_DENSE='%s' (use f32|dp4a)\n", e);
+            exit(1);
+        }
+        return true;
+    }();
+    return value;
+}
+
 static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
-    if (backend_ctx->kernels_loaded) {
+    if (backend_ctx->kernels_loaded || backend_ctx->kernel_build_failed) {
         return;
     }
 
@@ -1539,6 +1595,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_add =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_add         = clCreateKernel(backend_ctx->program_add, "kernel_add", &err), err));
         CL_CHECK((backend_ctx->kernel_add_row     = clCreateKernel(backend_ctx->program_add, "kernel_add_row", &err), err));
@@ -1558,6 +1615,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_add_id =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_add_id = clCreateKernel(backend_ctx->program_add_id, "kernel_add_id", &err), err));
         GGML_LOG_CONT(".");
@@ -1574,6 +1632,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_moe_add_id_glu =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_add_id_add_id_swiglu_oai =
             clCreateKernel(backend_ctx->program_moe_add_id_glu, "kernel_add_id_add_id_swiglu_oai", &err), err));
@@ -1591,6 +1650,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_tri = clCreateKernel(prog, "kernel_tri_f32", &err), err));
         GGML_LOG_CONT(".");
@@ -1609,6 +1669,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_fill = clCreateKernel(prog, "kernel_fill_f32", &err), err));
         GGML_LOG_CONT(".");
@@ -1627,6 +1688,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_clamp =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_clamp = clCreateKernel(backend_ctx->program_clamp, "kernel_clamp", &err), err));
         GGML_LOG_CONT(".");
@@ -1643,6 +1705,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_cpy_f16_f16 = clCreateKernel(prog, "kernel_cpy_f16_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_cpy_f16_f32 = clCreateKernel(prog, "kernel_cpy_f16_f32", &err), err));
@@ -1702,6 +1765,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         backend_ctx->program_cvt =
             build_program_from_source(backend_ctx, kernel_src.c_str(), cvt_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_convert_block_q1_0  = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_q1_0", &err), err));
         CL_CHECK((backend_ctx->kernel_restore_block_q1_0  = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_q1_0", &err), err));
@@ -1797,6 +1861,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_diag_mask_inf =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_diag_mask_inf_8 = clCreateKernel(backend_ctx->program_diag_mask_inf, "kernel_diag_mask_inf_8", &err), err));
         CL_CHECK((backend_ctx->kernel_diag_mask_inf   = clCreateKernel(backend_ctx->program_diag_mask_inf, "kernel_diag_mask_inf", &err), err));
@@ -1814,6 +1879,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_diag_f32 = clCreateKernel(prog, "kernel_diag_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -1831,6 +1897,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_gelu =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gelu         = clCreateKernel(backend_ctx->program_gelu, "kernel_gelu", &err), err));
         CL_CHECK((backend_ctx->kernel_gelu_4       = clCreateKernel(backend_ctx->program_gelu, "kernel_gelu_4", &err), err));
@@ -1852,6 +1919,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_glu =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_geglu           = clCreateKernel(backend_ctx->program_glu, "kernel_geglu", &err), err));
         CL_CHECK((backend_ctx->kernel_reglu           = clCreateKernel(backend_ctx->program_glu, "kernel_reglu", &err), err));
@@ -1880,6 +1948,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_get_rows =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_get_rows_f32  = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_get_rows_f16  = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_f16", &err), err));
@@ -1898,6 +1967,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_solve_tri_f32 = clCreateKernel(prog, "kernel_solve_tri_f32", &err), err));
         GGML_LOG_CONT(".");
@@ -1915,6 +1985,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_im2col_f32 =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_im2col_f32 = clCreateKernel(backend_ctx->program_im2col_f32, "kernel_im2col_f32", &err), err));
         GGML_LOG_CONT(".");
@@ -1931,6 +2002,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_im2col_f16 =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_im2col_f16 = clCreateKernel(backend_ctx->program_im2col_f16, "kernel_im2col_f16", &err), err));
         GGML_LOG_CONT(".");
@@ -1947,6 +2019,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_mul_mv_q4_0_f32 =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mat_q4_0_f32 = clCreateKernel(backend_ctx->program_mul_mv_q4_0_f32, "kernel_mul_mat_q4_0_f32", &err), err));
         GGML_LOG_CONT(".");
@@ -1963,6 +2036,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_mul_mv_q4_0_f32_v =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mat_q4_0_f32_v = clCreateKernel(backend_ctx->program_mul_mv_q4_0_f32_v, "kernel_mul_mat_q4_0_f32_v", &err), err));
         GGML_LOG_CONT(".");
@@ -1979,6 +2053,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_mul_mv_q4_0_f32_8x_flat =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mat_q4_0_f32_8x_flat = clCreateKernel(backend_ctx->program_mul_mv_q4_0_f32_8x_flat, "kernel_mul_mat_q4_0_f32_8x_flat", &err), err));
         GGML_LOG_CONT(".");
@@ -2000,6 +2075,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_mul_mv_q4_0_f32_1d_8x_flat =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mat_q4_0_f32_1d_8x_flat = clCreateKernel(backend_ctx->program_mul_mv_q4_0_f32_1d_8x_flat, "kernel_mul_mat_q4_0_f32_1d_8x_flat", &err), err));
         GGML_LOG_CONT(".");
@@ -2020,6 +2096,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_mul_mv_q4_0_f32_1d_16x_flat =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mat_q4_0_f32_1d_16x_flat = clCreateKernel(backend_ctx->program_mul_mv_q4_0_f32_1d_16x_flat, "kernel_mul_mat_q4_0_f32_1d_16x_flat", &err), err));
         GGML_LOG_CONT(".");
@@ -2036,6 +2113,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q4_1_f32 = clCreateKernel(prog, "kernel_mul_mv_q4_1_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -2053,6 +2131,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q4_1_f32_flat = clCreateKernel(prog, "kernel_mul_mv_q4_1_f32_flat", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -2070,6 +2149,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q4_K_f32 = clCreateKernel(prog, "kernel_mul_mv_q4_K_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -2087,6 +2167,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q4_K_f32_flat = clCreateKernel(prog, "kernel_mul_mv_q4_K_f32_flat", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -2104,6 +2185,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q5_0_f32 = clCreateKernel(prog, "kernel_mul_mv_q5_0_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -2121,6 +2203,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q5_0_f32_flat = clCreateKernel(prog, "kernel_mul_mv_q5_0_f32_flat", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -2138,6 +2221,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q5_1_f32 = clCreateKernel(prog, "kernel_mul_mv_q5_1_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -2155,6 +2239,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q5_1_f32_flat = clCreateKernel(prog, "kernel_mul_mv_q5_1_f32_flat", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -2172,6 +2257,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q5_K_f32 = clCreateKernel(prog, "kernel_mul_mv_q5_K_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -2189,6 +2275,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q5_K_f32_flat = clCreateKernel(prog, "kernel_mul_mv_q5_K_f32_flat", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -2205,6 +2292,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_mul_mv_q6_K =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q6_K_f32 = clCreateKernel(backend_ctx->program_mul_mv_q6_K, "kernel_mul_mv_q6_K_f32", &err), err));
         GGML_LOG_CONT(".");
@@ -2227,6 +2315,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             : compile_opts;
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), q6k_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q6_K_f32_flat = clCreateKernel(prog, "kernel_mul_mv_q6_K_f32_flat", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -2244,6 +2333,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_mul_mv_q8_0_f32 =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q8_0_f32 = clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32, "kernel_mul_mv_q8_0_f32", &err), err));
         GGML_LOG_CONT(".");
@@ -2260,6 +2350,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_mul_mv_q8_0_f32_flat =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q8_0_f32_flat = clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32_flat, "kernel_mul_mv_q8_0_f32_flat", &err), err));
         GGML_LOG_CONT(".");
@@ -2276,6 +2367,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q1_0_f32 = clCreateKernel(prog, "kernel_mul_mv_q1_0_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -2293,6 +2385,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q1_0_f32_flat = clCreateKernel(prog, "kernel_mul_mv_q1_0_f32_flat", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -2310,6 +2403,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mv_iq4_nl_f32 = clCreateKernel(prog, "kernel_mul_mv_iq4_nl_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -2327,6 +2421,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mv_iq4_nl_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq4_nl_f32_flat", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -2344,6 +2439,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_mul_mv_mxfp4_f32 =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mv_mxfp4_f32 = clCreateKernel(backend_ctx->program_mul_mv_mxfp4_f32, "kernel_mul_mv_mxfp4_f32", &err), err));
         GGML_LOG_CONT(".");
@@ -2360,6 +2456,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_mul_mv_mxfp4_f32_flat =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mv_mxfp4_f32_flat = clCreateKernel(backend_ctx->program_mul_mv_mxfp4_f32_flat, "kernel_mul_mv_mxfp4_f32_flat", &err), err));
         GGML_LOG_CONT(".");
@@ -2376,6 +2473,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_mul_mv_f16_f16 =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mat_f16_f16 = clCreateKernel(backend_ctx->program_mul_mv_f16_f16, "kernel_mul_mat_f16_f16", &err), err));
         GGML_LOG_CONT(".");
@@ -2392,6 +2490,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_mul_mv_f16_f32_1row =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_1row = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_1row, "kernel_mul_mat_f16_f32_1row", &err), err));
         GGML_LOG_CONT(".");
@@ -2408,6 +2507,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_mul_mv_f16_f32_mrow =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_mrow = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_mrow, "kernel_mul_mat_f16_f32_mrow", &err), err));
         CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_mrow_r2 = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_mrow, "kernel_mul_mat_f16_f32_mrow_r2", &err), err));
@@ -2428,6 +2528,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_mul_mv_f16_f32_l4 =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_l4   = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_l4, "kernel_mul_mat_f16_f32_l4", &err), err));
         CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_l4_dr = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_l4, "kernel_mul_mat_f16_f32_l4_dr", &err), err));
@@ -2494,6 +2595,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_mul_mv_f16_f32 =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32 = clCreateKernel(backend_ctx->program_mul_mv_f16_f32, "kernel_mul_mat_f16_f32", &err), err));
         GGML_LOG_CONT(".");
@@ -2510,6 +2612,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_mul_mv_f32_f32 =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mat_f32_f32 = clCreateKernel(backend_ctx->program_mul_mv_f32_f32, "kernel_mul_mat_f32_f32", &err), err));
         GGML_LOG_CONT(".");
@@ -2526,6 +2629,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_mul_mat_f16_f32_tiled =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_tiled = clCreateKernel(backend_ctx->program_mul_mat_f16_f32_tiled, "mul_mat_f16_f32", &err), err));
         GGML_LOG_CONT(".");
@@ -2543,6 +2647,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_adreno_xmem_pack_src_f32 =
             clCreateKernel(prog, "adreno_xmem_pack_src_f32", &err), err));
@@ -2568,6 +2673,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("sdpa_xmem_f32_f16_os8.cl");
 #endif
         cl_program program = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         auto & xmem_attn = backend_ctx->adreno_xmem_attn;
         CL_CHECK((xmem_attn.kernel_q_f32_to_img_scaled =
@@ -2611,6 +2717,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_mul_mm_f32_f32_l4_lm =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mm_f32_f32_l4_lm = clCreateKernel(backend_ctx->program_mul_mm_f32_f32_l4_lm, "kernel_mul_mm_f32_f32_l4_lm", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_f32_f32_mc = clCreateKernel(backend_ctx->program_mul_mm_f32_f32_l4_lm, "kernel_gemv_f32_f32_mc", &err), err));
@@ -2628,6 +2735,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_mul_mm_f16_f32_l4_lm =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mm_f16_f32_l4_lm = clCreateKernel(backend_ctx->program_mul_mm_f16_f32_l4_lm, "kernel_mul_mm_f16_f32_l4_lm", &err), err));
         GGML_LOG_CONT(".");
@@ -2644,6 +2752,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q4_0_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_q4_0_f32_l4_lm", &err), err));
         GGML_LOG_CONT(".");
@@ -2660,6 +2769,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q4_1_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_q4_1_f32_l4_lm", &err), err));
         GGML_LOG_CONT(".");
@@ -2676,6 +2786,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q5_0_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_q5_0_f32_l4_lm", &err), err));
         GGML_LOG_CONT(".");
@@ -2692,6 +2803,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q5_1_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_q5_1_f32_l4_lm", &err), err));
         GGML_LOG_CONT(".");
@@ -2708,6 +2820,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_mul_mm_q8_0_f32_l4_lm =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q8_0_f32_l4_lm = clCreateKernel(backend_ctx->program_mul_mm_q8_0_f32_l4_lm, "kernel_mul_mm_q8_0_f32_l4_lm", &err), err));
         GGML_LOG_CONT(".");
@@ -2724,6 +2837,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q1_0_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_q1_0_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -2741,6 +2855,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mm_iq4_nl_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_iq4_nl_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -2758,6 +2873,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q4_k_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_q4_k_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -2775,6 +2891,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q6_k_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_q6_k_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -2792,6 +2909,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q5_k_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_q5_k_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -2809,8 +2927,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_mul_mm_f16_f32_kqv =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts+" -DKQV ");
+        if (backend_ctx->kernel_build_failed) { return; }
         backend_ctx->program_mul_mm_f16_f32_kq =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mm_f16_f32_kqv = clCreateKernel(backend_ctx->program_mul_mm_f16_f32_kqv, "mul_mm_f16_f32_kqv", &err), err));
         CL_CHECK((backend_ctx->kernel_mul_mm_f16_f32_kq = clCreateKernel(backend_ctx->program_mul_mm_f16_f32_kq, "mul_mm_f16_f32_kq", &err), err));
@@ -2828,6 +2948,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_mul =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul         = clCreateKernel(backend_ctx->program_mul, "kernel_mul", &err), err));
         CL_CHECK((backend_ctx->kernel_mul_row     = clCreateKernel(backend_ctx->program_mul, "kernel_mul_row", &err), err));
@@ -2847,6 +2968,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_norm =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_norm         = clCreateKernel(backend_ctx->program_norm, "kernel_norm", &err), err));
         CL_CHECK((backend_ctx->kernel_norm_mul_add = clCreateKernel(backend_ctx->program_norm, "kernel_norm_mul_add", &err), err));
@@ -2864,6 +2986,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_relu =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_relu = clCreateKernel(backend_ctx->program_relu, "kernel_relu", &err), err));
         GGML_LOG_CONT(".");
@@ -2880,6 +3003,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_rms_norm =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_rms_norm     = clCreateKernel(backend_ctx->program_rms_norm, "kernel_rms_norm", &err), err));
         CL_CHECK((backend_ctx->kernel_rms_norm_mul = clCreateKernel(backend_ctx->program_rms_norm, "kernel_rms_norm_mul", &err), err));
@@ -2898,6 +3022,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_l2_norm_f32     = clCreateKernel(prog, "kernel_l2_norm_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -2915,6 +3040,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_rope =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_rope_norm_f32   = clCreateKernel(backend_ctx->program_rope, "kernel_rope_norm_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_rope_norm_f16   = clCreateKernel(backend_ctx->program_rope, "kernel_rope_norm_f16", &err), err));
@@ -2938,6 +3064,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_scale_f32   = clCreateKernel(prog, "kernel_scale_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_scale_f32_4 = clCreateKernel(prog, "kernel_scale_f32_4", &err), err));
@@ -2956,6 +3083,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_silu =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_silu   = clCreateKernel(backend_ctx->program_silu, "kernel_silu", &err), err));
         CL_CHECK((backend_ctx->kernel_silu_4 = clCreateKernel(backend_ctx->program_silu, "kernel_silu_4", &err), err));
@@ -2973,6 +3101,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_softmax_f32 =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_soft_max = clCreateKernel(backend_ctx->program_softmax_f32, "kernel_soft_max", &err), err));
         GGML_LOG_CONT(".");
@@ -2989,6 +3118,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_softmax_f16 =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_soft_max_f16 = clCreateKernel(backend_ctx->program_softmax_f16, "kernel_soft_max_f16", &err), err));
         GGML_LOG_CONT(".");
@@ -3005,6 +3135,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_softmax_4_f32 =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_soft_max_4 = clCreateKernel(backend_ctx->program_softmax_4_f32, "kernel_soft_max_4", &err), err));
         GGML_LOG_CONT(".");
@@ -3021,6 +3152,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_softmax_4_f16 =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_soft_max_4_f16 = clCreateKernel(backend_ctx->program_softmax_4_f16, "kernel_soft_max_4_f16", &err), err));
         GGML_LOG_CONT(".");
@@ -3040,6 +3172,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         backend_ctx->program_div =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_div         = clCreateKernel(backend_ctx->program_div, "kernel_div", &err), err));
         CL_CHECK((backend_ctx->kernel_div_row     = clCreateKernel(backend_ctx->program_div, "kernel_div_row", &err), err));
@@ -3059,6 +3192,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_sqr_cont_f32     = clCreateKernel(prog, "kernel_sqr_cont_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_sqr_cont_f32_4   = clCreateKernel(prog, "kernel_sqr_cont_f32_4", &err), err));
@@ -3080,6 +3214,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_sqrt_cont_f32     = clCreateKernel(prog, "kernel_sqrt_cont_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_sqrt_cont_f32_4   = clCreateKernel(prog, "kernel_sqrt_cont_f32_4", &err), err));
@@ -3101,6 +3236,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mean_f32 = clCreateKernel(prog, "kernel_mean_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_mean_f32_4 = clCreateKernel(prog, "kernel_mean_f32_4", &err), err));
@@ -3120,6 +3256,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_sub =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_sub         = clCreateKernel(backend_ctx->program_sub, "kernel_sub", &err), err));
         CL_CHECK((backend_ctx->kernel_sub_row     = clCreateKernel(backend_ctx->program_sub, "kernel_sub_row", &err), err));
@@ -3139,6 +3276,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_sum_rows_f32 =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_sum_rows_f32 = clCreateKernel(backend_ctx->program_sum_rows_f32, "kernel_sum_rows_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_sum_rows_f32_4 = clCreateKernel(backend_ctx->program_sum_rows_f32, "kernel_sum_rows_f32_4", &err), err));
@@ -3156,6 +3294,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog;
         prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_cumsum_blk = clCreateKernel(prog, "kernel_cumsum_blk", &err), err));
         CL_CHECK((backend_ctx->kernel_cumsum_add = clCreateKernel(prog, "kernel_cumsum_add", &err), err));
@@ -3174,6 +3313,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_sigmoid =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_sigmoid_f32 = clCreateKernel(backend_ctx->program_sigmoid, "kernel_sigmoid_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_sigmoid_f16 = clCreateKernel(backend_ctx->program_sigmoid, "kernel_sigmoid_f16", &err), err));
@@ -3191,6 +3331,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_group_norm =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_group_norm         = clCreateKernel(backend_ctx->program_group_norm, "kernel_group_norm", &err), err));
         CL_CHECK((backend_ctx->kernel_group_norm_mul_add = clCreateKernel(backend_ctx->program_group_norm, "kernel_group_norm_mul_add", &err), err));
@@ -3208,6 +3349,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_repeat_f32 = clCreateKernel(prog, "kernel_repeat_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -3225,6 +3367,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         if (!kernel_src.empty()) {
             backend_ctx->program_pad =
                 build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            if (backend_ctx->kernel_build_failed) { return; }
             CL_CHECK((backend_ctx->kernel_pad = clCreateKernel(backend_ctx->program_pad, "kernel_pad", &err), err));
             GGML_LOG_CONT(".");
         } else {
@@ -3245,6 +3388,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_tanh_f32    = clCreateKernel(prog, "kernel_tanh_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_tanh_f32_4  = clCreateKernel(prog, "kernel_tanh_f32_4", &err), err));
         CL_CHECK((backend_ctx->kernel_tanh_f32_nc = clCreateKernel(prog, "kernel_tanh_f32_nc", &err), err));
@@ -3266,6 +3410,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_neg_f32    = clCreateKernel(prog, "kernel_neg_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_neg_f32_4  = clCreateKernel(prog, "kernel_neg_f32_4", &err), err));
         CL_CHECK((backend_ctx->kernel_neg_f32_nc = clCreateKernel(prog, "kernel_neg_f32_nc", &err), err));
@@ -3287,6 +3432,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_exp_f32    = clCreateKernel(prog, "kernel_exp_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_exp_f32_4  = clCreateKernel(prog, "kernel_exp_f32_4", &err), err));
         CL_CHECK((backend_ctx->kernel_exp_f32_nc = clCreateKernel(prog, "kernel_exp_f32_nc", &err), err));
@@ -3308,6 +3454,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_expm1_f32    = clCreateKernel(prog, "kernel_expm1_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_expm1_f32_4  = clCreateKernel(prog, "kernel_expm1_f32_4", &err), err));
         CL_CHECK((backend_ctx->kernel_expm1_f32_nc = clCreateKernel(prog, "kernel_expm1_f32_nc", &err), err));
@@ -3329,6 +3476,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_abs_f32    = clCreateKernel(prog, "kernel_abs_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_abs_f32_4  = clCreateKernel(prog, "kernel_abs_f32_4", &err), err));
         CL_CHECK((backend_ctx->kernel_abs_f32_nc = clCreateKernel(prog, "kernel_abs_f32_nc", &err), err));
@@ -3350,6 +3498,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 #define CL_UNARY_EXT_K(op) \
         CL_CHECK((backend_ctx->kernel_##op##_f32    = clCreateKernel(prog, "kernel_" #op "_f32",    &err), err)); \
         CL_CHECK((backend_ctx->kernel_##op##_f32_4  = clCreateKernel(prog, "kernel_" #op "_f32_4",  &err), err)); \
@@ -3382,6 +3531,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_softplus_f32    = clCreateKernel(prog, "kernel_softplus_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_softplus_f32_4  = clCreateKernel(prog, "kernel_softplus_f32_4", &err), err));
         CL_CHECK((backend_ctx->kernel_softplus_f32_nc = clCreateKernel(prog, "kernel_softplus_f32_nc", &err), err));
@@ -3404,6 +3554,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         if (!kernel_src.empty()) {
             backend_ctx->program_upscale =
                 build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            if (backend_ctx->kernel_build_failed) { return; }
             CL_CHECK((backend_ctx->kernel_upscale = clCreateKernel(backend_ctx->program_upscale, "kernel_upscale", &err), err));
             if (backend_ctx->program_upscale) {
                 cl_int err_bilinear;
@@ -3435,6 +3586,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_concat_b1 = clCreateKernel(prog, "kernel_concat_b1", &err), err));
         CL_CHECK((backend_ctx->kernel_concat_b2 = clCreateKernel(prog, "kernel_concat_b2", &err), err));
         CL_CHECK((backend_ctx->kernel_concat_b4 = clCreateKernel(prog, "kernel_concat_b4", &err), err));
@@ -3457,6 +3609,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         if (!kernel_src.empty()) {
             backend_ctx->program_tsembd =
                 build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            if (backend_ctx->kernel_build_failed) { return; }
             CL_CHECK((backend_ctx->kernel_timestep_embedding = clCreateKernel(backend_ctx->program_tsembd, "kernel_timestep_embedding", &err), err));
             GGML_LOG_CONT(".");
         } else {
@@ -3477,6 +3630,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_set_rows =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_set_rows_f32_i64 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_f32_i64", &err), err));
         CL_CHECK((backend_ctx->kernel_set_rows_f32_i32 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_f32_i32", &err), err));
@@ -3509,10 +3663,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                 if (!kernel_src.empty()) {
                     backend_ctx->program_conv_2d_f16 =
                         build_program_from_source(backend_ctx, kernel_src.c_str(), (std::string(compile_opts) + " -DUSE_FP16=1").c_str());
+                    if (backend_ctx->kernel_build_failed) { return; }
                     CL_CHECK((backend_ctx->kernel_conv_2d_f16 = clCreateKernel(backend_ctx->program_conv_2d_f16, "kernel_conv_2d", &err), err));
                     GGML_LOG_CONT(".");
                     backend_ctx->program_conv_2d_f32 =
                         build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+                    if (backend_ctx->kernel_build_failed) { return; }
                     CL_CHECK((backend_ctx->kernel_conv_2d_f32 = clCreateKernel(backend_ctx->program_conv_2d_f32, "kernel_conv_2d", &err), err));
                     GGML_LOG_CONT(".");
                 } else {
@@ -3525,6 +3681,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                 if (!kernel_src_f16_f32.empty()) {
                     backend_ctx->program_conv_2d_f16_f32 =
                         build_program_from_source(backend_ctx, kernel_src_f16_f32.c_str(), compile_opts);
+                    if (backend_ctx->kernel_build_failed) { return; }
                     CL_CHECK((backend_ctx->kernel_conv_2d_f16_f32 = clCreateKernel(backend_ctx->program_conv_2d_f16_f32, "kernel_conv_2d", &err), err));
                     GGML_LOG_CONT(".");
                 } else {
@@ -3545,6 +3702,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_ssm_conv_f32_f32   = clCreateKernel(prog, "kernel_ssm_conv_f32_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_ssm_conv_f32_f32_4 = clCreateKernel(prog, "kernel_ssm_conv_f32_f32_4", &err), err));
@@ -3563,6 +3721,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_ssm_scan_f32 = clCreateKernel(prog, "kernel_ssm_scan_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_ssm_scan_f32_mamba2_d128 = clCreateKernel(prog, "kernel_ssm_scan_f32_mamba2_d128", &err), err));
@@ -3665,6 +3824,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                     opts += " -DSUBGROUPS_PER_WG=" + std::to_string(spw);
 
                     cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
+                    if (backend_ctx->kernel_build_failed) { return; }
 
                     CL_CHECK((backend_ctx->kernel_gated_delta_net_f32[si][kda][tgpp] =
                                 clCreateKernel(prog, "kernel_gated_delta_net", &err), err));
@@ -3686,6 +3846,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     #endif
         cl_program prog = build_program_from_source(
             backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_moe_combine_f32 =
                     clCreateKernel(prog, "kernel_moe_combine_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_moe_combine_bias_f32 =
@@ -3705,6 +3866,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_mul_mv_id_q4_0_f32_8x_flat =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mv_id_q4_0_f32_8x_flat = clCreateKernel(backend_ctx->program_mul_mv_id_q4_0_f32_8x_flat, "kernel_mul_mv_id_q4_0_f32_8x_flat", &err), err));
         GGML_LOG_CONT(".");
@@ -3721,6 +3883,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_mul_mv_id_q8_0_f32 =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mv_id_q8_0_f32 = clCreateKernel(backend_ctx->program_mul_mv_id_q8_0_f32, "kernel_mul_mv_id_q8_0_f32", &err), err));
         GGML_LOG_CONT(".");
@@ -3737,6 +3900,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_mul_mv_id_q8_0_f32_flat =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mv_id_q8_0_f32_flat = clCreateKernel(backend_ctx->program_mul_mv_id_q8_0_f32_flat, "kernel_mul_mv_id_q8_0_f32_flat", &err), err));
         GGML_LOG_CONT(".");
@@ -3753,6 +3917,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_mul_mv_id_mxfp4_f32 =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mv_id_mxfp4_f32 = clCreateKernel(backend_ctx->program_mul_mv_id_mxfp4_f32, "kernel_mul_mv_id_mxfp4_f32", &err), err));
         GGML_LOG_CONT(".");
@@ -3769,6 +3934,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_mul_mv_id_mxfp4_f32_flat =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_mul_mv_id_mxfp4_f32_flat = clCreateKernel(backend_ctx->program_mul_mv_id_mxfp4_f32_flat, "kernel_mul_mv_id_mxfp4_f32_flat", &err), err));
         GGML_LOG_CONT(".");
@@ -3787,6 +3953,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_transpose =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_transpose_32_16 = clCreateKernel(backend_ctx->program_transpose, "kernel_transpose_32_16", &err), err));
         CL_CHECK((backend_ctx->kernel_transpose_32    = clCreateKernel(backend_ctx->program_transpose, "kernel_transpose_32", &err), err));
@@ -3808,6 +3975,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("gemm_noshuffle_q1_0_f32.cl");
 #endif
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q1_0_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q1_0_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -3829,6 +3997,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
 
         cl_program prog = build_program_from_source(backend_ctx, kernel_src_CL_gemv_general.c_str(), CL_gemv_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q1_0_f32 = clCreateKernel(prog, "kernel_gemv_noshuffle_q1_0_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -3854,6 +4023,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
 
         cl_program prog = build_program_from_source(backend_ctx, kernel_src_CL_gemv_general.c_str(), CL_gemv_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_0_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32_mc3 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_0_f32_mc3", &err), err));
@@ -3883,6 +4053,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
 
         cl_program prog = build_program_from_source(backend_ctx, kernel_src_CL_gemv.c_str(), CL_gemv_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32_4096_1_4096 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_0_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -3899,6 +4070,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         }
 
         prog = build_program_from_source(backend_ctx, kernel_src_CL_gemv.c_str(), CL_gemv_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32_4096_1_11008 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_0_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -3915,6 +4087,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         }
 
         prog = build_program_from_source(backend_ctx, kernel_src_CL_gemv.c_str(), CL_gemv_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32_11008_1_4096 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_0_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -3932,6 +4105,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         }
 
         prog = build_program_from_source(backend_ctx, kernel_src_CL_gemv.c_str(), CL_gemv_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32_32000_1_4096 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_0_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -3947,6 +4121,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src_CL_gemm = read_file("gemm_noshuffle_q4_0_f32.cl");
 #endif
         cl_program prog = build_program_from_source(backend_ctx, kernel_src_CL_gemm.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_0_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_0_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -3968,6 +4143,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             const std::string kernel_src = read_file("gemv_noshuffle_q4_0_f32_32b_trans.cl");
 #endif
             cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
+            if (backend_ctx->kernel_build_failed) { return; }
             CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32_32b_trans =
                 clCreateKernel(prog, "kernel_gemv_noshuffle_q4_0_f32_32b_trans", &err), err));
             CL_CHECK(clReleaseProgram(prog));
@@ -3999,6 +4175,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("gemm_noshuffle_q4_1_f32.cl");
 #endif
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_1_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_1_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -4021,6 +4198,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
 
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), CL_gemv_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_1_f32 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_1_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_1_f32_mc3 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_1_f32_mc3", &err), err));
@@ -4038,6 +4216,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("gemm_noshuffle_q5_0_f32.cl");
 #endif
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q5_0_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q5_0_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -4053,6 +4232,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("gemm_noshuffle_q5_0_q8_1_dp4a.cl");
 #endif
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q5_0_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q5_0_q8_1_dp4a", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q5_0_q8_1_dp4a_wimg = clCreateKernel(prog, "kernel_gemm_noshuffle_q5_0_q8_1_dp4a_wimg", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4075,6 +4255,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("gemv_noshuffle_q5_0_f32.cl");
 #endif
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), CL_gemv_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q5_0_f32 = clCreateKernel(prog, "kernel_gemv_noshuffle_q5_0_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -4090,6 +4271,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("gemm_noshuffle_q5_1_f32.cl");
 #endif
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q5_1_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q5_1_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -4111,6 +4293,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("gemv_noshuffle_q5_1_f32.cl");
 #endif
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), CL_gemv_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q5_1_f32 = clCreateKernel(prog, "kernel_gemv_noshuffle_q5_1_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -4126,6 +4309,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("gemm_noshuffle_iq4_nl_f32.cl");
 #endif
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_iq4_nl_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_iq4_nl_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -4141,6 +4325,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("gemm_noshuffle_iq4_nl_q8_1_dp4a.cl");
 #endif
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_iq4_nl_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_iq4_nl_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -4156,6 +4341,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("gemm_noshuffle_q4_0_q8_1_dp4a.cl");
 #endif
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_0_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -4178,6 +4364,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
 
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), CL_gemv_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_iq4_nl_f32 = clCreateKernel(prog, "kernel_gemv_noshuffle_iq4_nl_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4194,6 +4381,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("gemm_noshuffle_q8_0_f32.cl");
 #endif
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q8_0_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q8_0_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -4236,6 +4424,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
 
         cl_program prog = build_program_from_source(backend_ctx, kernel_src_CL_gemv_general.c_str(), CL_gemv_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q8_0_f32 = clCreateKernel(prog, "kernel_gemv_noshuffle_q8_0_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q8_0_f32_splitk = clCreateKernel(prog, "kernel_gemv_noshuffle_q8_0_f32_splitk", &err), err));
@@ -4253,6 +4442,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("gemm_noshuffle_q4_k_f32.cl");
 #endif
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32_r1 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_r1", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32_kimg = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_kimg", &err), err));
@@ -4277,6 +4467,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         if (const char * e = getenv("GGML_OPENCL_Q4K_DP4A_TS")) { q4k_dp4a_ts = atoi(e); }
         std::string dp4a_opts = compile_opts + " -DTILESIZE_N=" + std::to_string(q4k_dp4a_ts);
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), dp4a_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4293,6 +4484,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("gemm_noshuffle_q8_0_q8_1_dp4a.cl");
 #endif
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q8_0_q8_1_dp4a", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a_wimg = clCreateKernel(prog, "kernel_gemm_noshuffle_q8_0_q8_1_dp4a_wimg", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4309,6 +4501,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("gemm_noshuffle_q5_k_q8_1_dp4a.cl");
 #endif
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q5_k_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q5_k_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -4324,6 +4517,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("gemm_noshuffle_q6_k_q8_1_dp4a.cl");
 #endif
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q6_k_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -4339,6 +4533,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("quant_a_q8_1.cl");
 #endif
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_quant_a_q8_1 = clCreateKernel(prog, "kernel_quant_a_q8_1", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -4373,6 +4568,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
 
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), CL_gemv_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_k_f32 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_k_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_k_f32_mc3 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_k_f32_mc3", &err), err));
@@ -4399,6 +4595,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         }
         cl_program prog = build_program_from_source(
             backend_ctx, kernel_src.c_str(), CL_gemv_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_k_f32_o4 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_k_f32_o4", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -4417,6 +4614,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         std::string compile_opts = std::string("-cl-std=") + opencl_c_std + " -cl-mad-enable ";
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_k_f32_tiled =
             clCreateKernel(prog, "kernel_gemv_noshuffle_q4_k_f32_tiled", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4439,6 +4637,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             const std::string kernel_src = read_file("gemv_noshuffle_q4_k_f32_32b_trans.cl");
 #endif
             cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
+            if (backend_ctx->kernel_build_failed) { return; }
             CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_k_f32_32b_trans =
                 clCreateKernel(prog, "gemv_noshuffle_q4_k_f32_32b_trans", &err), err));
             CL_CHECK(clReleaseProgram(prog));
@@ -4489,6 +4688,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("gemv_moe_q4_1_f32_ns.cl");
 #endif
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemv_moe_q4_1_f32_ns = clCreateKernel(prog, "kernel_gemv_moe_q4_1_f32_ns", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4505,6 +4705,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("gemm_moe_q4_1_f32_ns.cl");
 #endif
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemm_moe_q4_1_f32_ns = clCreateKernel(prog, "kernel_gemm_moe_q4_1_f32_ns", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4540,6 +4741,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_gemv_moe_mxfp4_f32 =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemv_moe_mxfp4_f32 = clCreateKernel(backend_ctx->program_gemv_moe_mxfp4_f32, "kernel_gemv_moe_mxfp4_f32", &err), err));
         GGML_LOG_CONT(".");
@@ -4556,6 +4758,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         backend_ctx->program_gemm_moe_mxfp4_f32 =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemm_moe_mxfp4_f32 = clCreateKernel(backend_ctx->program_gemm_moe_mxfp4_f32, "kernel_gemm_moe_mxfp4_f32", &err), err));
         GGML_LOG_CONT(".");
@@ -4572,6 +4775,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemv_moe_q4_0_f32_ns = clCreateKernel(prog, "kernel_gemv_moe_q4_0_f32_ns", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4589,6 +4793,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemm_moe_q4_0_f32_ns = clCreateKernel(prog, "kernel_gemm_moe_q4_0_f32_ns", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4645,6 +4850,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         cl_program prog_gemv = build_program_from_source(
             backend_ctx, oracle_gemv_src.c_str(), backend_ctx->moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_oracle_q4_0_gemv_buffer =
             clCreateKernel(prog_gemv, "oracle_q4_0_gemv_buffer", &err), err));
         CL_CHECK((backend_ctx->kernel_oracle_q4_0_gemv_image =
@@ -4653,6 +4859,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         cl_program prog_gemm = build_program_from_source(
             backend_ctx, oracle_gemm_src.c_str(), backend_ctx->moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_oracle_q4_0_gemm_buffer =
             clCreateKernel(prog_gemm, "oracle_q4_0_gemm_buffer", &err), err));
         CL_CHECK((backend_ctx->kernel_oracle_q4_0_gemm_image =
@@ -4675,6 +4882,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemm_moe_q8_0_f32_ns = clCreateKernel(prog, "kernel_gemm_moe_q8_0_f32_ns", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4692,6 +4900,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemv_moe_q5_0_f32_ns = clCreateKernel(prog, "kernel_gemv_moe_q5_0_f32_ns", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4709,6 +4918,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemm_moe_q5_0_f32_ns = clCreateKernel(prog, "kernel_gemm_moe_q5_0_f32_ns", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4726,6 +4936,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemv_moe_q5_1_f32_ns = clCreateKernel(prog, "kernel_gemv_moe_q5_1_f32_ns", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4743,6 +4954,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemm_moe_q5_1_f32_ns = clCreateKernel(prog, "kernel_gemm_moe_q5_1_f32_ns", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4760,6 +4972,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemv_moe_q4_k_f32_ns = clCreateKernel(prog, "kernel_gemv_moe_q4_k_f32_ns", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_moe_q4_k_f32_ns_wimg = clCreateKernel(prog, "kernel_gemv_moe_q4_k_f32_ns_wimg", &err), err));
@@ -4778,6 +4991,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemm_moe_q4_k_f32_ns = clCreateKernel(prog, "kernel_gemm_moe_q4_k_f32_ns", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4822,6 +5036,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemm_moe_q4_k_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_moe_q4_k_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4839,6 +5054,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemm_moe_mxfp4_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_moe_mxfp4_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4874,6 +5090,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemm_moe_q4_0_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_moe_q4_0_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4910,18 +5127,21 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string opts80 = CL_moe_compile_opts + " -DMOE_QT=80";
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts80.c_str());
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemm_moe_q8_1_dp4a_q80 = clCreateKernel(prog, "kernel_gemm_moe_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
 
         const std::string opts50 = CL_moe_compile_opts + " -DMOE_QT=50";
         cl_program prog50 =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts50.c_str());
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemm_moe_q8_1_dp4a_q50 = clCreateKernel(prog50, "kernel_gemm_moe_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog50));
 
         const std::string opts5 = CL_moe_compile_opts + " -DMOE_QT=5";
         cl_program prog5 =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts5.c_str());
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemm_moe_q8_1_dp4a_q5k = clCreateKernel(prog5, "kernel_gemm_moe_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog5));
         GGML_LOG_CONT(".");
@@ -4938,6 +5158,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_moe_reorder_quant_a_q8_1 = clCreateKernel(prog, "kernel_moe_reorder_quant_a_q8_1", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4955,6 +5176,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemv_moe_q5_k_f32_ns = clCreateKernel(prog, "kernel_gemv_moe_q5_k_f32_ns", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4972,6 +5194,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemm_moe_q5_k_f32_ns = clCreateKernel(prog, "kernel_gemm_moe_q5_k_f32_ns", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4989,6 +5212,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemv_moe_q6_k_f32_ns = clCreateKernel(prog, "kernel_gemv_moe_q6_k_f32_ns", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -5006,6 +5230,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemm_moe_q6_k_f32_ns = clCreateKernel(prog, "kernel_gemm_moe_q6_k_f32_ns", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -5023,6 +5248,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemv_moe_q2_k_f32_ns = clCreateKernel(prog, "kernel_gemv_moe_q2_k_f32_ns", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -5040,6 +5266,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemm_moe_q2_k_f32_ns = clCreateKernel(prog, "kernel_gemm_moe_q2_k_f32_ns", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -5057,6 +5284,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemv_moe_q3_k_f32_ns = clCreateKernel(prog, "kernel_gemv_moe_q3_k_f32_ns", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -5074,6 +5302,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemm_moe_q3_k_f32_ns = clCreateKernel(prog, "kernel_gemm_moe_q3_k_f32_ns", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -5108,6 +5337,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemm_moe_q6_k_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_moe_q6_k_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -5125,6 +5355,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemv_moe_mxfp4_f32_ns = clCreateKernel(prog, "kernel_gemv_moe_mxfp4_f32_ns", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_moe_mxfp4_f32_ns_wimg = clCreateKernel(prog, "kernel_gemv_moe_mxfp4_f32_ns_wimg", &err), err));
@@ -5143,6 +5374,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
             CL_CHECK((backend_ctx->kernel_gemm_moe_mxfp4_f32_ns = clCreateKernel(prog, "kernel_gemm_moe_mxfp4_f32_ns", &err), err));
             CL_CHECK(clReleaseProgram(prog));
@@ -5178,6 +5410,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_moe_reorder_b = clCreateKernel(prog, "kernel_moe_reorder_b", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -5195,6 +5428,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_moe_histogram = clCreateKernel(prog, "kernel_moe_histogram", &err), err));
         CL_CHECK((backend_ctx->kernel_moe_scan = clCreateKernel(prog, "kernel_moe_scan", &err), err));
@@ -5223,6 +5457,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_gemv_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q6_K_f32 = clCreateKernel(prog, "kernel_gemv_noshuffle_q6_K_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q6_K_f32_mc3 = clCreateKernel(prog, "kernel_gemv_noshuffle_q6_K_f32_mc3", &err), err));
@@ -5259,6 +5494,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_gemv_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q6_K_f32_o4 = clCreateKernel(prog, "kernel_gemv_noshuffle_q6_K_f32_o4", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -5267,6 +5503,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         // image1d_buffer (the texture cache caps the streaming lm_head read
         // bandwidth). Opt-in via GGML_OPENCL_Q6K_GEMV_O4_GLOBAL.
         cl_program prog_g = build_program_from_source(backend_ctx, kernel_src.c_str(), CL_gemv_compile_opts + " -DQ6K_O4_GLOBAL");
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q6_K_f32_o4_global =
             clCreateKernel(prog_g, "kernel_gemv_noshuffle_q6_K_f32_o4_global", &err), err));
         CL_CHECK(clReleaseProgram(prog_g));
@@ -5286,6 +5523,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         std::string compile_opts = std::string("-cl-std=") + opencl_c_std + " -cl-mad-enable ";
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q6_K_f32_tiled =
             clCreateKernel(prog, "kernel_gemv_noshuffle_q6_K_f32_tiled", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q6_K_f32_tiled_mc3 =
@@ -5307,6 +5545,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         std::string compile_opts = std::string("-cl-std=") + opencl_c_std + " -cl-mad-enable ";
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_K_f32_tiled =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q6_K_f32_tiled", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -5324,9 +5563,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_K_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q6_K_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_K_f32_cok = clCreateKernel(prog, "kernel_gemm_noshuffle_q6_K_f32_cok", &err), err));
+        GGML_LOG_INFO("ggml_opencl: dense q6_K prefill GEMM path: %s (KALSA_Q6K_DENSE)\n",
+                      kalsa_q6k_dense_f32() ? "f32" : "dp4a");
         GGML_LOG_CONT(".");
     }
 
@@ -5347,6 +5589,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
 
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), CL_gemv_compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
 
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q5_k_f32 = clCreateKernel(prog, "kernel_gemv_noshuffle_q5_k_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q5_k_f32_mc3 = clCreateKernel(prog, "kernel_gemv_noshuffle_q5_k_f32_mc3", &err), err));
@@ -5364,12 +5607,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("gemm_noshuffle_q5_k_f32.cl");
 #endif
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q5_k_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q5_k_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
     GGML_LOG_CONT("\n");
+    ggml_opencl_record_verdict(backend_ctx, true);
     backend_ctx->kernels_loaded = true;
     ggml_opencl_log_alloc_note("load_cl_kernels.done");
 }
@@ -6939,6 +7184,18 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     if (const char * env = getenv("GGML_OPENCL_F16_MROW_RPT")) {
         const int v = atoi(env);
         backend_ctx->f16_mrow_rpt = (v == 2 || v == 4 || v == 8 || v == 16) ? v : 1;
+    }
+
+    if (!backend_ctx->program_cache_initialized) {
+        backend_ctx->program_cache = cl_program_cache_init(backend_ctx->device);
+        backend_ctx->program_cache_initialized = true;
+
+        cl_program_cache_verdict v;
+        if (cl_program_cache_load_verdict(backend_ctx->program_cache, v) && !v.ok) {
+            backend_ctx->kernel_build_failed = true;
+            GGML_LOG_WARN("ggml_opencl: kernel set failed to build on '%s' (driver '%s'); device disabled, ops stay on CPU\n",
+                          v.device_name.c_str(), v.driver_version.c_str());
+        }
     }
 
     dev_ctx->backend_ctx = backend_ctx.release();
@@ -9262,6 +9519,12 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
 
+    // A kernel set that does not compile on this driver keeps the whole device
+    // off the graph, so the affected nodes run on CPU.
+    if (backend_ctx->kernel_build_failed) {
+        return false;
+    }
+
     // reject ops that match the opfilter regex
     if (dev_ctx->opfilter && std::regex_match(std::string(ggml_op_desc(op)), *dev_ctx->opfilter)) {
         return false;
@@ -9592,6 +9855,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             return true;
         case GGML_OP_ARGSORT: {
             load_cl_kernels_argsort(backend_ctx);
+            if (backend_ctx->kernel_build_failed || backend_ctx->kernel_argsort_f32_i32 == nullptr) {
+                return false;
+            }
 
             cl_kernel kernel = backend_ctx->kernel_argsort_f32_i32;
             int max_workgroup_size = backend_ctx->get_kernel_workgroup_size(kernel);
@@ -10660,6 +10926,14 @@ static cl_mem ggml_cl_create_temp_upload_buffer(
     return buf;
 }
 
+// A failed weight upload must fail the model load (the app retries on CPU)
+// instead of aborting the process.
+[[noreturn]] static void throw_set_tensor_upload_error(const char * what, const char * tensor_name) {
+    throw std::runtime_error(
+        std::string("ggml_opencl: set_tensor: ") + what + " failed for tensor '" +
+        (tensor_name ? tensor_name : "?") + "'");
+}
+
 // Allocate a temporary download buffer of `nbytes`. The caller runs a kernel
 // that writes into it, then reads it back to host via clEnqueueReadBuffer (or
 // equivalent). Mirrors ggml_cl_create_temp_upload_buffer; the host-pinned
@@ -10727,10 +11001,15 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         cl_int err;
         cl_mem data_device = clCreateBuffer(context, CL_MEM_READ_WRITE,
             ggml_nbytes(tensor), NULL, &err);
-        CL_CHECK(err);
-        CL_CHECK(clEnqueueWriteBuffer(
+        if (err != CL_SUCCESS) {
+            throw_set_tensor_upload_error("staging clCreateBuffer", tensor->name);
+        }
+        if (clEnqueueWriteBuffer(
             queue, data_device, CL_TRUE, 0,
-            ggml_nbytes(tensor), data, 0, NULL, NULL));
+            ggml_nbytes(tensor), data, 0, NULL, NULL) != CL_SUCCESS) {
+            clReleaseMemObject(data_device);
+            throw_set_tensor_upload_error("staging clEnqueueWriteBuffer", tensor->name);
+        }
 
         // The original tensor memory is divided into scales and quants, i.e.,
         // we first store scales, then quants.
@@ -10813,7 +11092,9 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
         cl_int err;
         cl_mem data_device = ggml_cl_create_temp_upload_buffer(context, queue, ggml_nbytes(tensor), data, tensor->name);
-        GGML_ASSERT(data_device != NULL && "set_tensor: temp upload buffer alloc failed");
+        if (!data_device) {
+            throw_set_tensor_upload_error("temp upload buffer alloc", tensor->name);
+        }
 
         // We consider the specified offset arg as always, although For weights
         // the offset arg should be 0 (we do not assert this).
@@ -10929,8 +11210,14 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                         }
                     }
                 }
-                CL_CHECK(clEnqueueWriteBuffer(queue, extra->d, CL_TRUE, 0, hd.size()*sizeof(uint16_t), hd.data(), 0, NULL, NULL));
-                CL_CHECK(clEnqueueWriteBuffer(queue, extra->q, CL_TRUE, 0, hq.size()*sizeof(uint32_t), hq.data(), 0, NULL, NULL));
+                if (clEnqueueWriteBuffer(queue, extra->d, CL_TRUE, 0, hd.size()*sizeof(uint16_t), hd.data(), 0, NULL, NULL) != CL_SUCCESS) {
+                    clReleaseMemObject(data_device);
+                    throw_set_tensor_upload_error("clEnqueueWriteBuffer d", tensor->name);
+                }
+                if (clEnqueueWriteBuffer(queue, extra->q, CL_TRUE, 0, hq.size()*sizeof(uint32_t), hq.data(), 0, NULL, NULL) != CL_SUCCESS) {
+                    clReleaseMemObject(data_device);
+                    throw_set_tensor_upload_error("clEnqueueWriteBuffer q", tensor->name);
+                }
                 GGML_LOG_INFO("ggml_opencl: KALSA host repack for q4_0 MoE tensor %dx%dx%d\n", ne00, ne01, ne02);
                 CL_CHECK(clReleaseMemObject(data_device));
             } else {
@@ -11091,14 +11378,20 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                 wimg_desc.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
                 wimg_desc.image_width = (size_t)M * K / 8;
                 wimg_desc.buffer      = extra->q;
-                CL_CHECK((extra->q_img = clCreateImage(context, CL_MEM_READ_ONLY, &wimg_fmt, &wimg_desc, NULL, &err), err));
+                extra->q_img = clCreateImage(context, CL_MEM_READ_ONLY, &wimg_fmt, &wimg_desc, NULL, &err);
+                if (err != CL_SUCCESS) {
+                    throw_set_tensor_upload_error("weight clCreateImage", tensor->name);
+                }
 
                 wimg_fmt = { CL_R, CL_HALF_FLOAT };
                 memset(&wimg_desc, 0, sizeof(wimg_desc));
                 wimg_desc.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
                 wimg_desc.image_width = (size_t)M * K / 32;
                 wimg_desc.buffer      = extra->d;
-                CL_CHECK((extra->d_img = clCreateImage(context, CL_MEM_READ_ONLY, &wimg_fmt, &wimg_desc, NULL, &err), err));
+                extra->d_img = clCreateImage(context, CL_MEM_READ_ONLY, &wimg_fmt, &wimg_desc, NULL, &err);
+                if (err != CL_SUCCESS) {
+                    throw_set_tensor_upload_error("weight clCreateImage", tensor->name);
+                }
             } else {
                 // Transpose q and d as ushort
                 transpose_2d_as_16b(backend_ctx, extra->q, extra->q, size_q, K/4, M);
@@ -11123,7 +11416,9 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
         cl_int err;
         cl_mem data_device = ggml_cl_create_temp_upload_buffer(context, queue, ggml_nbytes(tensor), data, tensor->name);
-        GGML_ASSERT(data_device != NULL && "set_tensor: temp upload buffer alloc failed");
+        if (!data_device) {
+            throw_set_tensor_upload_error("temp upload buffer alloc", tensor->name);
+        }
 
         cl_buffer_region region;
 
@@ -11253,7 +11548,9 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
         cl_int err;
         cl_mem data_device = ggml_cl_create_temp_upload_buffer(context, queue, ggml_nbytes(tensor), data, tensor->name);
-        GGML_ASSERT(data_device != NULL && "set_tensor: temp upload buffer alloc failed");
+        if (!data_device) {
+            throw_set_tensor_upload_error("temp upload buffer alloc", tensor->name);
+        }
 
         cl_buffer_region region;
 
@@ -11328,8 +11625,14 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                     size_t nb32 = (size_t)ne00 / 32;
                     size_t sc_elems = (size_t)ne02 * ne01 * nb32 * 2;
                     size_t mn_elems = (size_t)ne02 * ne01 * nb32;
-                    extra->scale = clCreateBuffer(context, CL_MEM_READ_WRITE, sc_elems * sizeof(cl_half), NULL, &err); CL_CHECK(err);
-                    extra->min   = clCreateBuffer(context, CL_MEM_READ_WRITE, mn_elems * sizeof(cl_half), NULL, &err); CL_CHECK(err);
+                    extra->scale = clCreateBuffer(context, CL_MEM_READ_WRITE, sc_elems * sizeof(cl_half), NULL, &err);
+                    if (err != CL_SUCCESS) {
+                        throw_set_tensor_upload_error("scale clCreateBuffer", tensor->name);
+                    }
+                    extra->min   = clCreateBuffer(context, CL_MEM_READ_WRITE, mn_elems * sizeof(cl_half), NULL, &err);
+                    if (err != CL_SUCCESS) {
+                        throw_set_tensor_upload_error("min clCreateBuffer", tensor->name);
+                    }
                     cl_kernel ek = backend_ctx->kernel_moe_expand_scale_q5_0;
                     CL_CHECK(clSetKernelArg(ek, 0, sizeof(cl_mem), &extra->d));
                     CL_CHECK(clSetKernelArg(ek, 1, sizeof(cl_mem), &extra->scale));
@@ -11415,7 +11718,9 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
         cl_int err;
         cl_mem data_device = ggml_cl_create_temp_upload_buffer(context, queue, ggml_nbytes(tensor), data, tensor->name);
-        GGML_ASSERT(data_device != NULL && "set_tensor: temp upload buffer alloc failed");
+        if (!data_device) {
+            throw_set_tensor_upload_error("temp upload buffer alloc", tensor->name);
+        }
 
         cl_buffer_region region;
 
@@ -11566,7 +11871,9 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
         cl_int err;
         cl_mem data_device = ggml_cl_create_temp_upload_buffer(context, queue, ggml_nbytes(tensor), data, tensor->name);
-        GGML_ASSERT(data_device != NULL && "set_tensor: temp upload buffer alloc failed");
+        if (!data_device) {
+            throw_set_tensor_upload_error("temp upload buffer alloc", tensor->name);
+        }
 
         // The original tensor memory is divided into scales and quants, i.e.,
         // we first store scales, then quants.
@@ -11675,7 +11982,9 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
         cl_int err;
         cl_mem data_device = ggml_cl_create_temp_upload_buffer(context, queue, ggml_nbytes(tensor), data, tensor->name);
-        GGML_ASSERT(data_device != NULL && "set_tensor: temp upload buffer alloc failed");
+        if (!data_device) {
+            throw_set_tensor_upload_error("temp upload buffer alloc", tensor->name);
+        }
 
         // The original tensor memory is divided into scales and quants, i.e.,
         // we first store scales, then quants.
@@ -11728,7 +12037,9 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                 size_t nb32 = (size_t)ne00 / 32;
                 size_t scale_elems = (size_t)ne02 * ne01 * nb32 * 2;   // 2 per-16-seg scales / 32-block
                 extra->scale = clCreateBuffer(context, CL_MEM_READ_WRITE, scale_elems * sizeof(cl_half), NULL, &err);
-                CL_CHECK(err);
+                if (err != CL_SUCCESS) {
+                    throw_set_tensor_upload_error("scale clCreateBuffer", tensor->name);
+                }
                 cl_kernel ek = backend_ctx->kernel_moe_expand_scale_q8_0;
                 CL_CHECK(clSetKernelArg(ek, 0, sizeof(cl_mem), &extra->d));
                 CL_CHECK(clSetKernelArg(ek, 1, sizeof(cl_mem), &extra->scale));
@@ -11775,7 +12086,9 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
         cl_int err;
         cl_mem data_device = ggml_cl_create_temp_upload_buffer(context, queue, ggml_nbytes(tensor), data, tensor->name);
-        GGML_ASSERT(data_device != NULL && "set_tensor: temp upload buffer alloc failed");
+        if (!data_device) {
+            throw_set_tensor_upload_error("temp upload buffer alloc", tensor->name);
+        }
 
         cl_buffer_region region;
 
@@ -11856,7 +12169,9 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         cl_int err;
         ggml_opencl_log_alloc("try.q4_k.staging", ggml_nbytes(tensor), 0);
         cl_mem data_device = ggml_cl_create_temp_upload_buffer(context, queue, ggml_nbytes(tensor), data, tensor->name);
-        GGML_ASSERT(data_device != NULL && "q4_K set_tensor: temp upload buffer alloc failed");
+        if (!data_device) {
+            throw_set_tensor_upload_error("q4_K temp upload buffer alloc", tensor->name);
+        }
         ggml_opencl_log_alloc("q4_k.staging", ggml_nbytes(tensor), CL_SUCCESS);
         ggml_opencl_log_alloc_note("q4_k.write_done");
 
@@ -11936,7 +12251,9 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             const size_t q4k_img_px = (size_t) ggml_nelements(tensor) / 8;
             ggml_opencl_log_alloc("try.q4_k.q_img", q4k_img_px * 4, 0);
             extra->q_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_format_q, &img_desc_q, NULL, &err);
-            CL_CHECK(err);
+            if (err != CL_SUCCESS) {
+                throw_set_tensor_upload_error("weight clCreateImage", tensor->name);
+            }
             ggml_opencl_log_alloc("q4_k.q_img", q4k_img_px * 4, err);
             tensor->extra = extra;
 
@@ -12028,7 +12345,10 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                 wimg_desc.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
                 wimg_desc.image_width = (size_t)M * K / 8;
                 wimg_desc.buffer      = extra->q;
-                CL_CHECK((extra->q_img = clCreateImage(context, CL_MEM_READ_ONLY, &wimg_fmt, &wimg_desc, NULL, &err), err));
+                extra->q_img = clCreateImage(context, CL_MEM_READ_ONLY, &wimg_fmt, &wimg_desc, NULL, &err);
+                if (err != CL_SUCCESS) {
+                    throw_set_tensor_upload_error("weight clCreateImage", tensor->name);
+                }
             } else {
                 // Transpose q as ushort
                 transpose_2d_as_16b(backend_ctx, extra->q, extra->q, size_q, K/4, M);
@@ -12060,7 +12380,9 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
         cl_int err;
         cl_mem data_device = ggml_cl_create_temp_upload_buffer(context, queue, ggml_nbytes(tensor), data, tensor->name);
-        GGML_ASSERT(data_device != NULL && "q5_K set_tensor: temp upload buffer alloc failed");
+        if (!data_device) {
+            throw_set_tensor_upload_error("q5_K temp upload buffer alloc", tensor->name);
+        }
 
         cl_buffer_region region;
 
@@ -12144,7 +12466,9 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                 { extra->q }
             };
             extra->q_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_format_q, &img_desc_q, NULL, &err);
-            CL_CHECK(err);
+            if (err != CL_SUCCESS) {
+                throw_set_tensor_upload_error("weight clCreateImage", tensor->name);
+            }
             tensor->extra = extra;
 
             // Generic dp4a MoE path
@@ -12156,8 +12480,14 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                     size_t nb32     = (size_t)ne00 / 32;
                     size_t sc_elems = (size_t)ne02 * ne01 * nb32 * 2;
                     size_t mn_elems = (size_t)ne02 * ne01 * nb32;
-                    extra->scale = clCreateBuffer(context, CL_MEM_READ_WRITE, sc_elems * sizeof(cl_half), NULL, &err); CL_CHECK(err);
-                    extra->min   = clCreateBuffer(context, CL_MEM_READ_WRITE, mn_elems * sizeof(cl_half), NULL, &err); CL_CHECK(err);
+                    extra->scale = clCreateBuffer(context, CL_MEM_READ_WRITE, sc_elems * sizeof(cl_half), NULL, &err);
+                    if (err != CL_SUCCESS) {
+                        throw_set_tensor_upload_error("scale clCreateBuffer", tensor->name);
+                    }
+                    extra->min   = clCreateBuffer(context, CL_MEM_READ_WRITE, mn_elems * sizeof(cl_half), NULL, &err);
+                    if (err != CL_SUCCESS) {
+                        throw_set_tensor_upload_error("min clCreateBuffer", tensor->name);
+                    }
                     cl_kernel ek = backend_ctx->kernel_moe_expand_scale_q5_K;
                     CL_CHECK(clSetKernelArg(ek, 0, sizeof(cl_mem), &extra->s));
                     CL_CHECK(clSetKernelArg(ek, 1, sizeof(cl_mem), &extra->d));
@@ -12248,7 +12578,9 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
         cl_int err;
         cl_mem data_device = ggml_cl_create_temp_upload_buffer(context, queue, ggml_nbytes(tensor), data, tensor->name);
-        GGML_ASSERT(data_device != NULL && "q6_K set_tensor: temp upload buffer alloc failed");
+        if (!data_device) {
+            throw_set_tensor_upload_error("q6_K temp upload buffer alloc", tensor->name);
+        }
 
         cl_buffer_region region;
 
@@ -12473,9 +12805,14 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             cl_int err;
             ggml_opencl_log_alloc("try.q2_k.staging", ggml_nbytes(tensor), 0);
             cl_mem data_device = clCreateBuffer(context, CL_MEM_READ_WRITE, ggml_nbytes(tensor), NULL, &err);
-            CL_CHECK(err);
+            if (err != CL_SUCCESS) {
+                throw_set_tensor_upload_error("staging clCreateBuffer", tensor->name);
+            }
             ggml_opencl_log_alloc("q2_k.staging", ggml_nbytes(tensor), err);
-            CL_CHECK(clEnqueueWriteBuffer(queue, data_device, CL_TRUE, 0, ggml_nbytes(tensor), data, 0, NULL, NULL));
+            if (clEnqueueWriteBuffer(queue, data_device, CL_TRUE, 0, ggml_nbytes(tensor), data, 0, NULL, NULL) != CL_SUCCESS) {
+                clReleaseMemObject(data_device);
+                throw_set_tensor_upload_error("staging clEnqueueWriteBuffer", tensor->name);
+            }
 
             ggml_opencl_log_weight_storage_path(backend_ctx, tensor, "trans4-moe");
 
@@ -12551,9 +12888,14 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             cl_int err;
             ggml_opencl_log_alloc("try.q3_k.staging", ggml_nbytes(tensor), 0);
             cl_mem data_device = clCreateBuffer(context, CL_MEM_READ_WRITE, ggml_nbytes(tensor), NULL, &err);
-            CL_CHECK(err);
+            if (err != CL_SUCCESS) {
+                throw_set_tensor_upload_error("staging clCreateBuffer", tensor->name);
+            }
             ggml_opencl_log_alloc("q3_k.staging", ggml_nbytes(tensor), err);
-            CL_CHECK(clEnqueueWriteBuffer(queue, data_device, CL_TRUE, 0, ggml_nbytes(tensor), data, 0, NULL, NULL));
+            if (clEnqueueWriteBuffer(queue, data_device, CL_TRUE, 0, ggml_nbytes(tensor), data, 0, NULL, NULL) != CL_SUCCESS) {
+                clReleaseMemObject(data_device);
+                throw_set_tensor_upload_error("staging clEnqueueWriteBuffer", tensor->name);
+            }
 
             ggml_opencl_log_weight_storage_path(backend_ctx, tensor, "trans4-moe");
             ggml_opencl_log_alloc_note("q3_k.parent_planes SoA=114B/sb (subbuffers of existing parent, not a new clCreateBuffer)");
@@ -12630,7 +12972,9 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         cl_int err;
         cl_mem data_device = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
             size, const_cast<void *>(data), &err);
-        CL_CHECK(err);
+        if (err != CL_SUCCESS) {
+            throw_set_tensor_upload_error("staging clCreateBuffer", tensor->name);
+        }
 
         cl_kernel kernel = backend_ctx->kernel_convert_bf16_to_f16;
         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &data_device));
@@ -12653,9 +12997,11 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
     ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) tensor->extra;
     GGML_ASSERT(extra);
 
-    CL_CHECK(clEnqueueWriteBuffer(
+    if (clEnqueueWriteBuffer(
         queue, extra->data_device, CL_TRUE, extra->offset + offset,
-        size, data, 0, NULL, NULL));
+        size, data, 0, NULL, NULL) != CL_SUCCESS) {
+        throw_set_tensor_upload_error("clEnqueueWriteBuffer", tensor->name);
+    }
 
     ggml_opencl_gemv_audit_stash_generic(extra, tensor, data, offset, size);
 
@@ -13976,11 +14322,10 @@ static const char * ggml_backend_opencl_buffer_type_get_name(ggml_backend_buffer
 static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buffer_type, size_t size) {
     ggml_backend_opencl_context *backend_ctx = ggml_cl_init(buffer_type->device);
 
-    if (!backend_ctx->program_cache_initialized) {
-        backend_ctx->program_cache = cl_program_cache_init(backend_ctx->device);
-        backend_ctx->program_cache_initialized = true;
-    }
     load_cl_kernels(backend_ctx);
+    if (backend_ctx->kernel_build_failed) {
+        return nullptr;
+    }
 
     // clCreateBuffer returns -61 for size 0
     size = std::max(size, (size_t)1);
@@ -22833,10 +23178,13 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK((b_sub_buf = clCreateSubBuffer(extra1->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
 
         // dp4a (int8) dense q6_K prefill GEMM
+        // KALSA_Q6K_DENSE decides when GGML_OPENCL_Q6K_DENSE_DP4A is unset; the stock
+        // env keeps its override meaning (=1 forces dp4a, =0 forces the f32 GEMM)
         static const char * q6k_dense_dp4a_env = getenv("GGML_OPENCL_Q6K_DENSE_DP4A");
+        const bool          kalsa_q6k_f32      = kalsa_q6k_dense_f32();
                      bool   q6k_dense_dp4a_on  = (q6k_dense_dp4a_env != nullptr)
                                                    ? (atoi(q6k_dense_dp4a_env) != 0)
-                                                   : (backend_ctx->adreno_gen != ADRENO_GPU_GEN::X1E);
+                                                   : (!kalsa_q6k_f32 && backend_ctx->adreno_gen != ADRENO_GPU_GEN::X1E);
         // dot prod has to be available
         q6k_dense_dp4a_on = backend_ctx->has_integer_dot && q6k_dense_dp4a_on;
 

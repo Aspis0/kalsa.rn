@@ -263,7 +263,10 @@ struct llama_governor_params {
     float expert_substitution_lambda = 0.0f;
 };
 
-/** One successful battery poll. Temperature is the dumpsys tenths-of-°C value. */
+/** One successful battery poll. Temperature is the dumpsys tenths-of-degrees-C
+ *  value. t_idle_c is the plugged temperature in whole degrees C, forwarded
+ *  raw by the client: the policy latches the plugged reference from the first
+ *  plugged sample and judges it (validity gate, 1.5 C drift, clear on unplug). */
 struct llama_governor_thermo_profile {
     int32_t batt_temp_tenths_c = 0;
     int32_t batt_level_pct = 100;

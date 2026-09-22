@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <system_error>
@@ -170,6 +171,21 @@ std::string compute_key(const std::string & key_suffix,
     return sha256_hex(digest);
 }
 
+// The verdict covers the whole kernel set, so it keys on the device identity
+// alone (the same suffix the per-program keys fold in).
+std::string compute_verdict_key(const std::string & key_suffix) {
+    sha256_ctx c;
+    sha256_init(c);
+
+    static const uint8_t sep = 0;
+    sha256_update(c, key_suffix.data(), key_suffix.size());
+    sha256_update(c, &sep,              1);
+
+    uint8_t digest[32];
+    sha256_final(c, digest);
+    return sha256_hex(digest);
+}
+
 bool make_dir_recursive(const std::string & path) {
     if (path.empty()) { return false; }
     // create_directories() already creates missing parents. It returns false
@@ -233,6 +249,11 @@ std::string compute_key_suffix(cl_device_id device) {
         s += query_string(clGetPlatformInfo, platform, CL_PLATFORM_VERSION); s.push_back('\0');
     }
     s += "fmt=" + std::to_string(CL_PROGRAM_CACHE_FORMAT_VERSION);
+#ifdef GGML_OPENCL_KERNEL_SET_ID
+    s += " kset=" GGML_OPENCL_KERNEL_SET_ID;
+#else
+    s += " kset=unknown";
+#endif
     return s;
 }
 
@@ -450,4 +471,64 @@ void cl_program_cache_try_save(
         ++g_cache_saves;
         cache_debug_line("SAVE", key, source, compile_opts);
     }
+}
+
+void cl_program_cache_save_verdict(const cl_program_cache_state & state, const cl_program_cache_verdict & verdict) {
+    if (state.dir.empty()) { return; }
+
+    std::string text = "GGMLCLVERDICT 1\n";
+    text += "ok=" + std::to_string(verdict.ok ? 1 : 0) + "\n";
+    text += "vendor=" + verdict.vendor + "\n";
+    text += "device_name=" + verdict.device_name + "\n";
+    text += "driver_version=" + verdict.driver_version + "\n";
+    text += "global_mem_size=" + std::to_string(verdict.global_mem_size) + "\n";
+    text += "has_integer_dot=" + std::to_string(verdict.has_integer_dot ? 1 : 0) + "\n";
+    const uint64_t written = verdict.written ? verdict.written : (uint64_t) time(nullptr);
+    text += "written=" + std::to_string(written) + "\n";
+
+    const std::string path = state.dir + "/verdict-" + compute_verdict_key(state.key_suffix) + ".txt";
+    if (!write_atomic(path, (const uint8_t *) text.data(), text.size())) {
+        GGML_LOG_INFO("ggml_opencl: kernel cache: failed to write '%s'\n", path.c_str());
+    }
+}
+
+bool cl_program_cache_load_verdict(const cl_program_cache_state & state, cl_program_cache_verdict & verdict) {
+    if (state.dir.empty()) { return false; }
+
+    const std::string path = state.dir + "/verdict-" + compute_verdict_key(state.key_suffix) + ".txt";
+    std::vector<uint8_t> file;
+    if (!read_all(path, file)) { return false; }
+
+    const std::string text((const char *) file.data(), file.size());
+    if (text.compare(0, 14, "GGMLCLVERDICT ") != 0) { return false; }
+
+    verdict = cl_program_cache_verdict{};
+    size_t pos = text.find('\n');
+    while (pos != std::string::npos) {
+        const size_t end  = text.find('\n', pos + 1);
+        const std::string line = text.substr(pos + 1, end == std::string::npos ? std::string::npos : end - pos - 1);
+        const size_t eq = line.find('=');
+        if (eq != std::string::npos) {
+            const std::string k = line.substr(0, eq);
+            const std::string v = line.substr(eq + 1);
+            if      (k == "ok")              { verdict.ok              = (v == "1"); }
+            else if (k == "vendor")          { verdict.vendor          = v; }
+            else if (k == "device_name")     { verdict.device_name     = v; }
+            else if (k == "driver_version")  { verdict.driver_version  = v; }
+            else if (k == "global_mem_size") { verdict.global_mem_size = (size_t) strtoull(v.c_str(), nullptr, 10); }
+            else if (k == "has_integer_dot") { verdict.has_integer_dot = (v == "1"); }
+            else if (k == "written")        { verdict.written        = (uint64_t) strtoull(v.c_str(), nullptr, 10); }
+        }
+        if (end == std::string::npos) { break; }
+        pos = end;
+    }
+
+    if (!verdict.ok) {
+        const uint64_t now = (uint64_t) time(nullptr);
+        if (verdict.written == 0 || now - verdict.written > CL_PROGRAM_CACHE_VERDICT_FAIL_TTL_SECONDS) {
+            GGML_LOG_INFO("ggml_opencl: kernel cache: stale fail verdict ignored, rebuilding kernels\n");
+            return false;
+        }
+    }
+    return true;
 }

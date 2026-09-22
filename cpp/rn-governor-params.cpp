@@ -97,11 +97,7 @@ bool governor_thermo_profile_is_valid(
     if (thermo.batt_level_pct < 0 || thermo.batt_level_pct > 100) {
         return false;
     }
-    if (!thermo.plugged) {
-        return true;
-    }
-    return thermo.t_idle_valid && std::isfinite(thermo.t_idle_c) &&
-           thermo.t_idle_c + 1.0f < 42.0f;
+    return true;
 }
 
 bool parse_governor_params(

@@ -7,6 +7,14 @@
 #define TILESIZE_N 32
 #define QK_K 256
 
+// Activation block scale type; float build selected with -DKALSA_Q8A_SCALE_F32,
+// must match the kernel_quant_a_q8_1 build (KALSA_Q8A_SCALE).
+#ifdef KALSA_Q8A_SCALE_F32
+typedef float q8a_t;
+#else
+typedef half q8a_t;
+#endif
+
 // 4 nibbles in the low 16 bits of `u` -> 4 bytes (value 0..15, in bits 0-3).
 #define EXP4(u)  ( ((uint)((u) & 0x000Fu))        | \
                   (((uint)((u) & 0x00F0u)) << 4)  | \
@@ -45,7 +53,7 @@ kernel void kernel_gemm_noshuffle_q6_k_q8_1_dp4a(
         __global const ushort * src0_s,    // int8 scale codes (2 chars/ushort, per 16)
         __global const half   * src0_d,    // per-superblock scale
         __global const uint   * src1_qa,   // q8_1 activations int8 (as uint, 4/elem) [N, K]
-        __global const half   * src1_da,   // q8_1 per-block scale [N, K/32]
+        __global const q8a_t  * src1_da,   // q8_1 per-block scale [N, K/32]
         __global       float  * dst,
         ulong  offsetd,
         int    m,                          // output features (rows)
@@ -67,7 +75,7 @@ kernel void kernel_gemm_noshuffle_q6_k_q8_1_dp4a(
     const uint k_b = (uint)k >> 5;   // blocks-of-32 along K
 
     __local uint sh_qa[TILESIZE_N][8];
-    __local half sh_d[TILESIZE_N];
+    __local q8a_t sh_d[TILESIZE_N];
 
 #define NGROUPS (TILESIZE_N / 4)
     float4 acc[NGROUPS];
@@ -103,7 +111,7 @@ kernel void kernel_gemm_noshuffle_q6_k_q8_1_dp4a(
         }
         if (lid < TILESIZE_N) {
             const uint c = col_base + lid;
-            sh_d[lid] = (c < (uint)n_no_padding) ? src1_da[c * k_b + sub] : (half)0;
+            sh_d[lid] = (c < (uint)n_no_padding) ? src1_da[c * k_b + sub] : (q8a_t)0;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 

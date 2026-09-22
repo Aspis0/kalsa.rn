@@ -1266,7 +1266,9 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg = nullptr;  // dp4a dense prefill GEMM, weights via texture (X1 opt-in)
     cl_kernel kernel_gemm_noshuffle_q5_k_q8_1_dp4a = nullptr;  // dp4a (int8) dense q5_K prefill GEMM
     cl_kernel kernel_gemm_noshuffle_q6_k_q8_1_dp4a = nullptr;  // dp4a (int8) dense q6_K prefill GEMM
+    cl_kernel kernel_gemm_noshuffle_q6_k_q8_1_dp4a_f32 = nullptr;  // same GEMM, fp32 activation scale build (KALSA_Q8A_SCALE)
     cl_kernel kernel_quant_a_q8_1;                    // plain activation q8_1 pre-pass
+    cl_kernel kernel_quant_a_q8_1_f32 = nullptr;      // same pre-pass, fp32 activation scale build (KALSA_Q8A_SCALE)
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_r1;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_kimg;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok;
@@ -1543,17 +1545,35 @@ static bool use_adreno_bin_kernels(ggml_backend_opencl_context * backend_ctx) {
 #endif // GGML_OPENCL_USE_ADRENO_BIN_KERNELS
 }
 
-// KALSA_Q6K_DENSE=f32|dp4a: dense q6_K prefill GEMM path, default f32.
+// KALSA_Q6K_DENSE=f32|dp4a: dense q6_K prefill GEMM path, default dp4a.
 // f32 = transpose + noshuffle f32 GEMM (no activation quantization);
 // dp4a = stock int8 path (kernel_quant_a_q8_1 + q8_1 dp4a GEMM), for A/B.
 inline bool kalsa_q6k_dense_f32() {
     static const bool value = [] {
         const char * e = getenv("KALSA_Q6K_DENSE");
-        if (e && strcmp(e, "dp4a") == 0) {
+        if (e && strcmp(e, "f32") == 0) {
+            return true;
+        }
+        if (e && *e && strcmp(e, "dp4a") != 0) {
+            GGML_LOG_ERROR("ggml_opencl: unrecognized KALSA_Q6K_DENSE='%s' (use f32|dp4a)\n", e);
+            exit(1);
+        }
+        return false;
+    }();
+    return value;
+}
+
+// KALSA_Q8A_SCALE=fp32|fp16: dense q6_K q8_1 activation block scale type, default fp32.
+// fp32 = float scale end to end (the fp16 store flushes subnormals to zero on this
+// device); fp16 = stock half scale, for A/B in the same binary.
+inline bool kalsa_q8a_scale_f32() {
+    static const bool value = [] {
+        const char * e = getenv("KALSA_Q8A_SCALE");
+        if (e && strcmp(e, "fp16") == 0) {
             return false;
         }
-        if (e && *e && strcmp(e, "f32") != 0) {
-            GGML_LOG_ERROR("ggml_opencl: unrecognized KALSA_Q6K_DENSE='%s' (use f32|dp4a)\n", e);
+        if (e && *e && strcmp(e, "fp32") != 0) {
+            GGML_LOG_ERROR("ggml_opencl: unrecognized KALSA_Q8A_SCALE='%s' (use fp32|fp16)\n", e);
             exit(1);
         }
         return true;
@@ -4520,6 +4540,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q6_k_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
+        if (kalsa_q8a_scale_f32()) {
+            prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts + " -DKALSA_Q8A_SCALE_F32");
+            if (backend_ctx->kernel_build_failed) { return; }
+            CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q6_k_q8_1_dp4a", &err), err));
+            CL_CHECK(clReleaseProgram(prog));
+        }
         GGML_LOG_CONT(".");
     }
 
@@ -4536,6 +4562,15 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_quant_a_q8_1 = clCreateKernel(prog, "kernel_quant_a_q8_1", &err), err));
         CL_CHECK(clReleaseProgram(prog));
+        if (kalsa_q8a_scale_f32()) {
+            prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts + " -DKALSA_Q8A_SCALE_F32");
+            if (backend_ctx->kernel_build_failed) { return; }
+            CL_CHECK((backend_ctx->kernel_quant_a_q8_1_f32 = clCreateKernel(prog, "kernel_quant_a_q8_1", &err), err));
+            CL_CHECK(clReleaseProgram(prog));
+        }
+        // WARN so the active arm survives the bench stderr filter (the KALSA_Q6K_DENSE INFO line does not)
+        GGML_LOG_WARN("ggml_opencl: q8_1 activation scale: %s (KALSA_Q8A_SCALE)\n",
+                      kalsa_q8a_scale_f32() ? "fp32" : "fp16");
         GGML_LOG_CONT(".");
     }
 
@@ -23194,12 +23229,13 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         if (q6k_dense_dp4a_on && !is_output_w_dp4a && ne1 > 8 && (ne00 % 32 == 0) && (ne01 % 64 == 0)) {
             const int M = ne01, N = ne1, K = ne00;
             const size_t n_blocks = (size_t)N * (K / 32);
+            const bool   q8a_f32  = kalsa_q8a_scale_f32();
             backend_ctx->prealloc_moe_qa.allocate(context, (size_t)N * K * sizeof(cl_char));
-            backend_ctx->prealloc_moe_da.allocate(context, n_blocks * sizeof(cl_half));
+            backend_ctx->prealloc_moe_da.allocate(context, n_blocks * (q8a_f32 ? sizeof(cl_float) : sizeof(cl_half)));
             backend_ctx->prealloc_moe_sa.allocate(context, n_blocks * sizeof(cl_half));
 
             cl_int tb = (cl_int)n_blocks;
-            cl_kernel qk = backend_ctx->kernel_quant_a_q8_1;
+            cl_kernel qk = q8a_f32 ? backend_ctx->kernel_quant_a_q8_1_f32 : backend_ctx->kernel_quant_a_q8_1;
             CL_CHECK(clSetKernelArg(qk, 0, sizeof(cl_mem), &b_sub_buf));
             CL_CHECK(clSetKernelArg(qk, 1, sizeof(cl_mem), &backend_ctx->prealloc_moe_qa.buffer));
             CL_CHECK(clSetKernelArg(qk, 2, sizeof(cl_mem), &backend_ctx->prealloc_moe_da.buffer));
@@ -23209,7 +23245,8 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
             size_t q_global[1] = { (size_t)(((n_blocks + 63) / 64) * 64) };
             backend_ctx->enqueue_ndrange_kernel(qk, 1, q_global, q_local, dst);
 
-            cl_kernel dk = backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a;
+            cl_kernel dk = q8a_f32 ? backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_f32
+                                   : backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a;
             int ai = 0;
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &extra0_q6_K->ql));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &extra0_q6_K->qh));

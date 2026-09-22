@@ -1,5 +1,13 @@
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
+// KALSA_Q8A_SCALE=fp32 (build with -DKALSA_Q8A_SCALE_F32): the block scale da is
+// carried in float, so a quiet block cannot flush to zero in fp16 storage.
+#ifdef KALSA_Q8A_SCALE_F32
+typedef float q8a_t;
+#else
+typedef half q8a_t;
+#endif
+
 // Quantize a contiguous [N, K] f32 activation buffer (token-major, K contiguous
 // per token) into q8_1 blocks of 32: int8 quants + per-block scale d + per-block
 // sum s (= d * Sum(qs)). Consumed by kernel_gemm_noshuffle_q4_k_q8_1_dp4a for the
@@ -7,7 +15,7 @@
 __kernel void kernel_quant_a_q8_1(
         __global const float * src,   // [N * K]
         __global       char  * qa,    // [N * K]
-        __global       half  * da,    // [N * (K/32)]
+        __global       q8a_t * da,    // [N * (K/32)]
         __global       half  * sa,    // [N * (K/32)]
         int total_blocks              // N * (K/32)
 ) {
@@ -37,6 +45,6 @@ __kernel void kernel_quant_a_q8_1(
         sum += q;
     }
 
-    da[blk] = (half)d;
+    da[blk] = (q8a_t)d;
     sa[blk] = (half)(d * (float)sum);
 }

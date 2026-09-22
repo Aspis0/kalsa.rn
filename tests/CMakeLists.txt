@@ -123,3 +123,12 @@ rnllama_test(kv_cache_bench kv_cache_bench.cpp)
 if(KV_BENCH_HAS_STATE_CACHE)
     target_compile_definitions(kv_cache_bench PRIVATE KV_BENCH_HAS_STATE_CACHE)
 endif()
+
+# Governor thermo parse: links only the parse TU, not the whole library.
+# It checks the binding's transport contract (payload sanity only, plugged
+# baselines forwarded for the engine), so a host-only fast target is enough.
+add_executable(governor_params_test governor_params_test.cpp ${RNLLAMA_CPP_DIR}/rn-governor-params.cpp)
+target_include_directories(governor_params_test PRIVATE ${RNLLAMA_INCLUDE_DIRS})
+if(UNIX AND NOT APPLE)
+    target_link_libraries(governor_params_test PRIVATE m)
+endif()

@@ -51,19 +51,30 @@ fi
 echo "✓ chat_parse_utf8_test built successfully"
 
 echo ""
+echo "Building governor_params_test..."
+make governor_params_test -j4
+if [ ! -f "governor_params_test" ]; then
+    echo "Error: Failed to build governor_params_test"
+    exit 1
+fi
+echo "✓ governor_params_test built successfully"
+
+echo ""
 echo "=== Build Successful ==="
 echo ""
 echo "Built executables:"
 echo "  - rnllama_tests (basic integration tests)"
 echo "  - parallel_decoding_test (parallel decoding tests)"
 echo "  - chat_parse_utf8_test (chat parse UTF-8 robustness tests)"
+echo "  - governor_params_test (governor thermo parse tests)"
 echo ""
 echo "To run the tests:"
 echo "  cd tests/build"
 echo "  ./rnllama_tests           # Run basic tests"
 echo "  ./parallel_decoding_test  # Run parallel decoding tests"
 echo "  ./chat_parse_utf8_test    # Run chat parse UTF-8 tests"
+echo "  ./governor_params_test    # Run governor thermo parse tests"
 echo ""
 echo "Or run all:"
-echo "  ./rnllama_tests && ./parallel_decoding_test && ./chat_parse_utf8_test"
+echo "  ./rnllama_tests && ./parallel_decoding_test && ./chat_parse_utf8_test && ./governor_params_test"
 echo ""

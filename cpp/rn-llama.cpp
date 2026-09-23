@@ -77,6 +77,15 @@ bool load_governor_models(llama_rn_context & owner,
     decode_params.n_gpu_layers = 0;
     prefill_params.n_parallel = 1;
     decode_params.n_parallel = 1;
+    // The CPU repack copy exists only where repackable tensors are placed on
+    // CPU: that is the decode model (n_gpu_layers=0) — the load log shows its
+    // CPU_REPACK ≈ W beside the prefill model's OpenCL copy, and no CPU_REPACK
+    // line for prefill (its tensors are on OpenCL; its CPU residuals carry no
+    // repack traits). The engine honours no_extra_bufts (use_extra_bufts =
+    // !no_extra_bufts, common.cpp) — the same flag bmoe_stream raises — so
+    // drop the second full copy here; decode pays the ~1.4x CPU decode cost
+    // the S23 repack A/B measured, in a lane where GPU prefill covers the 2.6x.
+    decode_params.no_extra_bufts = true;
 
     const bool profile_valid = governor_thermo_profile_is_valid(governor_thermo);
     auto cleanup = [&owner]() {

@@ -1679,11 +1679,18 @@ completion_token_output llama_rn_context_completion::nextToken()
         } else {
             if (parent_ctx->decode(llama_batch_get_one(&embd[n_past], n_eval)))
             {
-                LOG_ERROR("failed to eval, n_eval: %d, n_past: %d, n_threads: %d, embd: %s",
+                // No token text here: the failure log reaches logcat, and the
+                // pending tokens are prompt/user content.
+                // No token text here: the failure log reaches logcat, and the
+                // pending tokens are prompt/user content.
+                // No token text here: the failure log reaches logcat, and the
+                // pending tokens are prompt/user content.
+                // No token text here: the failure log reaches logcat, and the
+                // pending tokens are prompt/user content.
+                LOG_ERROR("failed to eval, n_eval: %d, n_past: %d, n_threads: %d",
                     n_eval,
                     n_past,
-                    parent_ctx->params.cpuparams.n_threads,
-                    tokens_to_str(parent_ctx->ctx, embd.cbegin() + n_past, embd.cend()).c_str()
+                    parent_ctx->params.cpuparams.n_threads
                 );
                 // Trim embd to what the memory actually contains so a later prefix
                 // match can't claim never-written cells.

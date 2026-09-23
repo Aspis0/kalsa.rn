@@ -850,8 +850,13 @@ static bool ggml_gallocr_reserve_n_impl(
     // set the node_allocs from the hash table
     if (galloc->n_nodes < graph->n_nodes) {
         free(galloc->node_allocs);
-        galloc->node_allocs = calloc(graph->n_nodes, sizeof(struct node_alloc));
-        GGML_ASSERT(galloc->node_allocs != NULL);
+        galloc->node_allocs = NULL;
+        // A node-less graph reaches this branch only via the poisoned plan
+        // (-1 < 0); calloc(0) returning NULL is legal C, so skip it.
+        if (graph->n_nodes > 0) {
+            galloc->node_allocs = calloc(graph->n_nodes, sizeof(struct node_alloc));
+            GGML_ASSERT(galloc->node_allocs != NULL);
+        }
     }
     galloc->n_nodes = graph->n_nodes;
     for (int i = 0; i < graph->n_nodes; i++) {
@@ -932,13 +937,33 @@ static bool ggml_gallocr_reserve_n_impl(
                 }
             }
 #endif
-            ggml_vbuffer_free(galloc->buffers[i]);
-            if (no_alloc) {
-                galloc->buffers[i] = NULL;
-            } else {
+            // Slots sharing this buffer type alias this vbuffer (buf_tallocs
+            // dedup above); after the free they would dangle into a double
+            // free at teardown, so clear every alias in both exit paths. Later
+            // alias slots cannot be left stale by this clear: the dedup makes
+            // the lowest index canonical, and every later slot re-reads the
+            // canonical's fresh pointer at the alias assignment, which runs
+            // before the realloc decision.
+            struct vbuffer * buffer_old = galloc->buffers[i];
+            ggml_vbuffer_free(buffer_old);
+            for (int j = 0; j < galloc->n_buffers; j++) {
+                if (galloc->buffers[j] == buffer_old) {
+                    galloc->buffers[j] = NULL;
+                }
+            }
+            if (!no_alloc) {
                 galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
                 if (galloc->buffers[i] == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
+                    // The plan for this graph was already recorded above, so a retry
+                    // would pass ggml_gallocr_needs_realloc and walk this NULL buffer
+                    // in ggml_gallocr_init_tensor. Only n_nodes is invalidated here,
+                    // and that suffices ONLY because needs_realloc compares n_nodes
+                    // before everything else - reordering its checks re-arms this
+                    // trap. The next ggml_gallocr_alloc_graph re-reserves (single
+                    // buffer) or refuses (multi buffer) instead of using the freed
+                    // layout.
+                    galloc->n_nodes = -1;
                     return false;
                 }
             }

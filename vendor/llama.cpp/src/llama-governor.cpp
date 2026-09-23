@@ -214,6 +214,12 @@ int32_t llama_governor::decode_impl(llama_batch batch, bool allow_chunking) {
     const int32_t rc = llama_decode(target, batch);
     if (rc != 0) {
         LLAMA_LOG_ERROR("%s: llama_decode failed with rc=%d\n", __func__, rc);
+        // fail() would collapse the rc to -1; callers must still see the raw
+        // engine code (e.g. -2 for GGML_STATUS_ALLOC_FAILED), so set the
+        // sticky state and reason directly.
+        snprintf(decode_failure_reason_, sizeof(decode_failure_reason_),
+                 "llama_decode failed with rc=%d", rc);
+        failure_reason_ = decode_failure_reason_;
         failed = true;
         return rc;
     }

@@ -28,6 +28,10 @@ struct llama_governor {
     void stall_exit();
     bool note_expert_route(bool resident, float resident_score,
                            float flash_winner_score, float score_range);
+    // The failed state is sticky and distinguishes real failures from the
+    // flow-control -2 returns (thermal pause, chunking, reload-required),
+    // which never set it - the binding keys its fallback on exactly that.
+    bool is_failed() const { return failed; }
     const char * failure_reason() const { return failure_reason_; }
 
 private:
@@ -83,6 +87,8 @@ private:
     bool hot_plugged_announced_ = false;
     bool failed = false;
     const char * failure_reason_ = nullptr;
+    // Storage for the decode-failure reason; failure_reason_ points into it.
+    char decode_failure_reason_[48] = "";
 };
 
 // Internal RN bridge: returns the constructor error without emitting a second

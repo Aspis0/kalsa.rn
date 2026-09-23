@@ -425,7 +425,13 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok(
     global const half   * d_ptr      = src0_d  + gx;
     global const half   * dm_ptr     = src0_dm + gx;
 
+#ifdef KALSA_COK_ACC_F16
+    // v1-1-1 behaviour: half product into a half accumulator (control arm).
     half8 acc = 0;
+#else
+    // f32 product and accumulator, matching the large-batch GEMM above.
+    float8 acc = 0;
+#endif
     half8 B;
     half  dq;
 
@@ -450,22 +456,38 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok(
             B.s0123 = read_imageh(src1,     (ki+0) * n_4);
             B.s4567 = read_imageh(src1, 1 + (ki+0) * n_4);
             dq = (bits & 0x000F) * scale - mval;
+#ifdef KALSA_COK_ACC_F16
             acc += B * dq;
+#else
+            acc += convert_float8(B) * (float)dq;
+#endif
 
             B.s0123 = read_imageh(src1,     (ki+1) * n_4);
             B.s4567 = read_imageh(src1, 1 + (ki+1) * n_4);
             dq = ((bits & 0x00F0) >> 4) * scale - mval;
+#ifdef KALSA_COK_ACC_F16
             acc += B * dq;
+#else
+            acc += convert_float8(B) * (float)dq;
+#endif
 
             B.s0123 = read_imageh(src1,     (ki+2) * n_4);
             B.s4567 = read_imageh(src1, 1 + (ki+2) * n_4);
             dq = ((bits & 0x0F00) >> 8) * scale - mval;
+#ifdef KALSA_COK_ACC_F16
             acc += B * dq;
+#else
+            acc += convert_float8(B) * (float)dq;
+#endif
 
             B.s0123 = read_imageh(src1,     (ki+3) * n_4);
             B.s4567 = read_imageh(src1, 1 + (ki+3) * n_4);
             dq = ((bits & 0xF000) >> 12) * scale - mval;
+#ifdef KALSA_COK_ACC_F16
             acc += B * dq;
+#else
+            acc += convert_float8(B) * (float)dq;
+#endif
         }
     }
 

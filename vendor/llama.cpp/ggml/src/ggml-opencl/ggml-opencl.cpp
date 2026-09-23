@@ -1581,6 +1581,24 @@ inline bool kalsa_q8a_scale_f32() {
     return value;
 }
 
+// KALSA_COK_ACC=fp32|fp16: dense q4_K small-batch (_cok) accumulator and product
+// precision, default fp32 (same arithmetic as the large-batch GEMM).
+// fp16 = the v1-1-1 half build, for A/B in the same binary.
+inline bool kalsa_cok_acc_f32() {
+    static const bool value = [] {
+        const char * e = getenv("KALSA_COK_ACC");
+        if (e && strcmp(e, "fp16") == 0) {
+            return false;
+        }
+        if (e && *e && strcmp(e, "fp32") != 0) {
+            GGML_LOG_ERROR("ggml_opencl: unrecognized KALSA_COK_ACC='%s' (use fp32|fp16)\n", e);
+            exit(1);
+        }
+        return true;
+    }();
+    return value;
+}
+
 static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     if (backend_ctx->kernels_loaded || backend_ctx->kernel_build_failed) {
         return;
@@ -4461,7 +4479,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("gemm_noshuffle_q4_k_f32.cl");
 #endif
-        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        const bool cok_acc_f32 = kalsa_cok_acc_f32();
+        std::string cok_opts = compile_opts;
+        if (!cok_acc_f32) {
+            cok_opts += " -DKALSA_COK_ACC_F16";
+        }
+        GGML_LOG_WARN("ggml_opencl: q4_K small-batch accumulator: %s (KALSA_COK_ACC)\n", cok_acc_f32 ? "fp32" : "fp16");
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), cok_opts);
         if (backend_ctx->kernel_build_failed) { return; }
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32_r1 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_r1", &err), err));

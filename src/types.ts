@@ -564,6 +564,10 @@ export type NativeCompletionResult = {
   stopped_limit: number
   stopping_word: string
   context_full: boolean
+  // Set by the JSI serializer from the governor's live state; empty string
+  // when the governor has not failed.
+  governor_failed?: boolean
+  governor_failure_reason?: string
   interrupted: boolean
   tokens_cached: number
   timings: NativeCompletionResultTimings

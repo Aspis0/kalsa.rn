@@ -8,6 +8,15 @@
 
 namespace rnllama {
 
+// A decode rc is a real failure iff it is nonzero and either not the
+// flow-control -2 or the engine governor has actually failed: the six
+// flow-control -2s (thermal pause, caller chunking, reload-required, ...)
+// never set the engine's failed state, while decode_impl sets it before
+// returning any engine rc, including -2 for GGML_STATUS_ALLOC_FAILED.
+inline bool governor_decode_failed(int32_t rc, bool engine_failed) {
+    return rc != 0 && (rc != -2 || engine_failed);
+}
+
 class rn_governor {
 public:
     rn_governor(llama_model * prefill_model, llama_model * decode_model,
@@ -24,6 +33,9 @@ public:
     llama_governor_stats stats() const;
 
     bool failed() const { return failed_; }
+    // The engine governor's sticky state (not the shadow); out-of-line because
+    // llama_governor is incomplete in this header.
+    bool engine_failed() const;
     bool profile_valid() const { return profile_valid_; }
     llama_governor_fit gpu_fit() const { return gpu_fit_; }
     const std::string & failure_reason() const { return failure_reason_; }

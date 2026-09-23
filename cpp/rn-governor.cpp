@@ -49,7 +49,7 @@ int32_t rn_governor::decode(llama_batch batch) {
     }
 
     const int32_t result = llama_governor_decode(governor_, batch);
-    if (result != 0 && result != -2) {
+    if (governor_decode_failed(result, governor_->is_failed())) {
         failed_ = true;
         const char * reason = governor_->failure_reason();
         if (reason != nullptr) {
@@ -59,6 +59,10 @@ int32_t rn_governor::decode(llama_batch batch) {
         }
     }
     return result;
+}
+
+bool rn_governor::engine_failed() const {
+    return governor_ != nullptr && governor_->is_failed();
 }
 
 void rn_governor::clear_cache(bool clear_data) {

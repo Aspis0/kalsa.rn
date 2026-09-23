@@ -79,6 +79,8 @@ if (!NativeModules.RNLlama) {
       ],
       completion_probabilities: completionProbabilities,
       content: '*giggles*',
+      governor_failed: false,
+      governor_failure_reason: '',
       draft_tokens: 0,
       draft_tokens_accepted: 0,
       text: '*giggles*',

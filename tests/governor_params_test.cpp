@@ -8,6 +8,7 @@
 // same message: "governor: thermo profile invalid".
 
 #include "rn-governor-params.h"
+#include "rn-governor.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -102,12 +103,25 @@ static bool test_zero_baseline_forwarded() {
     return parses(zero_baseline);
 }
 
+// Pins the rc-vs-engine-state discriminator both -2 filters key on: the
+// flow-control -2s (thermal pause, chunking, reload-required) never set the
+// engine's failed state, while decode_impl sets it before returning any
+// engine rc, including -2 for GGML_STATUS_ALLOC_FAILED.
+bool test_governor_decode_failed_discriminator() {
+    return !rnllama::governor_decode_failed(0, false)
+        && !rnllama::governor_decode_failed(-2, false)
+        && rnllama::governor_decode_failed(-2, true)
+        && rnllama::governor_decode_failed(-1, true)
+        && rnllama::governor_decode_failed(1, false);
+}
+
 int main() {
     TestResults results;
     results.run_test("dead sensor refused at parse", test_dead_sensor_refused());
     results.run_test("out-of-range plugged baseline forwarded", test_out_of_range_baseline_forwarded());
     results.run_test("missing baseline flag forwarded", test_missing_baseline_flag_forwarded());
     results.run_test("zero plugged baseline forwarded for the engine", test_zero_baseline_forwarded());
+    results.run_test("decode rc failure discriminates on engine state", test_governor_decode_failed_discriminator());
     results.print_summary();
     return (results.passed_tests == results.total_tests) ? 0 : 1;
 }

@@ -398,6 +398,8 @@ test('Parallel APIs - completion with stop settles the result once', async () =>
       chat_format: 0,
       content: '*giggles*',
       context_full: false,
+      governor_failed: false,
+      governor_failure_reason: '',
       draft_tokens: 0,
       draft_tokens_accepted: 0,
       incomplete: false,
@@ -422,6 +424,8 @@ test('Parallel APIs - completion with stop settles the result once', async () =>
   )
   expect(result.completion_probabilities).toHaveLength(5)
   expect(result.audio_tokens).toHaveLength(11)
+  expect(result.governor_failed).toBe(false)
+  expect(result.governor_failure_reason).toBe('')
 
   // Repeated cancellation must not invoke the terminal callback again.
   await stop()

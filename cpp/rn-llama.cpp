@@ -665,7 +665,7 @@ int32_t llama_rn_context::decode(llama_batch batch) {
 
     const bool was_failed = governor->failed();
     const int32_t result = governor->decode(batch);
-    if (result != 0 && result != -2 && !was_failed) {
+    if (governor_decode_failed(result, governor->engine_failed()) && !was_failed) {
         const std::string & reason = governor->failure_reason();
         const bool route_rejected = reason.find("route Reject") != std::string::npos;
         LOG_ERROR(

@@ -179,6 +179,10 @@ namespace rnllama_jsi {
         res["draft_tokens_accepted"] = c.num_draft_tokens_accepted;
         res["truncated"] = c.truncated;
         res["context_full"] = c.context_full;
+        // Read live from the governor at serialization: a decode-time failure
+        // ends the loop before any flag could be set on the context.
+        res["governor_failed"] = ctx->governorFailed();
+        res["governor_failure_reason"] = ctx->governorFailureReason();
         res["interrupted"] = c.is_interrupted;
         res["stopped_eos"] = c.stopped_eos;
         res["stopped_word"] = c.stopped_word;
@@ -310,6 +314,8 @@ namespace rnllama_jsi {
             {"stopped_limit", result.stopped_limit},
             {"stopped_word", result.stopped_word},
             {"context_full", result.context_full},
+            {"governor_failed", ctx->governorFailed()},
+            {"governor_failure_reason", ctx->governorFailureReason()},
             {"incomplete", result.incomplete},
             {"truncated", result.truncated},
             {"interrupted", result.interrupted},

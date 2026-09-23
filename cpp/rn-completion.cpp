@@ -1681,12 +1681,6 @@ completion_token_output llama_rn_context_completion::nextToken()
             {
                 // No token text here: the failure log reaches logcat, and the
                 // pending tokens are prompt/user content.
-                // No token text here: the failure log reaches logcat, and the
-                // pending tokens are prompt/user content.
-                // No token text here: the failure log reaches logcat, and the
-                // pending tokens are prompt/user content.
-                // No token text here: the failure log reaches logcat, and the
-                // pending tokens are prompt/user content.
                 LOG_ERROR("failed to eval, n_eval: %d, n_past: %d, n_threads: %d",
                     n_eval,
                     n_past,

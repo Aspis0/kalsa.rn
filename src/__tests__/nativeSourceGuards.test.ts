@@ -1,4 +1,3 @@
-
 /**
  * Source-text guards for binding-native invariants jest cannot execute: the
  * governor failure error prefix is a stable API (the JSI throw is the delivery

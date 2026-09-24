@@ -125,10 +125,10 @@ bool llama_governor_policy::update_thermal(const llama_governor_thermo_profile &
         if (can_leave(now_ms, temp, limits.critical_exit)) {
             state_ = llama_governor_thermal_state::FAST;
         }
-    } else if (profile.batt_level_pct < 25) {
+    } else if (!profile.plugged && profile.batt_level_pct < 25) {
         state_ = llama_governor_thermal_state::LOWBAT;
     } else if (state_ == llama_governor_thermal_state::LOWBAT) {
-        if (dwell_elapsed(now_ms)) {
+        if (profile.plugged || dwell_elapsed(now_ms)) {
             state_ = classify(temp);
         }
     } else if (state_ == llama_governor_thermal_state::Unknown || state_ == llama_governor_thermal_state::Invalid) {
@@ -158,8 +158,7 @@ bool llama_governor_policy::update_thermal(const llama_governor_thermo_profile &
 llama_governor_engine llama_governor_policy::prefill_engine() const {
     if (!valid_schema(params_) || !profile_valid_ || !have_profile_ ||
         state_ == llama_governor_thermal_state::CRITICAL || state_ == llama_governor_thermal_state::Invalid ||
-        state_ == llama_governor_thermal_state::LOWBAT ||
-        (profile_.batt_level_pct < 45 && !profile_.plugged)) {
+        state_ == llama_governor_thermal_state::LOWBAT) {
         return llama_governor_engine::CPU;
     }
     if (params_.bench_force_gpu_prefill && params_.gpu_fit == llama_governor_fit::Fit) {
@@ -245,7 +244,7 @@ llama_governor_decode_selection llama_governor_policy::select_decode(int64_t now
     }
     const bool budget_ok = last_gpu_engagement_ms_ < 0 || now_ms < last_gpu_engagement_ms_ ||
                            now_ms - last_gpu_engagement_ms_ >= k_flip_window_ms;
-    const bool eligible = valid_schema(params_) && have_profile_ && profile_valid_ && profile_.batt_level_pct >= 45 &&
+    const bool eligible = valid_schema(params_) && have_profile_ && profile_valid_ &&
         state_ == llama_governor_thermal_state::COOLMODE && !hot_plugged_ &&
         params_.generation == llama_governor_generation::V73 &&
         params_.gpu_fit == llama_governor_fit::Fit && params_.cool_delta_measured && params_.kexp_cool_scope &&

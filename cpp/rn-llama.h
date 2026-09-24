@@ -23,6 +23,8 @@
 
 using json = nlohmann::ordered_json;
 
+#include "rn-governor-params.h"
+
 namespace kalsa { class MoeStream; }
 
 namespace rnllama {
@@ -158,7 +160,8 @@ struct llama_rn_context {
     bool loadModel(
         common_params &params_,
         const llama_governor_params * governor_params = nullptr,
-        const llama_governor_thermo_profile * governor_thermo = nullptr);
+        const llama_governor_thermo_profile * governor_thermo = nullptr,
+        const governor_load_options & load_options = governor_load_options{});
     llama_context * active_ctx() const;
     int32_t decode(llama_batch batch);
     bool hasGovernor() const;

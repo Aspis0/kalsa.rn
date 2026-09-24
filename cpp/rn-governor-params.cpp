@@ -103,7 +103,8 @@ bool governor_thermo_profile_is_valid(
 bool parse_governor_params(
     const nlohmann::ordered_json & governor,
     llama_governor_params & params,
-    llama_governor_thermo_profile & thermo) {
+    llama_governor_thermo_profile & thermo,
+    governor_load_options & options) {
     if (!governor.is_object()) {
         throw std::invalid_argument("governor must be a JSON object");
     }
@@ -131,6 +132,7 @@ bool parse_governor_params(
     params.npu_lane_enabled = bool_or(governor, "npu_lane_enabled", false);
     params.gpu_prefill_measured = bool_or(governor, "gpu_prefill_measured", false);
     params.bench_force_gpu_prefill = bool_or(governor, "bench_force_gpu_prefill", false);
+    options.decode_repack = bool_or(governor, "decode_repack", true);
     params.cool_prefill_eligible = bool_or(governor, "cool_prefill_eligible", false);
     params.cool_delta_measured = bool_or(governor, "cool_delta_measured", false);
     params.kexp_cool_scope = bool_or(governor, "kexp_cool_scope", false);

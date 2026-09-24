@@ -228,12 +228,13 @@ namespace rnllama_jsi {
     static bool parseGovernorLoadParams(
         const json& params,
         llama_governor_params& result,
-        llama_governor_thermo_profile& thermo) {
+        llama_governor_thermo_profile& thermo,
+        rnllama::governor_load_options& loadOptions) {
         const auto governor = params.find("governor");
         if (governor == params.end()) {
             return false;
         }
-        return rnllama::parse_governor_params(*governor, result, thermo);
+        return rnllama::parse_governor_params(*governor, result, thermo, loadOptions);
     }
 
     static llama_governor_thermo_profile parseGovernorThermo(const json& params) {
@@ -633,8 +634,9 @@ namespace rnllama_jsi {
                     getPropertyAsInt(params, "state_cache_max_checkpoints", 8);
                 llama_governor_params governorParams{};
                 llama_governor_thermo_profile governorThermo{};
+                rnllama::governor_load_options governorLoadOptions{};
                 const bool governorEnabled = parseGovernorLoadParams(
-                    params, governorParams, governorThermo);
+                    params, governorParams, governorThermo, governorLoadOptions);
 
                 return createPromiseTask(runtime, callInvoker, [
                     contextId,
@@ -648,7 +650,8 @@ namespace rnllama_jsi {
                     stateCacheMaxCheckpoints,
                     governorEnabled,
                     governorParams,
-                    governorThermo
+                    governorThermo,
+                    governorLoadOptions
                 ]() mutable -> PromiseResultGenerator {
                     if (isContextLimitReached()) {
                         throw std::runtime_error("Context limit reached");
@@ -707,7 +710,8 @@ namespace rnllama_jsi {
                     if (ctx->loadModel(
                             cparams,
                             governorEnabled ? &governorParams : nullptr,
-                            governorEnabled ? &governorThermo : nullptr)) {
+                            governorEnabled ? &governorThermo : nullptr,
+                            governorLoadOptions)) {
                          ctx->attachThreadpoolsIfAvailable();
 
                          if (ctx->params.embedding && llama_model_has_encoder(ctx->model) && llama_model_has_decoder(ctx->model)) {

@@ -51,11 +51,15 @@ static nlohmann::ordered_json base_governor() {
     };
 }
 
-static bool parses(const nlohmann::ordered_json & governor) {
+static bool parses(const nlohmann::ordered_json & governor,
+                    rnllama::governor_load_options * options = nullptr) {
     llama_governor_params params{};
     llama_governor_thermo_profile thermo{};
+    rnllama::governor_load_options local_options{};
     try {
-        return rnllama::parse_governor_params(governor, params, thermo);
+        const bool ok = rnllama::parse_governor_params(governor, params, thermo, local_options);
+        if (options != nullptr) { *options = local_options; }
+        return ok;
     } catch (const std::invalid_argument &) {
         return false;
     }
@@ -64,8 +68,9 @@ static bool parses(const nlohmann::ordered_json & governor) {
 static bool refuses_with_engine_message(const nlohmann::ordered_json & governor) {
     llama_governor_params params{};
     llama_governor_thermo_profile thermo{};
+    rnllama::governor_load_options options{};
     try {
-        rnllama::parse_governor_params(governor, params, thermo);
+        rnllama::parse_governor_params(governor, params, thermo, options);
     } catch (const std::invalid_argument & error) {
         return std::string(error.what()) == "governor: thermo profile invalid";
     }
@@ -115,6 +120,22 @@ bool test_governor_decode_failed_discriminator() {
         && rnllama::governor_decode_failed(1, false);
 }
 
+// governor.decode_repack is the P1 switch: default true (upstream repack
+// on, the 12 GB+ shape), false = the 8 GB S23 lane (no_extra_bufts on the
+// decode model). Both directions must parse; anything but a boolean refuses.
+bool test_decode_repack_both_directions() {
+    rnllama::governor_load_options options{};
+    auto governor = base_governor();
+    if (!parses(governor, &options) || !options.decode_repack) { return false; }
+    governor["decode_repack"] = false;
+    if (!parses(governor, &options) || options.decode_repack) { return false; }
+    governor["decode_repack"] = true;
+    if (!parses(governor, &options) || !options.decode_repack) { return false; }
+    governor["decode_repack"] = 1;
+    rnllama::governor_load_options ignored{};
+    return !parses(governor, &ignored);
+}
+
 int main() {
     TestResults results;
     results.run_test("dead sensor refused at parse", test_dead_sensor_refused());
@@ -122,6 +143,7 @@ int main() {
     results.run_test("missing baseline flag forwarded", test_missing_baseline_flag_forwarded());
     results.run_test("zero plugged baseline forwarded for the engine", test_zero_baseline_forwarded());
     results.run_test("decode rc failure discriminates on engine state", test_governor_decode_failed_discriminator());
+    results.run_test("governor decode_repack parses both directions", test_decode_repack_both_directions());
     results.print_summary();
     return (results.passed_tests == results.total_tests) ? 0 : 1;
 }

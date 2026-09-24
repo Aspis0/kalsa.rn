@@ -237,6 +237,10 @@ export type NativeContextParams = {
     bench_force_gpu_prefill?: boolean
     npu_lane_enabled?: boolean
     reload_budget_available?: boolean
+    // Keep CPU repack on the decode model (upstream default). Set false only
+    // where the lane does not fit WITH repack (8 GB S23): repack-off costs
+    // ~1.41x lane decode speed and KLD p99 0.0341 -> 0.0422.
+    decode_repack?: boolean
     thermo: GovernorThermoProfile
   }
 }

@@ -70,7 +70,8 @@ void log_governor_fallback(const char * stage, int models_loaded,
 
 bool load_governor_models(llama_rn_context & owner,
                           const llama_governor_params & governor_params,
-                          const llama_governor_thermo_profile & governor_thermo) {
+                          const llama_governor_thermo_profile & governor_thermo,
+                          const governor_load_options & load_options) {
     common_params prefill_params = owner.params;
     common_params decode_params = owner.params;
     prefill_params.n_gpu_layers = 99;
@@ -82,10 +83,14 @@ bool load_governor_models(llama_rn_context & owner,
     // CPU_REPACK ≈ W beside the prefill model's OpenCL copy, and no CPU_REPACK
     // line for prefill (its tensors are on OpenCL; its CPU residuals carry no
     // repack traits). The engine honours no_extra_bufts (use_extra_bufts =
-    // !no_extra_bufts, common.cpp) — the same flag bmoe_stream raises — so
-    // drop the second full copy here; decode pays the ~1.4x CPU decode cost
-    // the S23 repack A/B measured, in a lane where GPU prefill covers the 2.6x.
-    decode_params.no_extra_bufts = true;
+    // !no_extra_bufts, common.cpp) — the same flag bmoe_stream raises. Only
+    // the 8 GB S23 shape needs the second copy dropped (the lane does not fit
+    // with repack); decode then pays the ~1.4x CPU decode cost the S23 repack
+    // A/B measured, in a lane where GPU prefill covers the 2.6x. Everywhere
+    // else repack stays on (governor.decode_repack, default true).
+    if (!load_options.decode_repack) {
+        decode_params.no_extra_bufts = true;
+    }
 
     const bool profile_valid = governor_thermo_profile_is_valid(governor_thermo);
     auto cleanup = [&owner]() {
@@ -705,7 +710,8 @@ llama_governor_stats llama_rn_context::governorStats() const {
 bool llama_rn_context::loadModel(
     common_params &params_,
     const llama_governor_params * governor_params,
-    const llama_governor_thermo_profile * governor_thermo)
+    const llama_governor_thermo_profile * governor_thermo,
+    const governor_load_options & load_options)
 {
     const bool governor_enabled = governor_params != nullptr;
     // Do not return after the two-model load. Both modes converge here so the
@@ -804,7 +810,7 @@ bool llama_rn_context::loadModel(
     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
 
     if (governor_enabled) {
-        if (!load_governor_models(*this, *governor_params, *governor_thermo)) {
+        if (!load_governor_models(*this, *governor_params, *governor_thermo, load_options)) {
             return false;
         }
     } else {

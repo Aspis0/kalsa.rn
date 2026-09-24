@@ -17,13 +17,16 @@ struct llama_governor {
     // stall_enter()/stall_exit() are the only worker-thread callbacks; they are mutex-protected.
     int32_t decode(llama_batch batch);
     // The ONLY sanctioned way to rewind KV under a governor: removes [p, end)
-    // of sequence 0 on BOTH contexts and lowers both watermarks to
-    // min(watermark, p). A raw seq_rm on one context (prefix reuse between
-    // turns) leaves that side's sequence below its watermark - the next
-    // handoff fails "watermark is invalid" - and the other side keeps stale
-    // cells. Returns false when a side's cells beyond p could not be removed
-    // (hybrid rollback window): that side's watermark is then kept, because
-    // lowering it would let the next commit copy stale cells.
+    // of sequence 0 on BOTH contexts and rewinds both watermarks. When every
+    // side can express the partial rewind, both watermarks become
+    // min(watermark, p). When a side cannot (hybrid recurrent rollback
+    // window), that side's sequence is cleared entirely and BOTH watermarks
+    // go to 0, so the next handoff re-commits [0, end) attention cells and
+    // the wholesale recurrent state from the rewound side instead of
+    // adopting stale cells; commit_side additionally rejects any destination
+    // that still holds cells beyond the source end. A raw seq_rm on one
+    // context (prefix reuse between turns) is exactly that bypass. Returns
+    // false only when even the full clear could not drop a side.
     bool trim_sequence(llama_pos p);
     llama_context * context() const;
     llama_context * prefill_context() const;

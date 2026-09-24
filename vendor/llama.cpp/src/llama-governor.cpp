@@ -93,6 +93,15 @@ bool llama_governor::commit_side(llama_context * src_ctx, llama_context * dst_ct
         LLAMA_LOG_ERROR("%s: %s watermark is invalid\n", __func__, direction);
         return false;
     }
+    llama_pos dst_end = 0;
+    if (sequence_end(dst_ctx, 0, dst_end) && dst_end > end) {
+        // The destination holds cells the source has already rewound past:
+        // the handoff would decode the next turn on stale state. A raw KV
+        // rewind bypassed the governor (use llama_governor_trim_sequence).
+        LLAMA_LOG_ERROR("%s: %s destination holds cells beyond the source end (%d > %d)\n",
+                        __func__, direction, (int) dst_end, (int) end);
+        return false;
+    }
     if (end > src.watermark) {
         size_t copied_bytes = 0;
         // Keep staged selection on the same v_trans predicate used by mirror(); otherwise
@@ -149,19 +158,45 @@ void llama_governor::record_side(llama_context * ctx, side_state & side, bool pr
 }
 
 bool llama_governor::trim_sequence(llama_pos p) {
-    bool ok = true;
-    for (auto side : { std::make_pair(ctx_prefill, &prefill_state),
-                       std::make_pair(ctx_decode,  &decode_state) }) {
-        llama_memory_t mem = llama_get_memory(side.first);
+    struct side_t { llama_context * ctx; side_state * state; };
+    const side_t sides[2] = { { ctx_prefill, &prefill_state }, { ctx_decode, &decode_state } };
+
+    bool exact = true;
+    bool untrimmable[2] = { false, false };
+    for (int i = 0; i < 2; ++i) {
+        llama_memory_t mem = llama_get_memory(sides[i].ctx);
         llama_memory_seq_rm(mem, 0, p, -1);
         const llama_pos pos_max = llama_memory_seq_pos_max(mem, 0);
         if (pos_max != -1 && pos_max >= p) {
-            ok = false;
-        } else {
-            side.second->watermark = std::min(side.second->watermark, p);
+            // Hybrid: the recurrent rollback window refused, so neither the
+            // recurrent state nor the attention cells beyond p were removed.
+            untrimmable[i] = true;
+            exact = false;
         }
     }
-    return ok;
+    if (exact) {
+        for (int i = 0; i < 2; ++i) {
+            sides[i].state->watermark = std::min(sides[i].state->watermark, p);
+        }
+        return true;
+    }
+
+    // A partial rewind is inexpressible on at least one side. Drop that
+    // side's whole sequence and zero BOTH watermarks, so the next handoff
+    // re-commits [0, end) attention cells and the wholesale recurrent state
+    // from the rewound side (llama-hybrid-commit.cpp) instead of letting
+    // commit_side adopt the stale side.
+    for (int i = 0; i < 2; ++i) {
+        if (!untrimmable[i]) { continue; }
+        llama_memory_t mem = llama_get_memory(sides[i].ctx);
+        llama_memory_seq_rm(mem, 0, -1, -1);
+        if (llama_memory_seq_pos_max(mem, 0) != -1) {
+            return false;
+        }
+    }
+    prefill_state.watermark = 0;
+    decode_state.watermark = 0;
+    return true;
 }
 
 int32_t llama_governor::fail(const char * message) {

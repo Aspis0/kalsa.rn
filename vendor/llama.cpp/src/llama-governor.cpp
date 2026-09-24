@@ -170,6 +170,12 @@ void llama_governor::record_side(llama_context * ctx, side_state & side, bool pr
 }
 
 bool llama_governor::trim_sequence(llama_pos p) {
+    // A latched commit failure may have left a half-copied side; the binding
+    // calls this from loadPrompt before any governorFailed() check, so a
+    // retry must not seq_rm anything. Touch nothing once failed.
+    if (failed) {
+        return false;
+    }
     struct side_t { llama_context * ctx; side_state * state; };
     const side_t sides[2] = { { ctx_prefill, &prefill_state }, { ctx_decode, &decode_state } };
 

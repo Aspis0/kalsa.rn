@@ -16,6 +16,15 @@ struct llama_governor {
     // note_expert_route(), and stats() are decode-thread methods and must not overlap.
     // stall_enter()/stall_exit() are the only worker-thread callbacks; they are mutex-protected.
     int32_t decode(llama_batch batch);
+    // The ONLY sanctioned way to rewind KV under a governor: removes [p, end)
+    // of sequence 0 on BOTH contexts and lowers both watermarks to
+    // min(watermark, p). A raw seq_rm on one context (prefix reuse between
+    // turns) leaves that side's sequence below its watermark - the next
+    // handoff fails "watermark is invalid" - and the other side keeps stale
+    // cells. Returns false when a side's cells beyond p could not be removed
+    // (hybrid rollback window): that side's watermark is then kept, because
+    // lowering it would let the next commit copy stale cells.
+    bool trim_sequence(llama_pos p);
     llama_context * context() const;
     llama_context * prefill_context() const;
     llama_context * decode_context() const;

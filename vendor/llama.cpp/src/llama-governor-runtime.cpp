@@ -263,6 +263,10 @@ int32_t llama_governor_decode(llama_governor * governor, llama_batch batch) {
     return governor ? governor->decode(batch) : -1;
 }
 
+bool llama_governor_trim_sequence(llama_governor * governor, llama_pos p) {
+    return governor ? governor->trim_sequence(p) : false;
+}
+
 bool llama_governor_set_thermo_profile(llama_governor * governor,
                                        llama_governor_thermo_profile profile, int64_t now_ms) {
     return governor && governor->set_thermo_profile(profile, now_ms);

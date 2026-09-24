@@ -148,6 +148,22 @@ void llama_governor::record_side(llama_context * ctx, side_state & side, bool pr
     }
 }
 
+bool llama_governor::trim_sequence(llama_pos p) {
+    bool ok = true;
+    for (auto side : { std::make_pair(ctx_prefill, &prefill_state),
+                       std::make_pair(ctx_decode,  &decode_state) }) {
+        llama_memory_t mem = llama_get_memory(side.first);
+        llama_memory_seq_rm(mem, 0, p, -1);
+        const llama_pos pos_max = llama_memory_seq_pos_max(mem, 0);
+        if (pos_max != -1 && pos_max >= p) {
+            ok = false;
+        } else {
+            side.second->watermark = std::min(side.second->watermark, p);
+        }
+    }
+    return ok;
+}
+
 int32_t llama_governor::fail(const char * message) {
     failed = true;
     failure_reason_ = message;

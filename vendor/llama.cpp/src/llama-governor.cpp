@@ -110,8 +110,20 @@ bool llama_governor::commit_side(llama_context * src_ctx, llama_context * dst_ct
             ? llama_kv_commit_mode::Staged : llama_kv_commit_mode::Naive;
         llama_kv_commit_stats commit_stats{};
         const int64_t t0 = ggml_time_us();
-        const bool ok = llama_kv_commit_with_stats(dst_ctx, src_ctx, 0, src.watermark, end,
-                                                   &copied_bytes, mode, &commit_stats);
+        bool ok = false;
+        try {
+            ok = llama_kv_commit_with_stats(dst_ctx, src_ctx, 0, src.watermark, end,
+                                            &copied_bytes, mode, &commit_stats);
+        } catch (const std::exception & e) {
+            // The OpenCL set_tensor path throws on device OOM (86f602f8a). An
+            // escaping throw reaches JS as a generic rejection with no failed
+            // flag, and the still-zeroed watermarks would make every next
+            // turn retry the same full copy - latch it here instead.
+            snprintf(decode_failure_reason_, sizeof(decode_failure_reason_),
+                     "KV commit failed: %.80s", e.what());
+            fail(decode_failure_reason_);
+            return false;
+        }
         stats_.commit_us += ggml_time_us() - t0;
         if (!ok) {
             LLAMA_LOG_ERROR("%s: %s KV commit failed\n", __func__, direction);
@@ -257,7 +269,10 @@ int32_t llama_governor::decode_impl(llama_batch batch, bool allow_chunking) {
             ? commit_side(ctx_decode, ctx_prefill, decode_state, prefill_state, "decode-to-prefill")
             : commit_side(ctx_prefill, ctx_decode, prefill_state, decode_state, "prefill-to-decode");
         if (!ok) {
-            return fail("route Reject during phase handoff");
+            // commit_side may already have latched a specific reason (the KV
+            // commit catch); keep it instead of overwriting with the generic
+            // route Reject.
+            return failed ? -1 : fail("route Reject during phase handoff");
         }
     }
 

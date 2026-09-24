@@ -99,8 +99,9 @@ private:
     bool hot_plugged_announced_ = false;
     bool failed = false;
     const char * failure_reason_ = nullptr;
-    // Storage for the decode-failure reason; failure_reason_ points into it.
-    char decode_failure_reason_[48] = "";
+    // Storage for the decode/commit-failure reason; failure_reason_ points
+    // into it.
+    char decode_failure_reason_[128] = "";
 };
 
 // Internal RN bridge: returns the constructor error without emitting a second

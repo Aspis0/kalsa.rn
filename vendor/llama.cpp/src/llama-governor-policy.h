@@ -28,7 +28,8 @@ public:
 
     bool update_thermal(const llama_governor_thermo_profile & profile, int64_t now_ms);
     llama_governor_prefill_admission admit_prefill(
-            llama_governor_engine requested, uint32_t prompt_tokens, float now_c) const;
+            llama_governor_engine requested, uint32_t prompt_tokens, float now_c,
+            uint32_t n_batch = UINT32_MAX) const;
     llama_governor_decode_selection select_decode(int64_t now_ms);
 
     llama_governor_engine prefill_engine() const;

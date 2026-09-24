@@ -198,7 +198,7 @@ uint32_t llama_governor_policy::prefill_rule() const {
 }
 
 llama_governor_prefill_admission llama_governor_policy::admit_prefill(
-        llama_governor_engine requested, uint32_t prompt_tokens, float now_c) const {
+        llama_governor_engine requested, uint32_t prompt_tokens, float now_c, uint32_t n_batch) const {
     llama_governor_prefill_admission result{};
     result.engine = llama_governor_engine::CPU;
     // Non-finite now_c is unknown heat: both the warn-line test and the delta
@@ -213,7 +213,11 @@ llama_governor_prefill_admission llama_governor_policy::admit_prefill(
     }
 
     size_t table = sizeof(k_table_tokens) / sizeof(k_table_tokens[0]);
-    while (table > 0 && k_table_tokens[table - 1] > prompt_tokens) {
+    // Rows are capped to n_batch as well as to the prompt: the input batch may
+    // be larger than n_batch, and every executed piece must fit one
+    // llama_decode (which asserts n_tokens_all <= cparams.n_batch).
+    while (table > 0 && (k_table_tokens[table - 1] > prompt_tokens ||
+                         k_table_tokens[table - 1] > n_batch)) {
         --table;
     }
     // Owner decision 2026-09-24: below the warn line the smallest chunk always
@@ -229,7 +233,7 @@ llama_governor_prefill_admission llama_governor_policy::admit_prefill(
         --table;
     }
     if (table == 0) {
-        if (prompt_tokens < k_table_tokens[0] && below_warn) {
+        if (prompt_tokens < k_table_tokens[0] && prompt_tokens <= n_batch && below_warn) {
             result.tokens = prompt_tokens;
             result.rule = requested == llama_governor_engine::NPU ? 2 : requested == llama_governor_engine::CPU ? 9 : 3;
             result.decision = requested == llama_governor_engine::CPU
@@ -241,13 +245,27 @@ llama_governor_prefill_admission llama_governor_policy::admit_prefill(
     }
 
     result.tokens = k_table_tokens[table - 1];
-    // A prompt one token past its row would be partitioned row+1, and the
-    // 1-token tail is a decode, not a prefill (decode_impl: is_prefill =
-    // n_tokens > 1), so the runtime cannot execute that partition. Admit the
-    // whole prompt instead. Reaching here implies now_c < k_warn_c (the row
-    // passed the deltas or the floor kept it), so no ceiling is bypassed.
+    // Row+1 cannot be partitioned: the leftover token would be a 1-token
+    // batch, and a 1-token batch is a decode, not a prefill (decode_impl:
+    // is_prefill = n_tokens > 1). Promote it whole unless that would exceed
+    // n_batch. On the delta path the projection stays under k_limit_c; on the
+    // owner's floor path (now_c < k_warn_c, decision 2026-09-24) row 128
+    // passes by decision and 129 is that floor plus the one token that cannot
+    // run alone - its projection may sit above the limit, which the floor
+    // accepts.
     if (prompt_tokens - result.tokens == 1) {
-        result.tokens = prompt_tokens;
+        if (prompt_tokens <= n_batch) {
+            result.tokens = prompt_tokens;
+        } else if (table > 1) {
+            // Only when n_batch is itself a table row can row+1 exceed the
+            // cap; take the next row down so the remainder re-plans inside it.
+            --table;
+            result.tokens = k_table_tokens[table - 1];
+        } else {
+            // Cap is the smallest row (128) and the prompt is 129: 127 + 2
+            // keeps both pieces runnable inside the cap.
+            result.tokens = prompt_tokens - 2;
+        }
     }
     result.rule = requested == llama_governor_engine::NPU ? 2 : requested == llama_governor_engine::CPU ? 9 : 3;
     if (result.tokens != prompt_tokens) {

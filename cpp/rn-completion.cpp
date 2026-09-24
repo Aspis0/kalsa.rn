@@ -670,12 +670,14 @@ void llama_rn_context_completion::loadPrompt(const std::vector<std::string> &med
         // Under a governor the rewind above (raw seq_rm / checkpoint restore /
         // clear on the ACTIVE context) must also reach the other context and
         // both commit watermarks, or the next handoff fails "watermark is
-        // invalid" and turns into a route Reject (S23 B2 2026-09-23).
+        // invalid" and turns into a route Reject (S23 B2 2026-09-23). On the
+        // hybrid ship model the other side cannot be trimmed exactly; the
+        // governor then clears that side and re-commits [0, end) from the
+        // rewound side on the next handoff (a full recurrent-state copy).
         if (parent_ctx->governor && !parent_ctx->governor->trim_sequence(n_past)) {
-            // A side's cells beyond n_past survived (hybrid rollback window):
-            // its watermark is kept; the governor rejects the handoff loudly
-            // rather than commit stale cells.
-            LOG_WARNING("KALSA_KVTRIM governor trim kept a watermark at n_past=%d", (int) n_past);
+            // Even the full clear failed (should not happen): the handoff
+            // will reject loudly rather than commit stale cells.
+            LOG_WARNING("KALSA_KVTRIM governor trim failed at n_past=%d", (int) n_past);
         }
 
         // Frontier capture: the reused state already rests at n_past, so snapshot

@@ -33,8 +33,8 @@ public:
     llama_governor_stats stats() const;
 
     // The only sanctioned KV rewind under a governor (both contexts, both
-    // watermarks); see llama_governor_trim_sequence. False when a side's
-    // cells beyond p could not be removed.
+    // watermarks); see llama_governor_trim_sequence. False only when even the
+    // full clear of an untrimmable side failed.
     bool trim_sequence(llama_pos p) const;
     bool failed() const { return failed_; }
     // The engine governor's sticky state (not the shadow); out-of-line because

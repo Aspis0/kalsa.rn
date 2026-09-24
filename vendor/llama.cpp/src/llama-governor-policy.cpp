@@ -208,12 +208,20 @@ llama_governor_prefill_admission llama_governor_policy::admit_prefill(
     while (table > 0 && k_table_tokens[table - 1] > prompt_tokens) {
         --table;
     }
+    // Owner decision 2026-09-24: below the warn line the smallest chunk always
+    // passes, so admission can only Wait at or above it. The per-row deltas are
+    // unmeasured defaults (40051f8ae) applied to CPU and GPU prefill alike;
+    // without this floor they empty the table at now_c > 37.6 C and refuse
+    // every prefill, even a 2-token prompt.
+    const bool below_warn = now_c < k_warn_c;
     while (table > 0 && now_c + k_cpu_delta_c[table - 1] > k_limit_c) {
+        if (table == 1 && below_warn) {
+            break;
+        }
         --table;
     }
     if (table == 0) {
-        if (prompt_tokens < k_table_tokens[0] &&
-            now_c + k_cpu_delta_c[0] <= k_limit_c) {
+        if (prompt_tokens < k_table_tokens[0] && below_warn) {
             result.tokens = prompt_tokens;
             result.rule = requested == llama_governor_engine::NPU ? 2 : requested == llama_governor_engine::CPU ? 9 : 3;
             result.decision = requested == llama_governor_engine::CPU

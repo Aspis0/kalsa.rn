@@ -7,6 +7,23 @@
 #include <stdexcept>
 #include <vector>
 
+namespace {
+
+const char * thermal_state_name(llama_governor_thermal_state state) {
+    switch (state) {
+        case llama_governor_thermal_state::Unknown:  return "Unknown";
+        case llama_governor_thermal_state::FAST:     return "FAST";
+        case llama_governor_thermal_state::WARM:     return "WARM";
+        case llama_governor_thermal_state::COOLMODE: return "COOLMODE";
+        case llama_governor_thermal_state::CRITICAL: return "CRITICAL";
+        case llama_governor_thermal_state::LOWBAT:   return "LOWBAT";
+        case llama_governor_thermal_state::Invalid:  return "Invalid";
+    }
+    return "?";
+}
+
+} // namespace
+
 void llama_governor::record_tally() {
     const auto tally = prefill_tally_.snapshot(telemetry_);
     stats_.prefill_cpu_us = tally.delta.cpu_us;
@@ -43,9 +60,9 @@ int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {
     }
 
     const auto requested = policy_.prefill_engine();
+    const float now_c = policy_.current_temperature_c();
     const auto admission = policy_.admit_prefill(
-            requested, static_cast<uint32_t>(batch.n_tokens),
-            policy_.current_temperature_c());
+            requested, static_cast<uint32_t>(batch.n_tokens), now_c);
     stats_.last_router_rule = admission.rule;
     if (admission.decision == llama_governor_decision::Abort) {
         return fail("prefill admission aborted");
@@ -53,7 +70,9 @@ int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {
     if (admission.decision == llama_governor_decision::Wait) {
         // No chunk fits under the thermal ceiling. Reducing tokens is the only
         // allowed fallback; never switch to another engine. Pause this turn.
-        LLAMA_LOG_WARN("%s: no safe prefill chunk under the thermal ceiling; pausing\n", __func__);
+        LLAMA_LOG_WARN("%s: no safe prefill chunk under the thermal ceiling; pausing "
+                       "(now_c=%.1f state=%s)\n",
+                       __func__, now_c, thermal_state_name(policy_.thermal_state()));
         return -2;
     }
     if (prefill_route_ == prefill_route::Undecided) {

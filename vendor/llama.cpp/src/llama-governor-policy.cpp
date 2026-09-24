@@ -270,6 +270,9 @@ llama_governor_prefill_admission llama_governor_policy::admit_prefill(
     result.rule = requested == llama_governor_engine::NPU ? 2 : requested == llama_governor_engine::CPU ? 9 : 3;
     if (result.tokens != prompt_tokens) {
         result.decision = llama_governor_decision::Chunk;
+        // Chunks execute on the requested engine; whole non-CPU admissions
+        // keep engine = CPU, which the runtime latch reads as the fallback.
+        result.engine = requested;
     } else if (requested == llama_governor_engine::CPU) {
         result.decision = llama_governor_decision::Admit;
     } else {

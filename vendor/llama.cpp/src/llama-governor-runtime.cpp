@@ -70,22 +70,6 @@ int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {
     const uint32_t n_batch = ctx_prefill != nullptr && ctx_decode != nullptr
         ? std::min(ctx_prefill->get_cparams().n_batch, ctx_decode->get_cparams().n_batch)
         : UINT32_MAX; // test-only governor without contexts
-    if (prefill_route_ == prefill_route::CPU) {
-        // The latched route skips re-admission below, so the Invalid/CRITICAL
-        // gate must still run here: a profile invalidated between two prefill
-        // batches would otherwise run unchecked.
-        if (policy_.thermal_state() == llama_governor_thermal_state::Invalid ||
-            policy_.thermal_state() == llama_governor_thermal_state::CRITICAL) {
-            return fail("prefill admission aborted");
-        }
-        if (static_cast<uint32_t>(batch.n_tokens) <= n_batch) {
-            return 0;
-        }
-        // Oversized batch: fall through, so the latched route is partitioned
-        // under n_batch exactly like an undecided one (the whole batch would
-        // abort in llama_decode).
-    }
-
     const auto requested = policy_.prefill_engine();
     const float now_c = policy_.current_temperature_c();
     const auto admission = policy_.admit_prefill(
@@ -101,11 +85,15 @@ int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {
         return -2;
     }
     if (prefill_route_ == prefill_route::Undecided) {
-        prefill_route_ = requested == llama_governor_engine::CPU ? prefill_route::CPU : prefill_route::GPU;
-        stats_.prefill_engine = requested;
+        // The latch picks the turn's engine from the policy's verdict: a
+        // CPUFallback whole admission runs on the decode (CPU) context, not
+        // on the requested one; later batches keep this route.
+        prefill_route_ = admission.engine == llama_governor_engine::CPU ? prefill_route::CPU : prefill_route::GPU;
+        stats_.prefill_engine = admission.engine;
     }
     if (admission.decision == llama_governor_decision::CPUFallback) {
-        // The policy already reduced the request to a table row that fits.
+        // Whole admission the policy did not reduce; the latch above already
+        // placed it on the policy's engine.
         return 0;
     }
     if (admission.tokens >= static_cast<uint32_t>(batch.n_tokens)) {
@@ -123,12 +111,13 @@ int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {
                 policy_.prefill_engine(), static_cast<uint32_t>(remaining),
                 policy_.current_temperature_c(), n_batch);
         if (next.decision == llama_governor_decision::Wait) {
-            // Honour the Wait as the pause the first admission gives: nothing
-            // has executed yet and a Wait means do not run. Checked before the
-            // tokens==0 guard below - a policy Wait always carries tokens 0,
-            // so that guard used to swallow it: -2 without this warn, and the
-            // outer admission's rule stamp left the binding calling it
-            // unexplained instead of thermal.
+            // Defensive: under the threading contract the profile cannot change
+            // inside one decode, and an admission that reached the planner
+            // (Chunk) implies below k_warn_c, so no remainder can ever Wait
+            // here (no deterministic test exists for that reason). If one
+            // somehow does, pause like the first admission: -2 with the
+            // thermal warn and rule-0 stamp, before the tokens==0 guard below
+            // would swallow the Wait into a silent, mislabelled -2.
             stats_.last_router_rule = next.rule;
             log_thermal_pause(__func__, policy_.current_temperature_c(), policy_.thermal_state());
             return -2;

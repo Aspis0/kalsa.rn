@@ -56,6 +56,13 @@ void llama_governor::refresh_policy_stats() {
 
 int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {
     if (prefill_route_ == prefill_route::CPU) {
+        // The latched route skips re-admission below, so the Invalid/CRITICAL
+        // gate must still run here: a profile invalidated between two prefill
+        // batches would otherwise run unchecked.
+        if (policy_.thermal_state() == llama_governor_thermal_state::Invalid ||
+            policy_.thermal_state() == llama_governor_thermal_state::CRITICAL) {
+            return fail("prefill admission aborted");
+        }
         return 0;
     }
 
@@ -107,6 +114,9 @@ int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {
         }
         const int32_t count = std::min<int32_t>(next.tokens, remaining);
         if (count <= 1) {
+            // Unreachable while the policy never returns a chunk that leaves a
+            // 1-token remainder; keep it loud if that invariant ever breaks.
+            LLAMA_LOG_INFO("%s: prompt cannot be partitioned into runnable chunks\n", __func__);
             return -2;
         }
         chunk_sizes.push_back(count);

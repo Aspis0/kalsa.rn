@@ -54,6 +54,11 @@ bool llama_governor_policy::profile_is_valid(const llama_governor_thermo_profile
     if (!profile.sensor_valid || !std::isfinite(profile.trend_c_per_min)) {
         return false;
     }
+    // A battery below 0 C is a sensor fault, not a reading; accepted as
+    // valid it would classify the session as cool and open admission.
+    if (profile.batt_temp_tenths_c < 0) {
+        return false;
+    }
     if (profile.batt_level_pct < 0 || profile.batt_level_pct > 100) {
         return false;
     }
@@ -196,7 +201,10 @@ llama_governor_prefill_admission llama_governor_policy::admit_prefill(
         llama_governor_engine requested, uint32_t prompt_tokens, float now_c) const {
     llama_governor_prefill_admission result{};
     result.engine = llama_governor_engine::CPU;
-    if (!profile_valid_ || !have_profile_ || state_ == llama_governor_thermal_state::Invalid ||
+    // Non-finite now_c is unknown heat: both the warn-line test and the delta
+    // comparisons read false for NaN, which would admit the largest row.
+    if (!profile_valid_ || !have_profile_ || !std::isfinite(now_c) ||
+        state_ == llama_governor_thermal_state::Invalid ||
         state_ == llama_governor_thermal_state::CRITICAL || prompt_tokens == 0) {
         result.decision = state_ == llama_governor_thermal_state::Invalid ||
                           state_ == llama_governor_thermal_state::CRITICAL
@@ -233,6 +241,14 @@ llama_governor_prefill_admission llama_governor_policy::admit_prefill(
     }
 
     result.tokens = k_table_tokens[table - 1];
+    // A prompt one token past its row would be partitioned row+1, and the
+    // 1-token tail is a decode, not a prefill (decode_impl: is_prefill =
+    // n_tokens > 1), so the runtime cannot execute that partition. Admit the
+    // whole prompt instead. Reaching here implies now_c < k_warn_c (the row
+    // passed the deltas or the floor kept it), so no ceiling is bypassed.
+    if (prompt_tokens - result.tokens == 1) {
+        result.tokens = prompt_tokens;
+    }
     result.rule = requested == llama_governor_engine::NPU ? 2 : requested == llama_governor_engine::CPU ? 9 : 3;
     if (result.tokens != prompt_tokens) {
         result.decision = llama_governor_decision::Chunk;

@@ -158,7 +158,8 @@ bool llama_governor_policy::update_thermal(const llama_governor_thermo_profile &
 llama_governor_engine llama_governor_policy::prefill_engine() const {
     if (!valid_schema(params_) || !profile_valid_ || !have_profile_ ||
         state_ == llama_governor_thermal_state::CRITICAL || state_ == llama_governor_thermal_state::Invalid ||
-        state_ == llama_governor_thermal_state::LOWBAT || profile_.batt_level_pct < 45) {
+        state_ == llama_governor_thermal_state::LOWBAT ||
+        (profile_.batt_level_pct < 45 && !profile_.plugged)) {
         return llama_governor_engine::CPU;
     }
     if (params_.bench_force_gpu_prefill && params_.gpu_fit == llama_governor_fit::Fit) {

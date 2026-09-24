@@ -404,13 +404,15 @@ LLAMA_API int32_t llama_governor_decode(
         struct llama_batch batch);
 
 /**
- * Rewind sequence 0 on BOTH governor contexts: removes [p, end) and lowers
- * both commit watermarks to min(watermark, p). Callers that trim a governor
- * context's KV for prefix reuse MUST use this instead of a raw
- * llama_memory_seq_rm on one context, or the next phase handoff fails with
- * "watermark is invalid" and the other context keeps stale cells. Returns
- * false when a side's cells beyond p could not be removed; that side's
- * watermark is kept in that case.
+ * Rewind sequence 0 on both governor contexts, removing [p, end) where
+ * supported. If both sides trim exactly, lower both commit watermarks to
+ * min(watermark, p). If a side cannot be trimmed exactly, clear that side's
+ * sequence entirely and reset both watermarks to zero after a successful
+ * clear. Callers that trim a governor context's KV for prefix reuse MUST use
+ * this instead of a raw llama_memory_seq_rm on one context, or the next phase
+ * handoff fails with "watermark is invalid" and the other context keeps stale
+ * cells. Returns false if the governor has failed or a required full clear
+ * could not remove the sequence.
  */
 LLAMA_API bool llama_governor_trim_sequence(
         struct llama_governor * governor,

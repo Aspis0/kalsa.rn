@@ -47,6 +47,16 @@ test('content log formats sit only inside the content macro', () => {
   )
 })
 
+test('content logging Gradle flag is always explicit', () => {
+  // Both branches must pass the CMake variable, so a reused cache can never
+  // keep content logging ON after the property is removed.
+  const gradle = fs.readFileSync(
+    path.join(__dirname, '../../android/build.gradle'),
+    'utf8',
+  )
+  expect(gradle).toMatch(/-DRNLLAMA_LOG_CONTENT=\${rnllamaLogContent \? "ON" : "OFF"}/)
+})
+
 test('KVDIAG0 counts stay unconditional', () => {
   // Release builds keep the counts-only signal; the ids live in the macro.
   expect(cpp('rn-completion.cpp')).toContain('KALSA_KVDIAG0 cache_len=%zu prompt_len=%zu"')

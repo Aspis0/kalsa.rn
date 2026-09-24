@@ -160,11 +160,13 @@ android {
 
     // Content-bearing diagnostic logs (prompt text, token ids, stop words):
     // OFF by default so plain release APKs never log content. The debuggable
-    // test APK sets rnllamaLogContent=true in gradle.properties to turn them on.
-    if (rootProject.findProperty("rnllamaLogContent")?.toString()?.trim() == "true") {
+    // test APK sets rnllamaLogContent=true in gradle.properties to turn them
+    // on. OFF is passed explicitly so a reused CMake cache can never retain ON.
+    def rnllamaLogContent = rootProject.findProperty("rnllamaLogContent")?.toString()?.trim() == "true"
+    if (rnllamaLogContent) {
       println("ℹ️  rnllama content logging enabled")
-      cmakeArgs += ["-DRNLLAMA_LOG_CONTENT=ON"]
     }
+    cmakeArgs += ["-DRNLLAMA_LOG_CONTENT=${rnllamaLogContent ? "ON" : "OFF"}"]
 
     if (hexagonPresent) {
       println("✅ Hexagon SDK detected — enabling DSP build")

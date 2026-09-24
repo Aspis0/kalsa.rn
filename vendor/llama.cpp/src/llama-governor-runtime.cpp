@@ -85,15 +85,15 @@ int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {
         return -2;
     }
     if (prefill_route_ == prefill_route::Undecided) {
-        // The latch picks the turn's engine from the policy's verdict: a
-        // CPUFallback whole admission runs on the decode (CPU) context, not
-        // on the requested one; later batches keep this route.
+        // The latch decides the turn's engine only - admission already ran.
+        // engine equals requested, so a whole GPU admission keeps the GPU
+        // route (owner rule: the CPU heats more, do not take the GPU away).
         prefill_route_ = admission.engine == llama_governor_engine::CPU ? prefill_route::CPU : prefill_route::GPU;
         stats_.prefill_engine = admission.engine;
     }
     if (admission.decision == llama_governor_decision::CPUFallback) {
-        // Whole admission the policy did not reduce; the latch above already
-        // placed it on the policy's engine.
+        // Whole admission of a non-CPU request on its requested engine; the
+        // enum name is a historical misnomer - it does not fall back to CPU.
         return 0;
     }
     if (admission.tokens >= static_cast<uint32_t>(batch.n_tokens)) {

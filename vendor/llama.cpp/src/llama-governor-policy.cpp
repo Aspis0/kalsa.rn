@@ -236,6 +236,7 @@ llama_governor_prefill_admission llama_governor_policy::admit_prefill(
         if (prompt_tokens < k_table_tokens[0] && prompt_tokens <= n_batch && below_warn) {
             result.tokens = prompt_tokens;
             result.rule = requested == llama_governor_engine::NPU ? 2 : requested == llama_governor_engine::CPU ? 9 : 3;
+            result.engine = requested;
             result.decision = requested == llama_governor_engine::CPU
                 ? llama_governor_decision::Admit : llama_governor_decision::CPUFallback;
         } else {
@@ -268,11 +269,11 @@ llama_governor_prefill_admission llama_governor_policy::admit_prefill(
         }
     }
     result.rule = requested == llama_governor_engine::NPU ? 2 : requested == llama_governor_engine::CPU ? 9 : 3;
+    // Every admitted piece runs on the requested engine; the runtime latch
+    // reads this stamp to pick the turn's route.
+    result.engine = requested;
     if (result.tokens != prompt_tokens) {
         result.decision = llama_governor_decision::Chunk;
-        // Chunks execute on the requested engine; whole non-CPU admissions
-        // keep engine = CPU, which the runtime latch reads as the fallback.
-        result.engine = requested;
     } else if (requested == llama_governor_engine::CPU) {
         result.decision = llama_governor_decision::Admit;
     } else {

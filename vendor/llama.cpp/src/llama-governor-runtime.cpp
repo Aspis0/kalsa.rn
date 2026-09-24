@@ -56,6 +56,13 @@ void llama_governor::refresh_policy_stats() {
 }
 
 int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {
+    // Every executed piece must fit one llama_decode, which asserts
+    // n_tokens_all <= cparams.n_batch; the input batch itself may be larger
+    // (partitioning is this function's job). Either context can execute the
+    // pieces (CPU vs GPU route), so cap to the smaller n_batch.
+    const uint32_t n_batch = ctx_prefill != nullptr && ctx_decode != nullptr
+        ? std::min(ctx_prefill->get_cparams().n_batch, ctx_decode->get_cparams().n_batch)
+        : UINT32_MAX; // test-only governor without contexts
     if (prefill_route_ == prefill_route::CPU) {
         // The latched route skips re-admission below, so the Invalid/CRITICAL
         // gate must still run here: a profile invalidated between two prefill
@@ -64,18 +71,16 @@ int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {
             policy_.thermal_state() == llama_governor_thermal_state::CRITICAL) {
             return fail("prefill admission aborted");
         }
-        return 0;
+        if (static_cast<uint32_t>(batch.n_tokens) <= n_batch) {
+            return 0;
+        }
+        // Oversized batch: fall through, so the latched route is partitioned
+        // under n_batch exactly like an undecided one (the whole batch would
+        // abort in llama_decode).
     }
 
     const auto requested = policy_.prefill_engine();
     const float now_c = policy_.current_temperature_c();
-    // Every executed piece must fit one llama_decode, which asserts
-    // n_tokens_all <= cparams.n_batch; the input batch itself may be larger
-    // (partitioning is this function's job). Either context can execute the
-    // pieces (CPU vs GPU route), so cap to the smaller n_batch.
-    const uint32_t n_batch = ctx_prefill != nullptr && ctx_decode != nullptr
-        ? std::min(ctx_prefill->get_cparams().n_batch, ctx_decode->get_cparams().n_batch)
-        : UINT32_MAX; // test-only governor without contexts
     const auto admission = policy_.admit_prefill(
             requested, static_cast<uint32_t>(batch.n_tokens), now_c, n_batch);
     stats_.last_router_rule = admission.rule;

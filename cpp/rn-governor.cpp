@@ -61,6 +61,10 @@ int32_t rn_governor::decode(llama_batch batch) {
     return result;
 }
 
+bool rn_governor::trim_sequence(llama_pos p) const {
+    return governor_ != nullptr && llama_governor_trim_sequence(governor_, p);
+}
+
 bool rn_governor::engine_failed() const {
     return governor_ != nullptr && governor_->is_failed();
 }

@@ -32,6 +32,10 @@ public:
     bool set_thermo_profile(const llama_governor_thermo_profile & profile);
     llama_governor_stats stats() const;
 
+    // The only sanctioned KV rewind under a governor (both contexts, both
+    // watermarks); see llama_governor_trim_sequence. False when a side's
+    // cells beyond p could not be removed.
+    bool trim_sequence(llama_pos p) const;
     bool failed() const { return failed_; }
     // The engine governor's sticky state (not the shadow); out-of-line because
     // llama_governor is incomplete in this header.

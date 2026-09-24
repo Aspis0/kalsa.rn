@@ -1,4 +1,5 @@
 #include "rn-completion.h"
+#include "rn-governor.h"
 #include "rn-llama.h"
 #include "rn-tts.h"
 #include "rn-mtmd.hpp"
@@ -664,6 +665,17 @@ void llama_rn_context_completion::loadPrompt(const std::vector<std::string> &med
                 llama_memory_clear(kv, false);
                 n_past = 0;
             }
+        }
+
+        // Under a governor the rewind above (raw seq_rm / checkpoint restore /
+        // clear on the ACTIVE context) must also reach the other context and
+        // both commit watermarks, or the next handoff fails "watermark is
+        // invalid" and turns into a route Reject (S23 B2 2026-09-23).
+        if (parent_ctx->governor && !parent_ctx->governor->trim_sequence(n_past)) {
+            // A side's cells beyond n_past survived (hybrid rollback window):
+            // its watermark is kept; the governor rejects the handoff loudly
+            // rather than commit stale cells.
+            LOG_WARNING("KALSA_KVTRIM governor trim kept a watermark at n_past=%d", (int) n_past);
         }
 
         // Frontier capture: the reused state already rests at n_past, so snapshot

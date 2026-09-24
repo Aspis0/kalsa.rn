@@ -518,6 +518,16 @@ export type NativeCompletionResult = {
     context_full: boolean;
     interrupted: boolean;
     tokens_cached: number;
+    /**
+     * Governor flow-control pause of this completion (absent = none): the
+     * completion RESOLVED paused — not a failure. "thermal" (prefill refused
+     * under the thermal ceiling — resume when the device cools), "profile"
+     * (waiting for a valid thermal profile), "reload" (decode engine change
+     * needs a context reload), "unexplained" (a flow-control -2 the engine did
+     * not attribute — a retry may repeat it, so hosts must not treat it as
+     * thermal).
+     */
+    pause_reason?: 'thermal' | 'profile' | 'reload' | 'unexplained';
     timings: NativeCompletionResultTimings;
     completion_probabilities?: Array<NativeCompletionTokenProb>;
     generated_token_ids?: Array<number>;

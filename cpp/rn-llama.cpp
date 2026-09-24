@@ -680,21 +680,28 @@ int32_t llama_rn_context::decode(llama_batch batch) {
             reason.c_str(), (int) governor->gpu_fit(), (int) governor->profile_valid());
     }
     if (result == -2 && !governor->failed()) {
-        // The engine shares one rc across its flow-control -2s
-        // (rn-governor.h), so the batch kind plus the stats refreshed at this
-        // decode's entry are the only distinguishing facts the binding has:
-        // a multi-token batch (prefill admission) waits for a profile exactly
-        // while the thermal state is Unknown, and otherwise only under the
-        // thermal ceiling (below the warn line admission never waits, engine
-        // 497ca1cc) — the caller-chunking -2s need a chunk smaller than an
-        // admitted row, which the internal chunk loop cannot produce. A
-        // single-token batch (decode admission) is reload-required when the
-        // stats say so, otherwise the same profile wait.
+        // Flow-control -2s share one rc (rn-governor.h); the labels use only
+        // what the governor publishes in the stats of THIS decode. Prefill:
+        // Unknown state is the profile wait; last_router_rule == 0 means the
+        // admission returned Wait without naming an engine — its heat refusal
+        // (the warn-line ceiling, or a non-finite reading), and the only
+        // signal here that the governor itself says thermal (every admit/chunk
+        // return stamps rule {2,3,9} in llama-governor-policy.cpp). A -2 that
+        // follows an admitted engine is a partition refusal the binding cannot
+        // name — the count<=1 guard is unreachable while the policy admits
+        // row+1 whole (6581c7a7b), yet logged, not asserted, there — so it is
+        // "unexplained", never "thermal": no host may cool-and-resume a retry
+        // that would repeat the same partition. Decode: reload-required when
+        // the stats say so, otherwise the profile wait.
         const llama_governor_stats stats = governor->stats();
         if (batch.n_tokens > 1) {
-            governor_pause_ = stats.thermal_state == llama_governor_thermal_state::Unknown
-                ? "profile"
-                : "thermal";
+            if (stats.thermal_state == llama_governor_thermal_state::Unknown) {
+                governor_pause_ = "profile";
+            } else if (stats.last_router_rule == 0) {
+                governor_pause_ = "thermal";
+            } else {
+                governor_pause_ = "unexplained";
+            }
         } else {
             governor_pause_ = stats.decode_requires_reload ? "reload" : "profile";
         }

@@ -99,6 +99,9 @@ void llama_rn_context_completion::rewind() {
     stopped_limit = false;
     stopping_word = "";
     incomplete = false;
+    // Per completion: a later one must not inherit a previous pause
+    // (JSICompletion emits pause_reason whenever this field is set).
+    governor_pause = "";
     n_remain = 0;
     n_past = 0;
     parent_ctx->params.sampling.n_prev = parent_ctx->n_ctx;
@@ -1715,10 +1718,11 @@ completion_token_output llama_rn_context_completion::nextToken()
                 if (pause != nullptr) {
                     // Governor flow-control pause: a distinct outcome, not an
                     // eval failure — the completion resolves with
-                    // pause_reason and the host resumes the same turn once
-                    // the device allows it. No LOG_ERROR here; the engine
-                    // already warned, and calling a pause an eval failure is
-                    // what made it look like one.
+                    // pause_reason instead; what the host does with a reason
+                    // (cool-and-resume only for "thermal") is its own
+                    // decision. No LOG_ERROR here; the engine already warned,
+                    // and calling a pause an eval failure is what made it
+                    // look like one.
                     governor_pause = pause;
                     LOG_WARNING("governor paused decode (%s), n_eval: %d, n_past: %d",
                         pause, n_eval, n_past);

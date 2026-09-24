@@ -133,9 +133,10 @@ struct llama_rn_context_completion {
     bool context_full = false;
     bool truncated = false;
     // Governor flow-control pause of this completion's last decode (empty =
-    // none; "thermal" | "profile" | "reload"). Set instead of the eval-failure
-    // log so the resolved result is a distinct outcome the host can resume,
-    // never an error (see governorPause in rn-llama.h).
+    // none; "thermal" | "profile" | "reload" | "unexplained"). Set instead of
+    // the eval-failure log so the resolved result is a distinct outcome,
+    // never an error — what a reason means (cool-and-resume only for
+    // "thermal") is the host's decision (see governorPause in rn-llama.h).
     std::string governor_pause;
     bool stopped_eos = false;
     bool stopped_word = false;

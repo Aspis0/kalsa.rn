@@ -664,6 +664,7 @@ llama_context * llama_rn_context::active_ctx() const {
 }
 
 int32_t llama_rn_context::decode(llama_batch batch) {
+    governor_pause_ = nullptr;
     if (!governor) {
         return llama_decode(ctx, batch);
     }
@@ -677,6 +678,26 @@ int32_t llama_rn_context::decode(llama_batch batch) {
             "KALSA_GOVERNOR_FALLBACK {stage:\"%s\", models_loaded:2, reason:\"%s\", gpu_fit:%d, profile_valid:%d}",
             route_rejected ? "route_reject" : "decode",
             reason.c_str(), (int) governor->gpu_fit(), (int) governor->profile_valid());
+    }
+    if (result == -2 && !governor->failed()) {
+        // The engine shares one rc across its flow-control -2s
+        // (rn-governor.h), so the batch kind plus the stats refreshed at this
+        // decode's entry are the only distinguishing facts the binding has:
+        // a multi-token batch (prefill admission) waits for a profile exactly
+        // while the thermal state is Unknown, and otherwise only under the
+        // thermal ceiling (below the warn line admission never waits, engine
+        // 497ca1cc) — the caller-chunking -2s need a chunk smaller than an
+        // admitted row, which the internal chunk loop cannot produce. A
+        // single-token batch (decode admission) is reload-required when the
+        // stats say so, otherwise the same profile wait.
+        const llama_governor_stats stats = governor->stats();
+        if (batch.n_tokens > 1) {
+            governor_pause_ = stats.thermal_state == llama_governor_thermal_state::Unknown
+                ? "profile"
+                : "thermal";
+        } else {
+            governor_pause_ = stats.decode_requires_reload ? "reload" : "profile";
+        }
     }
     return result;
 }

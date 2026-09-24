@@ -185,6 +185,12 @@ namespace rnllama_jsi {
         res["stopped_limit"] = c.stopped_limit;
         res["stopping_word"] = c.stopping_word;
         res["tokens_cached"] = c.n_past;
+        if (!c.governor_pause.empty()) {
+            // Distinct resolved outcome of a governor flow-control pause:
+            // present only then, so a normal completion never carries it and
+            // a failure still arrives as the thrown error, never here.
+            res["pause_reason"] = c.governor_pause;
+        }
 
         if (ctx->isVocoderEnabled() && ctx->tts_wrapper != nullptr) {
             result.audio_tokens = ctx->tts_wrapper->audio_tokens;

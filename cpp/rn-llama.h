@@ -131,6 +131,9 @@ struct llama_rn_context {
     common_init_result_ptr governor_prefill_init;
     common_init_result_ptr governor_decode_init;
     std::unique_ptr<rn_governor> governor;
+    // Literal strings only (see governorPause): the last decode()'s
+    // flow-control pause classification, cleared at decode entry.
+    const char * governor_pause_ = nullptr;
     common_init_result_ptr llama_init;
     llama_context *ctx = nullptr;
     common_chat_templates_ptr templates;
@@ -164,6 +167,14 @@ struct llama_rn_context {
         const governor_load_options & load_options = governor_load_options{});
     llama_context * active_ctx() const;
     int32_t decode(llama_batch batch);
+    // The flow-control pause of the LAST decode() call, or nullptr when that
+    // call was not one: "thermal" (prefill refused under the thermal ceiling),
+    // "profile" (prefill/decode waiting for a valid thermal profile),
+    // "reload" (decode engine change needs a context reload). Reset at every
+    // decode() entry, so a reader immediately after its own decode sees that
+    // call's outcome; only valid while !governorFailed() — a failed governor
+    // keeps its error path (and the "Governor decode failed: " prefix).
+    const char * governorPause() const { return governor_pause_; }
     bool hasGovernor() const;
     bool governorFailed() const;
     std::string governorFailureReason() const;

@@ -1706,15 +1706,31 @@ completion_token_output llama_rn_context_completion::nextToken()
             }
             llama_batch_free(b);
         } else {
-            if (parent_ctx->decode(llama_batch_get_one(&embd[n_past], n_eval)))
+            const int32_t decode_rc =
+                parent_ctx->decode(llama_batch_get_one(&embd[n_past], n_eval));
+            if (decode_rc)
             {
-                // No token text here: the failure log reaches logcat, and the
-                // pending tokens are prompt/user content.
-                LOG_ERROR("failed to eval, n_eval: %d, n_past: %d, n_threads: %d",
-                    n_eval,
-                    n_past,
-                    parent_ctx->params.cpuparams.n_threads
-                );
+                const char * pause =
+                    decode_rc == -2 ? parent_ctx->governorPause() : nullptr;
+                if (pause != nullptr) {
+                    // Governor flow-control pause: a distinct outcome, not an
+                    // eval failure — the completion resolves with
+                    // pause_reason and the host resumes the same turn once
+                    // the device allows it. No LOG_ERROR here; the engine
+                    // already warned, and calling a pause an eval failure is
+                    // what made it look like one.
+                    governor_pause = pause;
+                    LOG_WARNING("governor paused decode (%s), n_eval: %d, n_past: %d",
+                        pause, n_eval, n_past);
+                } else {
+                    // No token text here: the failure log reaches logcat, and the
+                    // pending tokens are prompt/user content.
+                    LOG_ERROR("failed to eval, n_eval: %d, n_past: %d, n_threads: %d",
+                        n_eval,
+                        n_past,
+                        parent_ctx->params.cpuparams.n_threads
+                    );
+                }
                 // Trim embd to what the memory actually contains so a later prefix
                 // match can't claim never-written cells.
                 embd.resize(n_past);

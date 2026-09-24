@@ -123,7 +123,9 @@ bool llama_governor_policy::update_thermal(const llama_governor_thermo_profile &
         state_ = llama_governor_thermal_state::CRITICAL;
     } else if (state_ == llama_governor_thermal_state::CRITICAL) {
         if (can_leave(now_ms, temp, limits.critical_exit)) {
-            state_ = llama_governor_thermal_state::FAST;
+            state_ = !profile.plugged && profile.batt_level_pct < 25
+                ? llama_governor_thermal_state::LOWBAT
+                : llama_governor_thermal_state::FAST;
         }
     } else if (!profile.plugged && profile.batt_level_pct < 25) {
         state_ = llama_governor_thermal_state::LOWBAT;

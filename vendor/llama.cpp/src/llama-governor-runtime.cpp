@@ -23,6 +23,13 @@ const char * thermal_state_name(llama_governor_thermal_state state) {
     return "?";
 }
 
+// One definition: this line is parsed as an API (prefix must stay stable).
+void log_thermal_pause(const char * func, float now_c, llama_governor_thermal_state state) {
+    LLAMA_LOG_WARN("%s: no safe prefill chunk under the thermal ceiling; pausing "
+                   "(now_c=%.1f state=%s)\n",
+                   func, now_c, thermal_state_name(state));
+}
+
 } // namespace
 
 void llama_governor::record_tally() {
@@ -90,9 +97,7 @@ int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {
     if (admission.decision == llama_governor_decision::Wait) {
         // No chunk fits under the thermal ceiling. Reducing tokens is the only
         // allowed fallback; never switch to another engine. Pause this turn.
-        LLAMA_LOG_WARN("%s: no safe prefill chunk under the thermal ceiling; pausing "
-                       "(now_c=%.1f state=%s)\n",
-                       __func__, now_c, thermal_state_name(policy_.thermal_state()));
+        log_thermal_pause(__func__, now_c, policy_.thermal_state());
         return -2;
     }
     if (prefill_route_ == prefill_route::Undecided) {
@@ -117,13 +122,20 @@ int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {
         const auto next = policy_.admit_prefill(
                 policy_.prefill_engine(), static_cast<uint32_t>(remaining),
                 policy_.current_temperature_c(), n_batch);
+        if (next.decision == llama_governor_decision::Wait) {
+            // Honour the Wait as the pause the first admission gives: nothing
+            // has executed yet and a Wait means do not run. Checked before the
+            // tokens==0 guard below - a policy Wait always carries tokens 0,
+            // so that guard used to swallow it: -2 without this warn, and the
+            // outer admission's rule stamp left the binding calling it
+            // unexplained instead of thermal.
+            stats_.last_router_rule = next.rule;
+            log_thermal_pause(__func__, policy_.current_temperature_c(), policy_.thermal_state());
+            return -2;
+        }
         if (next.decision == llama_governor_decision::Abort || next.tokens == 0) {
             LLAMA_LOG_INFO("%s: prompt cannot be partitioned into safe tabled chunks\n", __func__);
             return -2;
-        }
-        if (next.decision == llama_governor_decision::Wait) {
-            // No GPU chunk has run in this call yet; keep the turn's first route.
-            return 0;
         }
         const int32_t count = std::min<int32_t>(next.tokens, remaining);
         if (count <= 1) {

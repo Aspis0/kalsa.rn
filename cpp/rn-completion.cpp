@@ -538,10 +538,11 @@ void llama_rn_context_completion::loadPrompt(const std::vector<std::string> &med
         // Counts are logged in every build. The token ids and the detokenized
         // snippets are the user's own words, and WARNING-level logcat is collected
         // by Android bug reports, so both are compiled in for debug builds only:
-        // RNLLAMA_ANDROID_ENABLE_LOGGING is set by CMake when CMAKE_BUILD_TYPE is
-        // Debug (rnllama/CMakeLists.txt). NDEBUG cannot serve here — that target
-        // sets it unconditionally. Token ids are NOT exempt, which this code used
-        // to assume: detokenizing them recovers the words exactly.
+        // RNLLAMA_LOG_CONTENT is OFF by default and ON only in content-logging
+        // builds (the debuggable test APK passes -DRNLLAMA_LOG_CONTENT via the
+        // rnllamaLogContent Gradle property). NDEBUG cannot serve here — that
+        // target sets it unconditionally. Token ids are NOT exempt, which this
+        // code used to assume: detokenizing them recovers the words exactly.
         if (n_common < embd.size() && n_common < text_tokens.size()) {
             const size_t pre = 8;
             const size_t post = 12;
@@ -551,7 +552,7 @@ void llama_rn_context_completion::loadPrompt(const std::vector<std::string> &med
             rnllama::log("WARNING", __func__, __LINE__,
                 "KALSA_KVDIVERGE n_common=%zu shared_lo=%zu embd_hi=%zu text_hi=%zu",
                 n_common, shared_lo, embd_hi, text_hi);
-#ifdef RNLLAMA_ANDROID_ENABLE_LOGGING
+#ifdef RNLLAMA_LOG_CONTENT
             std::string shared_ids, embd_ids, text_ids;
             for (size_t i = shared_lo; i < n_common; i++) {
                 shared_ids += std::to_string(embd[i]) + " ";
@@ -595,6 +596,13 @@ void llama_rn_context_completion::loadPrompt(const std::vector<std::string> &med
         // wastes a restored session. Print both heads so the divergence can be
         // named instead of guessed (mirrors the KVDIAG idea from the MoE work).
         if (n_common == 0 && !embd.empty() && !text_tokens.empty()) {
+            // The token ids are vocabulary-decodable prompt content: lab
+            // instruments parse them (product-suite KV-shift audits), so they
+            // stay debug-only like the KVDIVERGE ids above; release keeps
+            // the counts.
+            LOG_WARNING("KALSA_KVDIAG0 cache_len=%zu prompt_len=%zu",
+                embd.size(), text_tokens.size());
+#ifdef RNLLAMA_LOG_CONTENT
             std::string a, b;
             for (size_t i = 0; i < 12 && i < embd.size(); i++) {
                 a += std::to_string(embd[i]) + " ";
@@ -602,8 +610,9 @@ void llama_rn_context_completion::loadPrompt(const std::vector<std::string> &med
             for (size_t i = 0; i < 12 && i < text_tokens.size(); i++) {
                 b += std::to_string(text_tokens[i]) + " ";
             }
-            LOG_WARNING("KALSA_KVDIAG0 cache_len=%zu prompt_len=%zu cache_head=[%s] prompt_head=[%s]",
-                embd.size(), text_tokens.size(), a.c_str(), b.c_str());
+            LOG_WARNING("KALSA_KVDIAG0 cache_head=[%s] prompt_head=[%s]",
+                a.c_str(), b.c_str());
+#endif
         }
 
         n_past = (llama_pos) n_common;
@@ -1457,9 +1466,15 @@ completion_token_output llama_rn_context_completion::nextToken()
     if (is_codec_lm_ar_tts &&
         parent_ctx->tts_wrapper->chatterbox_prefill_pending) {
 
-        LOG_INFO("Chatterbox prefill: entering block, n_past=%d text='%s'",
+        // The TTS input is user content: release builds log the length only,
+        // content-logging builds (RNLLAMA_LOG_CONTENT) add the text.
+        LOG_INFO("Chatterbox prefill: entering block, n_past=%d text_len=%zu",
                  n_past,
+                 parent_ctx->tts_wrapper->chatterbox_text.size());
+#ifdef RNLLAMA_LOG_CONTENT
+        LOG_INFO("Chatterbox prefill text='%s'",
                  parent_ctx->tts_wrapper->chatterbox_text.substr(0,40).c_str());
+#endif
 
         parent_ctx->tts_wrapper->chatterbox_prefill_pending = false;
 

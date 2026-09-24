@@ -440,8 +440,15 @@ inline void llama_rn_context_mtmd::processMedia(
         full_prompt += default_media_marker;
     }
 
-    LOG_INFO("[DEBUG] Processing message with role=user, content=%s", full_prompt.c_str());
-    LOG_INFO("[DEBUG] Processing %zu media with prompt: %s", media_paths.size(), prompt.c_str());
+    // No prompt text by default: LOG_INFO reaches logcat in release builds;
+    // the content forms are compiled only for content-logging builds
+    // (RNLLAMA_LOG_CONTENT, set by the rnllamaLogContent Gradle property).
+    LOG_INFO("Processing message with role=user, content_len=%zu", full_prompt.size());
+    LOG_INFO("Processing %zu media, prompt_len=%zu", media_paths.size(), prompt.size());
+#ifdef RNLLAMA_LOG_CONTENT
+    LOG_INFO("[DEBUG] message content=%s", full_prompt.c_str());
+    LOG_INFO("[DEBUG] media prompt: %s", prompt.c_str());
+#endif
     LOG_INFO("[DEBUG] Current context state: n_past=%d, n_ctx=%d", n_past, n_ctx);
 
     auto result = tokenizeWithMedia(this, full_prompt, media_paths);

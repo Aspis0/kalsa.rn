@@ -71,6 +71,13 @@ function(build_rnllama_library target_name arch cpu_flags)
         target_compile_options(${target_name} PRIVATE -DRNLLAMA_ANDROID_ENABLE_LOGGING)
     endif ()
 
+    # Content-bearing diagnostic logs (prompt text, token ids, stop words):
+    # OFF by default; the debuggable test APK passes -DRNLLAMA_LOG_CONTENT=ON
+    # from the rnllamaLogContent Gradle property (android/build.gradle).
+    if (RNLLAMA_LOG_CONTENT)
+        target_compile_options(${target_name} PRIVATE -DRNLLAMA_LOG_CONTENT)
+    endif ()
+
     # Hexagon backend support
     # Note: Hexagon requires building DSP libraries with Hexagon SDK toolchain
     # This is a complex process that needs to be done separately

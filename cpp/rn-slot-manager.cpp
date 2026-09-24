@@ -1153,7 +1153,13 @@ void llama_rn_slot_manager::sample_and_callback() {
                                     slot.stopped_word = true;
                                     slot.stopping_word = word;
                                     should_stop = true;
+                                    // The word can be a caller-supplied user
+                                    // string: length only in release, the word
+                                    // itself in content-logging builds.
+                                    LOG_INFO("Slot %d: Stopped on word (len=%zu)", slot.id, word.size());
+#ifdef RNLLAMA_LOG_CONTENT
                                     LOG_INFO("Slot %d: Stopped on word '%s'", slot.id, word.c_str());
+#endif
                                     break;
                                 }
                             }
@@ -1293,7 +1299,13 @@ void llama_rn_slot_manager::sample_and_callback() {
                             slot.stopped_word = true;
                             slot.stopping_word = word;
                             should_stop = true;
+                            // The word can be a caller-supplied user
+                            // string: length only in release, the word
+                            // itself in content-logging builds.
+                            LOG_INFO("Slot %d: Stopped on word (len=%zu)", slot.id, word.size());
+#ifdef RNLLAMA_LOG_CONTENT
                             LOG_INFO("Slot %d: Stopped on word '%s'", slot.id, word.c_str());
+#endif
                             break;
                         }
                     }

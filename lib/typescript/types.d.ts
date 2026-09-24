@@ -204,6 +204,7 @@ export type NativeContextParams = {
         bench_force_gpu_prefill?: boolean;
         npu_lane_enabled?: boolean;
         reload_budget_available?: boolean;
+        decode_repack?: boolean;
         thermo: GovernorThermoProfile;
     };
 };

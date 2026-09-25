@@ -3,6 +3,7 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 
@@ -49,7 +50,9 @@ public:
 private:
     llama_governor * governor_ = nullptr;
     llama_governor_fit gpu_fit_ = llama_governor_fit::Unknown;
-    bool failed_ = false;
+    // Atomic: decode() writes it on the decode thread while the override
+    // setter (allowed to overlap decode) reads it from a pool worker.
+    std::atomic<bool> failed_{false};
     bool profile_valid_ = false;
     std::string failure_reason_;
 };

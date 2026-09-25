@@ -100,6 +100,11 @@ private:
     llama_governor_stall_union stall_union_;
     phase last_phase = phase::None;
     prefill_route prefill_route_ = prefill_route::Undecided;
+    // Turn snapshot of the /bench route override, taken with the route latch
+    // so every route fact of one completion reports the same mode and the
+    // same causal decision, whatever a concurrent push does afterwards.
+    llama_governor_prefill_mode turn_prefill_mode_ = llama_governor_prefill_mode::Auto;
+    bool turn_override_decided_ = false;
     bool hot_plugged_announced_ = false;
     bool failed = false;
     const char * failure_reason_ = nullptr;

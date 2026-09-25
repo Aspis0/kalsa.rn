@@ -162,22 +162,38 @@ bool llama_governor_policy::update_thermal(const llama_governor_thermo_profile &
     return true;
 }
 
-llama_governor_engine llama_governor_policy::prefill_engine() const {
+llama_governor_engine llama_governor_policy::prefill_engine(
+        llama_governor_prefill_mode * mode_used, bool * override_decided) const {
+    // One atomic load per call: the binding may push a new mode from another
+    // thread, and both outputs must describe the same decision.
+    const auto mode = prefill_override_.value.load();
+    if (mode_used != nullptr) {
+        *mode_used = mode;
+    }
+    if (override_decided != nullptr) {
+        *override_decided = false;
+    }
     if (!valid_schema(params_) || !profile_valid_ || !have_profile_ ||
         state_ == llama_governor_thermal_state::CRITICAL || state_ == llama_governor_thermal_state::Invalid ||
         state_ == llama_governor_thermal_state::LOWBAT) {
-        return llama_governor_engine::CPU;
+        return llama_governor_engine::CPU; // safety preempts: override_decided stays false
     }
     // Bench route dev hook: the override requests the engine only after the
     // safety verdict above. Force-GPU keeps the gpu_fit==Fit gate (the same
     // gate bench_force_gpu_prefill uses below); a failed gate falls through
     // to the plan, which can only pick a Fit-guarded GPU path or CPU.
-    if (prefill_override_ == llama_governor_prefill_mode::CPU) {
+    if (mode == llama_governor_prefill_mode::CPU) {
+        if (override_decided != nullptr) {
+            *override_decided = true;
+        }
         return llama_governor_engine::CPU;
     }
-    if (prefill_override_ == llama_governor_prefill_mode::GPU) {
-        return params_.gpu_fit == llama_governor_fit::Fit ? llama_governor_engine::GPU
-                                                          : llama_governor_engine::CPU;
+    if (mode == llama_governor_prefill_mode::GPU) {
+        const bool fit = params_.gpu_fit == llama_governor_fit::Fit;
+        if (override_decided != nullptr) {
+            *override_decided = fit;
+        }
+        return fit ? llama_governor_engine::GPU : llama_governor_engine::CPU;
     }
     if (params_.bench_force_gpu_prefill && params_.gpu_fit == llama_governor_fit::Fit) {
         return llama_governor_engine::GPU;
@@ -338,8 +354,6 @@ bool llama_governor_policy::set_prefill_override(int mode) {
         mode > static_cast<int>(llama_governor_prefill_mode::GPU)) {
         return false;
     }
-    prefill_override_ = static_cast<llama_governor_prefill_mode>(mode);
+    prefill_override_.value.store(static_cast<llama_governor_prefill_mode>(mode));
     return true;
 }
-
-llama_governor_prefill_mode llama_governor_policy::prefill_override() const { return prefill_override_; }

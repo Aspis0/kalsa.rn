@@ -70,7 +70,9 @@ int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {
     const uint32_t n_batch = ctx_prefill != nullptr && ctx_decode != nullptr
         ? std::min(ctx_prefill->get_cparams().n_batch, ctx_decode->get_cparams().n_batch)
         : UINT32_MAX; // test-only governor without contexts
-    const auto requested = policy_.prefill_engine();
+    llama_governor_prefill_mode mode_used = llama_governor_prefill_mode::Auto;
+    bool override_decided = false;
+    const auto requested = policy_.prefill_engine(&mode_used, &override_decided);
     const float now_c = policy_.current_temperature_c();
     const auto admission = policy_.admit_prefill(
             requested, static_cast<uint32_t>(batch.n_tokens), now_c, n_batch);
@@ -90,6 +92,10 @@ int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {
         // route (owner rule: the CPU heats more, do not take the GPU away).
         prefill_route_ = admission.engine == llama_governor_engine::CPU ? prefill_route::CPU : prefill_route::GPU;
         stats_.prefill_engine = admission.engine;
+        // Snapshot the override inputs with the route: the facts of this
+        // turn can never mix modes even if a push lands mid-turn.
+        turn_prefill_mode_ = mode_used;
+        turn_override_decided_ = override_decided;
     }
     if (admission.decision == llama_governor_decision::CPUFallback) {
         // Whole admission of a non-CPU request on its requested engine; the
@@ -108,7 +114,7 @@ int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {
     int32_t remaining = batch.n_tokens;
     while (remaining > 0) {
         const auto next = policy_.admit_prefill(
-                policy_.prefill_engine(), static_cast<uint32_t>(remaining),
+                requested, static_cast<uint32_t>(remaining),
                 policy_.current_temperature_c(), n_batch);
         if (next.decision == llama_governor_decision::Wait) {
             // Defensive: under the threading contract the profile cannot change
@@ -217,6 +223,7 @@ void llama_governor::reset_prefill_stats() {
     stats_.prefill_n = 0;
     stats_.prefill_chunks[0] = '\0';
     stats_.route_chunk_count = 0;
+    stats_.route_chunks_truncated = false;
 }
 
 bool llama_governor::set_thermo_profile(const llama_governor_thermo_profile & profile, int64_t now_ms) {

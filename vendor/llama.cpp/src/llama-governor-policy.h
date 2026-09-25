@@ -2,7 +2,22 @@
 
 #include "llama-ext.h"
 
+#include <atomic>
 #include <cstdint>
+
+/** Copyable handle over an atomic prefill override: llama_governor_policy
+ *  stays copy-assignable (the router tests reassign whole policies) while
+ *  the binding's thread-pool push and a decode-thread read never race. */
+struct atomic_prefill_mode {
+    std::atomic<llama_governor_prefill_mode> value{llama_governor_prefill_mode::Auto};
+    atomic_prefill_mode() = default;
+    atomic_prefill_mode(llama_governor_prefill_mode mode) : value(mode) {}
+    atomic_prefill_mode(const atomic_prefill_mode & other) : value(other.value.load()) {}
+    atomic_prefill_mode & operator=(const atomic_prefill_mode & other) {
+        value.store(other.value.load());
+        return *this;
+    }
+};
 
 bool llama_governor_expert_substitution_would_displace(
         float lambda, bool resident, float resident_score,
@@ -32,12 +47,16 @@ public:
             uint32_t n_batch = UINT32_MAX) const;
     llama_governor_decode_selection select_decode(int64_t now_ms);
 
-    llama_governor_engine prefill_engine() const;
+    // The optional outputs stamp the causal route facts: mode_used is the
+    // single mode load of this call (reported even when safety preempts) and
+    // override_decided is true only when an override branch decided.
+    llama_governor_engine prefill_engine(
+            llama_governor_prefill_mode * mode_used = nullptr,
+            bool * override_decided = nullptr) const;
     uint32_t prefill_rule() const;
     // Bench route dev hook: mode is validated against
     // llama_governor_prefill_mode (0..2); false on anything else.
     bool set_prefill_override(int mode);
-    llama_governor_prefill_mode prefill_override() const;
     llama_governor_thermal_state thermal_state() const;
     llama_governor_fit npu_fit() const;
     float current_temperature_c() const;
@@ -74,7 +93,9 @@ private:
     bool cache_budget_warning_ = false;
     // /bench route dev hook; consulted only after the safety gates in
     // prefill_engine() - it requests, safety and admission still decide.
-    llama_governor_prefill_mode prefill_override_ = llama_governor_prefill_mode::Auto;
+    // Atomic: the binding pushes it from a thread-pool worker while a decode
+    // thread reads it - a plain field would be a data race.
+    atomic_prefill_mode prefill_override_;
     float t_idle_reference_c_ = 0.0f;
     bool have_t_idle_reference_ = false;
     llama_governor_engine last_decode_engine_ = llama_governor_engine::CPU;

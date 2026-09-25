@@ -323,7 +323,10 @@ struct llama_governor_route_chunk {
     llama_governor_prefill_mode actual = llama_governor_prefill_mode::CPU;
     uint32_t tokens = 0;
     uint64_t prefill_ms = 0;
-    bool forced = false;                // an active override whose demanded engine ran this chunk
+    // Causal: true only when the prefill engine's decision came from the
+    // override - the safety verdict did not preempt it and, for GPU, the
+    // gpu_fit==Fit gate allowed it. LOWBAT+cpu and NotFit+gpu are false.
+    bool forced = false;
 };
 
 /**
@@ -381,9 +384,11 @@ struct llama_governor_stats {
     char prefill_chunks[128] = {};
     // Per-completion route facts (reset by reset_prefill_stats, which the
     // binding calls at every completion start); overflow past the array
-    // keeps the first entries and stops recording.
+    // keeps the first entries, stops recording, and sets the flag so the
+    // truncation is observable instead of silent.
     llama_governor_route_chunk route_chunks[64] = {};
     uint32_t route_chunk_count = 0;
+    bool route_chunks_truncated = false;
 };
 
 /** Cumulative optional telemetry supplied by a streaming/backend integration. */

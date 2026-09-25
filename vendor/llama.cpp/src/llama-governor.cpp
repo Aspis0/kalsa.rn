@@ -244,6 +244,8 @@ int32_t llama_governor::decode_impl(llama_batch batch, bool allow_chunking) {
     }
 
     const bool is_prefill = batch.n_tokens > 1;
+    // The route latch re-arms only on prefill entry from another phase (or
+    // via clear_cache/reset): within one prefill phase the engine stays put.
     if (is_prefill && allow_chunking && last_phase != phase::Prefill) {
         prefill_route_ = prefill_route::Undecided;
     }
@@ -299,11 +301,10 @@ int32_t llama_governor::decode_impl(llama_batch batch, bool allow_chunking) {
     if (is_prefill) {
         stats_.prefill_us += static_cast<uint64_t>(ggml_time_us() - t0);
         // One route fact per executed prefill chunk (bench hook evidence),
-        // stamped from the snapshot taken with the admission latch: one
-        // latch, one mode. A prefill -> decode -> prefill sequence inside
-        // one reset interval re-latches and can record two modes. Overflow
-        // keeps the first entries and raises the truncation flag instead of
-        // failing.
+        // stamped from the snapshot taken with the route latch: one latch,
+        // one mode. A prefill -> decode -> prefill sequence inside one reset
+        // interval re-latches and can record two modes. Overflow keeps the
+        // first entries and raises the truncation flag instead of failing.
         if (stats_.route_chunk_count <
             sizeof(stats_.route_chunks) / sizeof(stats_.route_chunks[0])) {
             auto & chunk = stats_.route_chunks[stats_.route_chunk_count];

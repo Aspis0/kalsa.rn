@@ -15,8 +15,8 @@ struct llama_governor {
     // Threading contract: decode(), set_thermo_profile(), record_telemetry(),
     // note_expert_route(), and stats() are decode-thread methods and must not
     // overlap. set_prefill_override() is the one exception: it stores only the
-    // atomic mode in the policy, so it may overlap decode() and takes effect
-    // at the next prefill admission.
+    // atomic mode in the policy, so it may overlap decode(); the mode is
+    // consumed at the next prefill latch (see admit_prefill).
     // stall_enter()/stall_exit() are the only worker-thread callbacks; they are mutex-protected.
     int32_t decode(llama_batch batch);
     // The ONLY sanctioned way to rewind KV under a governor: removes [p, end)
@@ -39,7 +39,8 @@ struct llama_governor {
     void reset_prefill_stats();
     bool set_thermo_profile(const llama_governor_thermo_profile & profile, int64_t now_ms);
     // Bench route dev hook: validates mode (0..2) into the policy override.
-    // Atomic store only - no stats refresh; see the threading contract above.
+    // Atomic store only - no stats refresh (threading contract above); it
+    // takes effect at the next prefill latch.
     bool set_prefill_override(int mode);
     void record_telemetry(const llama_governor_telemetry_sample & sample);
     void stall_enter();
@@ -103,10 +104,10 @@ private:
     phase last_phase = phase::None;
     prefill_route prefill_route_ = prefill_route::Undecided;
     // Snapshot of the /bench route override, taken with the route latch so
-    // every route fact of one prefill admission reports the same mode and
-    // the same causal decision, whatever a concurrent push does afterwards.
-    // The latch re-arms at the next prefill entry, which may pick up a
-    // newer mode.
+    // every route fact of one prefill latch reports the same mode and the
+    // same causal decision, whatever a concurrent push does afterwards. The
+    // latch re-arms only at the next prefill entry from another phase, at
+    // clear_cache, or at a stats reset - which may pick up a newer mode.
     llama_governor_prefill_mode turn_prefill_mode_ = llama_governor_prefill_mode::Auto;
     bool turn_override_decided_ = false;
     bool hot_plugged_announced_ = false;

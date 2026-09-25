@@ -455,10 +455,14 @@ LLAMA_API bool llama_governor_set_thermo_profile(
         int64_t now_ms);
 
 /** Dev hook (/bench route): set the per-governor prefill override.
- *  mode: 0=auto (clears), 1=cpu, 2=gpu. Consulted only after the safety
- *  gates in prefill_engine(); admission is never bypassed. Safe to call
- *  while another thread decodes: it stores the mode atomically and the
- *  value is consulted at the next prefill admission. */
+ *  mode: 0=auto (clears), 1=cpu, 2=gpu. Safe to call while another thread
+ *  decodes: it stores the mode atomically. The prefill engine is chosen
+ *  once per route latch - the first admission after a decode, clear_cache()
+ *  or reset_prefill_stats() - and a latched route runs the whole prompt, so
+ *  engine-changing inputs (this override, LOWBAT, gpu fit) take effect at
+ *  the next latch, not at the next batch. Per-batch safety never waits for
+ *  the latch: Invalid/CRITICAL abort, the >=40 C Wait, the small-prompt
+ *  floor and the n_batch cap run on every admission. */
 LLAMA_API bool llama_governor_set_prefill_override(
         struct llama_governor * governor,
         int mode);

@@ -87,16 +87,21 @@ int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {
         return -2;
     }
     if (prefill_route_ == prefill_route::Undecided) {
-        // The latch decides the turn's engine only - admission already ran.
-        // engine equals requested, so a whole GPU admission keeps the GPU
-        // route (owner rule: the CPU heats more, do not take the GPU away).
+        // The engine is decided once per latch: engine-changing inputs
+        // (the override, LOWBAT, gpu fit) are read only while the route is
+        // Undecided, so a LOWBAT update between two same-phase prefills
+        // keeps the latched engine - switching mid-prompt would split the
+        // prompt's KV across the two contexts. Per-batch safety (abort,
+        // Wait, floor, cap) is admit_prefill's job and runs on every call.
+        // One latch, one mode: the latch re-arms at the next prefill entry
+        // from another phase, at clear_cache, or at a stats reset.
+        // engine equals requested; a non-CPU admission (GPU_COOLMODE
+        // included) keeps the GPU route - owner rule: the CPU heats more,
+        // do not take the GPU away.
         prefill_route_ = admission.engine == llama_governor_engine::CPU ? prefill_route::CPU : prefill_route::GPU;
         stats_.prefill_engine = admission.engine;
-        // Snapshot the override inputs with the route: one admission latch
-        // reports one mode and one causal decision, whatever a push lands
-        // mid-latch. The latch re-arms at the next prefill entry (after a
-        // decode or clear_cache), so one reset interval can still record
-        // two modes across two latches.
+        // Snapshot the override inputs with the route: every fact of this
+        // latch reports the same mode and the same causal decision.
         turn_prefill_mode_ = mode_used;
         turn_override_decided_ = override_decided;
     }
@@ -252,7 +257,8 @@ bool llama_governor::set_prefill_override(int mode) {
     }
     // Atomic mode store only. This method may overlap decode(), so it must
     // not touch stats_ or any other state decode writes - do not re-add the
-    // stats refresh here; decode_impl refreshes at the next admission.
+    // stats refresh here. The mode is consumed at the next prefill latch;
+    // decode_impl refreshes stats on the decode path in the meantime.
     return policy_.set_prefill_override(mode);
 }
 

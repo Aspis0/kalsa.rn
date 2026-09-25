@@ -154,7 +154,7 @@ export declare class LlamaContext {
          * @param onToken Callback fired for each generated token
          * @returns Promise resolving to object with requestId, promise (resolves to completion result), and stop function
          */
-        completion: (params: ParallelCompletionParams, onToken?: (requestId: number, data: TokenData) => void) => Promise<{
+        completion: (params: ParallelCompletionParams, onToken?: ((requestId: number, data: TokenData) => void) | undefined) => Promise<{
             requestId: number;
             promise: Promise<NativeCompletionResult>;
             stop: () => Promise<void>;
@@ -209,6 +209,9 @@ export declare class LlamaContext {
         tokenSize: number;
     }): Promise<number>;
     setGovernorThermo(profile: GovernorThermoProfile): Promise<boolean>;
+    /** Bench route dev hook: push the per-turn prefill override request
+     * ("cpu" | "gpu" | "auto"); the engine's safety gates still decide. */
+    setPrefillOverride(mode: 'cpu' | 'gpu' | 'auto'): Promise<void>;
     getGovernorStats(): Promise<GovernorStats>;
     isLlamaChatSupported(): boolean;
     isJinjaSupported(): boolean;

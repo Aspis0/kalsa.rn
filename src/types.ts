@@ -580,6 +580,20 @@ export type NativeCompletionResult = {
    * thermal).
    */
   pause_reason?: 'thermal' | 'profile' | 'reload' | 'unexplained'
+  /**
+   * One fact per executed prefill chunk of THIS completion (absent when the
+   * context has no governor): the pushed override mode, where the chunk
+   * actually ran, its size and prefill ms, and whether an active override
+   * demanded that engine (a safety/fit veto records forced=false).
+   */
+  route_chunks?: Array<{
+    index: number
+    requested: 'cpu' | 'gpu' | 'auto'
+    actual: 'cpu' | 'gpu'
+    tokens: number
+    prefill_ms: number
+    forced: boolean
+  }>
   timings: NativeCompletionResultTimings
 
   completion_probabilities?: Array<NativeCompletionTokenProb>

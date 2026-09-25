@@ -205,6 +205,10 @@ if (!NativeModules.RNLlama) {
       jest.fn(async () => true),
     )
     setGlobal(
+      'llamaSetPrefillOverride',
+      jest.fn(async () => true),
+    )
+    setGlobal(
       'llamaGetGovernorStats',
       jest.fn(async () => ({
         active: false,

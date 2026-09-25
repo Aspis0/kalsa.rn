@@ -106,6 +106,7 @@ const jsiBindingKeys = [
   'llamaModelInfo',
   'llamaGetBackendDevicesInfo',
   'llamaSetGovernorThermo',
+  'llamaSetPrefillOverride',
   'llamaGetGovernorStats',
   'llamaLoadSession',
   'llamaSaveSession',
@@ -722,6 +723,13 @@ export class LlamaContext {
   async setGovernorThermo(profile: GovernorThermoProfile): Promise<boolean> {
     const { llamaSetGovernorThermo } = getJsi()
     return llamaSetGovernorThermo(this.id, profile)
+  }
+
+  /** Bench route dev hook: push the per-turn prefill override request
+   * ("cpu" | "gpu" | "auto"); the engine's safety gates still decide. */
+  async setPrefillOverride(mode: 'cpu' | 'gpu' | 'auto'): Promise<void> {
+    const { llamaSetPrefillOverride } = getJsi()
+    await llamaSetPrefillOverride(this.id, mode)
   }
 
   async getGovernorStats(): Promise<GovernorStats> {

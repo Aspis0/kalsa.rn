@@ -180,6 +180,8 @@ struct llama_rn_context {
     std::string governorFailureReason() const;
     void resetGovernorPrefillStats();
     bool setThermoProfile(const llama_governor_thermo_profile & profile);
+    // Bench route dev hook: "cpu" | "gpu" | "auto" parsed by the JSI layer.
+    bool setPrefillOverride(int mode);
     llama_governor_stats governorStats() const;
     bool hasDraftModel() const;
     llama_model * getMTPDraftModel() const;

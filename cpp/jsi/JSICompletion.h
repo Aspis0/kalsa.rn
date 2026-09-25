@@ -37,6 +37,15 @@ namespace rnllama_jsi {
         }
     }
 
+    inline const char* prefillModeName(llama_governor_prefill_mode mode) {
+        switch (mode) {
+            case llama_governor_prefill_mode::CPU: return "cpu";
+            case llama_governor_prefill_mode::GPU: return "gpu";
+            case llama_governor_prefill_mode::Auto: break;
+        }
+        return "auto";
+    }
+
     inline std::string tokenPiece(rnllama::llama_rn_context* ctx, llama_token tok) {
         std::string piece = (ctx != nullptr && ctx->ctx != nullptr)
             ? rnllama::tokens_to_output_formatted_string(ctx->ctx, tok)
@@ -210,6 +219,23 @@ namespace rnllama_jsi {
         // prefill context, so llama_perf_context() of the decode context reports
         // no prompt tokens; take them from the governor stats when it ran.
         const auto governor_stats = ctx->governorStats();
+        // Per-chunk route facts of THIS completion: beginCompletion reset
+        // them, so a completion with no prefill carries an honest empty array.
+        if (ctx->hasGovernor()) {
+            json chunks = json::array();
+            for (uint32_t i = 0; i < governor_stats.route_chunk_count; ++i) {
+                const auto & chunk = governor_stats.route_chunks[i];
+                chunks.push_back(json::object({
+                    {"index", chunk.index},
+                    {"requested", prefillModeName(chunk.requested)},
+                    {"actual", prefillModeName(chunk.actual)},
+                    {"tokens", chunk.tokens},
+                    {"prefill_ms", chunk.prefill_ms},
+                    {"forced", chunk.forced},
+                }));
+            }
+            res["route_chunks"] = std::move(chunks);
+        }
         const bool governor_prefill = ctx->hasGovernor() && governor_stats.prefill_n > 0;
         t.prompt_n = governor_prefill
             ? (int32_t) governor_stats.prefill_n

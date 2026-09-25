@@ -30,6 +30,8 @@ public:
     void clear_cache(bool clear_data);
     void reset_prefill_stats();
     bool set_thermo_profile(const llama_governor_thermo_profile & profile);
+    // Bench route dev hook: 0=auto, 1=cpu, 2=gpu (engine validates).
+    bool set_prefill_override(int mode);
     llama_governor_stats stats() const;
 
     // The only sanctioned KV rewind under a governor (both contexts, both

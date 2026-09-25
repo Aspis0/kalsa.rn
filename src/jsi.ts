@@ -31,6 +31,10 @@ declare global {
     contextId: number,
     profile: GovernorThermoProfile,
   ) => Promise<boolean>
+  var llamaSetPrefillOverride: (
+    contextId: number,
+    mode: 'cpu' | 'gpu' | 'auto',
+  ) => Promise<boolean>
   var llamaGetGovernorStats: (contextId: number) => Promise<GovernorStats>
   var llamaLoadSession: (
     contextId: number,

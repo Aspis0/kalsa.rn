@@ -853,6 +853,35 @@ namespace rnllama_jsi {
         );
         runtime.global().setProperty(runtime, "llamaSetGovernorThermo", setGovernorThermo);
 
+        auto setPrefillOverride = jsi::Function::createFromHostFunction(runtime,
+            jsi::PropNameID::forAscii(runtime, "llamaSetPrefillOverride"),
+            2,
+            [callInvoker](jsi::Runtime& runtime, const jsi::Value&, const jsi::Value* arguments, size_t count) -> jsi::Value {
+                if (count < 2 || !arguments[1].isString()) {
+                    throw std::invalid_argument("prefill override mode is required");
+                }
+                const int contextId = (int) arguments[0].asNumber();
+                const auto mode = arguments[1].asString(runtime).utf8(runtime);
+                if (mode != "auto" && mode != "cpu" && mode != "gpu") {
+                    throw std::invalid_argument("prefill override must be cpu, gpu or auto");
+                }
+                return createPromiseTask(runtime, callInvoker,
+                    [contextId, mode]() -> PromiseResultGenerator {
+                        auto ctx = getContextOrThrow(contextId);
+                        throwIfContextBusy(ctx);
+                        if (!ctx->hasGovernor()) {
+                            throw std::runtime_error("Governor mode is not enabled");
+                        }
+                        const int code = mode == "cpu" ? 1 : mode == "gpu" ? 2 : 0;
+                        if (!ctx->setPrefillOverride(code)) {
+                            return [](jsi::Runtime&) { return jsi::Value(false); };
+                        }
+                        return [](jsi::Runtime&) { return jsi::Value(true); };
+                    }, contextId);
+            }
+        );
+        runtime.global().setProperty(runtime, "llamaSetPrefillOverride", setPrefillOverride);
+
         auto getGovernorStats = jsi::Function::createFromHostFunction(runtime,
             jsi::PropNameID::forAscii(runtime, "llamaGetGovernorStats"),
             1,

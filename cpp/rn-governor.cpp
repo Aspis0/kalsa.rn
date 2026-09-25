@@ -86,6 +86,13 @@ bool rn_governor::set_thermo_profile(const llama_governor_thermo_profile & profi
     return profile_valid_;
 }
 
+bool rn_governor::set_prefill_override(int mode) {
+    if (governor_ == nullptr || failed_) {
+        return false;
+    }
+    return llama_governor_set_prefill_override(governor_, mode);
+}
+
 llama_governor_stats rn_governor::stats() const {
     llama_governor_stats result{};
     llama_governor_get_stats(governor_, &result);

@@ -731,6 +731,10 @@ bool llama_rn_context::setThermoProfile(const llama_governor_thermo_profile & pr
     return governor != nullptr && governor->set_thermo_profile(profile);
 }
 
+bool llama_rn_context::setPrefillOverride(int mode) {
+    return governor != nullptr && governor->set_prefill_override(mode);
+}
+
 llama_governor_stats llama_rn_context::governorStats() const {
     return governor == nullptr ? llama_governor_stats{} : governor->stats();
 }

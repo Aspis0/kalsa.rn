@@ -6,6 +6,7 @@ declare global {
     var llamaModelInfo: (path: string, skip: string[]) => Promise<object>;
     var llamaGetBackendDevicesInfo: () => Promise<NativeBackendDeviceInfo[]>;
     var llamaSetGovernorThermo: (contextId: number, profile: GovernorThermoProfile) => Promise<boolean>;
+    var llamaSetPrefillOverride: (contextId: number, mode: 'cpu' | 'gpu' | 'auto') => Promise<boolean>;
     var llamaGetGovernorStats: (contextId: number) => Promise<GovernorStats>;
     var llamaLoadSession: (contextId: number, path: string) => Promise<NativeSessionLoadResult>;
     var llamaSaveSession: (contextId: number, path: string, size: number) => Promise<number>;

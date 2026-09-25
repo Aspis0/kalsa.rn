@@ -93,10 +93,10 @@ private:
     bool cache_budget_warning_ = false;
     // /bench route dev hook; consulted only after the safety gates in
     // prefill_engine() - it requests, safety and admission still decide.
-    // prefill_engine()'s engine answer (this override included, and LOWBAT's
-    // CPU verdict) is consumed by the runtime once per prefill latch, so a
-    // profile update mid-phase reroutes only at the next latch; per-batch
-    // safety (abort/Wait) does not go through here. Atomic: the binding
+    // prefill_engine()'s answer (this override included, and LOWBAT's CPU
+    // verdict) is read every admission but changes the route only at the
+    // prefill latch, so a profile update mid-phase reroutes only at the
+    // next latch; per-batch safety (abort/Wait) does not go through here. Atomic: the binding
     // pushes it from a thread-pool worker while a decode thread reads it -
     // a plain field would be a data race.
     atomic_prefill_mode prefill_override_;

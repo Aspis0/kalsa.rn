@@ -88,11 +88,12 @@ int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {
     }
     if (prefill_route_ == prefill_route::Undecided) {
         // The engine is decided once per latch: engine-changing inputs
-        // (the override, LOWBAT, gpu fit) are read only while the route is
-        // Undecided, so a LOWBAT update between two same-phase prefills
-        // keeps the latched engine - switching mid-prompt would split the
-        // prompt's KV across the two contexts. Per-batch safety (abort,
-        // Wait, floor, cap) is admit_prefill's job and runs on every call.
+        // (the override, LOWBAT, gpu fit) are read on every admission but
+        // applied to the route only while it is Undecided, so a LOWBAT
+        // update between two same-phase prefills keeps the latched engine -
+        // switching mid-prompt would split the prompt's KV across the two
+        // contexts. Per-batch safety (abort, Wait, floor, cap) is
+        // admit_prefill's job and runs on every call.
         // One latch, one mode: the latch re-arms at the next prefill entry
         // from another phase, at clear_cache, or at a stats reset.
         // engine equals requested; a non-CPU admission (GPU_COOLMODE

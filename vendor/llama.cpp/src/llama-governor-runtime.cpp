@@ -216,6 +216,7 @@ void llama_governor::reset_prefill_stats() {
     stats_.prefill_us = 0;
     stats_.prefill_n = 0;
     stats_.prefill_chunks[0] = '\0';
+    stats_.route_chunk_count = 0;
 }
 
 bool llama_governor::set_thermo_profile(const llama_governor_thermo_profile & profile, int64_t now_ms) {
@@ -233,6 +234,17 @@ bool llama_governor::set_thermo_profile(const llama_governor_thermo_profile & pr
         hot_plugged_announced_ = false;
     }
     return ok;
+}
+
+bool llama_governor::set_prefill_override(int mode) {
+    if (!policy_enabled_) {
+        return false;
+    }
+    if (!policy_.set_prefill_override(mode)) {
+        return false;
+    }
+    refresh_policy_stats();
+    return true;
 }
 
 void llama_governor::record_telemetry(const llama_governor_telemetry_sample & sample) {
@@ -313,6 +325,10 @@ bool llama_governor_trim_sequence(llama_governor * governor, llama_pos p) {
 bool llama_governor_set_thermo_profile(llama_governor * governor,
                                        llama_governor_thermo_profile profile, int64_t now_ms) {
     return governor && governor->set_thermo_profile(profile, now_ms);
+}
+
+bool llama_governor_set_prefill_override(llama_governor * governor, int mode) {
+    return governor && governor->set_prefill_override(mode);
 }
 
 void llama_governor_record_telemetry(llama_governor * governor, llama_governor_telemetry_sample sample) {

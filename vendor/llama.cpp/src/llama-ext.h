@@ -306,6 +306,26 @@ LLAMA_API bool llama_kv_commit_ex(
         llama_kv_commit_mode mode,
         struct llama_kv_commit_stats * stats);
 
+/** Per-governor prefill override of the `/bench route` dev hook: a REQUEST
+ *  consulted in prefill_engine() only after the safety early-returns.
+ *  Also the encoding of llama_governor_set_prefill_override's mode argument
+ *  and of llama_governor_route_chunk::{requested,actual}. */
+enum class llama_governor_prefill_mode {
+    Auto = 0, // no override: today's plan decides
+    CPU = 1,
+    GPU = 2,
+};
+
+/** One executed prefill chunk of a completion (bench route evidence). */
+struct llama_governor_route_chunk {
+    uint32_t index = 0;                 // 0-based within the completion
+    llama_governor_prefill_mode requested = llama_governor_prefill_mode::Auto;
+    llama_governor_prefill_mode actual = llama_governor_prefill_mode::CPU;
+    uint32_t tokens = 0;
+    uint64_t prefill_ms = 0;
+    bool forced = false;                // an active override whose demanded engine ran this chunk
+};
+
 /**
  * Statistics collected by llama_governor from existing context/KV APIs and
  * explicitly supplied router or telemetry inputs.
@@ -359,6 +379,11 @@ struct llama_governor_stats {
     uint64_t prefill_n = 0;
     uint32_t prefill_ctx_ngl = 0;
     char prefill_chunks[128] = {};
+    // Per-completion route facts (reset by reset_prefill_stats, which the
+    // binding calls at every completion start); overflow past the array
+    // keeps the first entries and stops recording.
+    llama_governor_route_chunk route_chunks[64] = {};
+    uint32_t route_chunk_count = 0;
 };
 
 /** Cumulative optional telemetry supplied by a streaming/backend integration. */
@@ -423,6 +448,13 @@ LLAMA_API bool llama_governor_set_thermo_profile(
         struct llama_governor * governor,
         struct llama_governor_thermo_profile profile,
         int64_t now_ms);
+
+/** Dev hook (/bench route): set the per-governor prefill override.
+ *  mode: 0=auto (clears), 1=cpu, 2=gpu. Consulted only after the safety
+ *  gates in prefill_engine(); admission is never bypassed. */
+LLAMA_API bool llama_governor_set_prefill_override(
+        struct llama_governor * governor,
+        int mode);
 
 /** Feed cumulative streaming/backend counters for phase-boundary attribution. */
 LLAMA_API void llama_governor_record_telemetry(

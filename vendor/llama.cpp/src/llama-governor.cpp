@@ -298,6 +298,23 @@ int32_t llama_governor::decode_impl(llama_batch batch, bool allow_chunking) {
 
     if (is_prefill) {
         stats_.prefill_us += static_cast<uint64_t>(ggml_time_us() - t0);
+        // One route fact per executed prefill chunk (bench hook evidence);
+        // overflow keeps the first entries and stops recording.
+        if (stats_.route_chunk_count <
+            sizeof(stats_.route_chunks) / sizeof(stats_.route_chunks[0])) {
+            auto & chunk = stats_.route_chunks[stats_.route_chunk_count];
+            const auto mode = policy_.prefill_override();
+            chunk.index = stats_.route_chunk_count;
+            chunk.requested = mode;
+            chunk.actual = cpu_prefill ? llama_governor_prefill_mode::CPU
+                                       : llama_governor_prefill_mode::GPU;
+            chunk.tokens = static_cast<uint32_t>(batch.n_tokens);
+            chunk.prefill_ms = static_cast<uint64_t>((ggml_time_us() - t0) / 1000);
+            // A safety/fit veto ran elsewhere than the requested engine and
+            // must read as not forced, whatever the reason.
+            chunk.forced = mode != llama_governor_prefill_mode::Auto && chunk.actual == mode;
+            ++stats_.route_chunk_count;
+        }
     }
 
     record_side(target, *state, is_prefill, batch.n_tokens);

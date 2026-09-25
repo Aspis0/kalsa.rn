@@ -12,8 +12,9 @@ struct llama_governor {
     explicit llama_governor(llama_governor_params governor_params);
     ~llama_governor();
 
-    // Threading contract: decode(), set_thermo_profile(), record_telemetry(),
-    // note_expert_route(), and stats() are decode-thread methods and must not overlap.
+    // Threading contract: decode(), set_thermo_profile(), set_prefill_override(),
+    // record_telemetry(), note_expert_route(), and stats() are decode-thread
+    // methods and must not overlap.
     // stall_enter()/stall_exit() are the only worker-thread callbacks; they are mutex-protected.
     int32_t decode(llama_batch batch);
     // The ONLY sanctioned way to rewind KV under a governor: removes [p, end)
@@ -35,6 +36,9 @@ struct llama_governor {
     void clear_cache(bool clear_data);
     void reset_prefill_stats();
     bool set_thermo_profile(const llama_governor_thermo_profile & profile, int64_t now_ms);
+    // Bench route dev hook: validates mode (0..2) into the policy override and
+    // refreshes stats so prefill_engine()'s answer is visible immediately.
+    bool set_prefill_override(int mode);
     void record_telemetry(const llama_governor_telemetry_sample & sample);
     void stall_enter();
     void stall_exit();

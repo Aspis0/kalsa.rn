@@ -34,6 +34,10 @@ public:
 
     llama_governor_engine prefill_engine() const;
     uint32_t prefill_rule() const;
+    // Bench route dev hook: mode is validated against
+    // llama_governor_prefill_mode (0..2); false on anything else.
+    bool set_prefill_override(int mode);
+    llama_governor_prefill_mode prefill_override() const;
     llama_governor_thermal_state thermal_state() const;
     llama_governor_fit npu_fit() const;
     float current_temperature_c() const;
@@ -68,6 +72,9 @@ private:
     bool have_profile_ = false;
     bool hot_plugged_ = false;
     bool cache_budget_warning_ = false;
+    // /bench route dev hook; consulted only after the safety gates in
+    // prefill_engine() - it requests, safety and admission still decide.
+    llama_governor_prefill_mode prefill_override_ = llama_governor_prefill_mode::Auto;
     float t_idle_reference_c_ = 0.0f;
     bool have_t_idle_reference_ = false;
     llama_governor_engine last_decode_engine_ = llama_governor_engine::CPU;

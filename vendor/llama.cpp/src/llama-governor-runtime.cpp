@@ -92,8 +92,11 @@ int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {
         // route (owner rule: the CPU heats more, do not take the GPU away).
         prefill_route_ = admission.engine == llama_governor_engine::CPU ? prefill_route::CPU : prefill_route::GPU;
         stats_.prefill_engine = admission.engine;
-        // Snapshot the override inputs with the route: the facts of this
-        // turn can never mix modes even if a push lands mid-turn.
+        // Snapshot the override inputs with the route: one admission latch
+        // reports one mode and one causal decision, whatever a push lands
+        // mid-latch. The latch re-arms at the next prefill entry (after a
+        // decode or clear_cache), so one reset interval can still record
+        // two modes across two latches.
         turn_prefill_mode_ = mode_used;
         turn_override_decided_ = override_decided;
     }
@@ -247,11 +250,10 @@ bool llama_governor::set_prefill_override(int mode) {
     if (!policy_enabled_) {
         return false;
     }
-    if (!policy_.set_prefill_override(mode)) {
-        return false;
-    }
-    refresh_policy_stats();
-    return true;
+    // Atomic mode store only. This method may overlap decode(), so it must
+    // not touch stats_ or any other state decode writes - do not re-add the
+    // stats refresh here; decode_impl refreshes at the next admission.
+    return policy_.set_prefill_override(mode);
 }
 
 void llama_governor::record_telemetry(const llama_governor_telemetry_sample & sample) {

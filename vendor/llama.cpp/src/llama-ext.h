@@ -456,7 +456,9 @@ LLAMA_API bool llama_governor_set_thermo_profile(
 
 /** Dev hook (/bench route): set the per-governor prefill override.
  *  mode: 0=auto (clears), 1=cpu, 2=gpu. Consulted only after the safety
- *  gates in prefill_engine(); admission is never bypassed. */
+ *  gates in prefill_engine(); admission is never bypassed. Safe to call
+ *  while another thread decodes: it stores the mode atomically and the
+ *  value is consulted at the next prefill admission. */
 LLAMA_API bool llama_governor_set_prefill_override(
         struct llama_governor * governor,
         int mode);

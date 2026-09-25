@@ -7,9 +7,14 @@ namespace {
 
 constexpr int64_t k_dwell_ms = 10 * 60 * 1000;
 constexpr int64_t k_flip_window_ms = 60 * 60 * 1000;
-constexpr float k_warn_c = 40.0f;
+// Owner decision 2026-09-25: pause at 43 C, kill at 44 C. k_limit_c is the
+// admission projection ceiling - a row runs only while now_c + its delta
+// stays at or under it - with one exception: the 2026-09-24 floor passes
+// the smallest row below the pause line even when its projection exceeds
+// the ceiling.
+constexpr float k_warn_c = 43.0f;
 constexpr float k_limit_c = k_warn_c - 0.5f;
-constexpr float k_kill_c = 43.0f;
+constexpr float k_kill_c = 44.0f;
 constexpr float k_trend_c_per_min = 1.5f;
 constexpr uint32_t k_table_tokens[] = { 128, 512, 1024, 2048 };
 constexpr float k_cpu_delta_c[] = { 1.9f, 3.25f, 3.25f, 5.15f };
@@ -41,12 +46,16 @@ llama_governor_policy::llama_governor_policy(const llama_governor_params & param
 
 llama_governor_policy::thresholds llama_governor_policy::get_thresholds() const {
     if (!profile_.plugged) {
-        return { 38.0f, 36.0f, 39.5f, 36.5f, 42.0f, 34.0f };
+        return { 38.0f, 36.0f, 39.5f, 36.5f, k_kill_c, 34.0f };
     }
+    // Review round 2026-09-25: critical_enter is the kill line in both
+    // profiles. The plugged form min(t_idle + 7, kill) fired at 42 C for a
+    // 35 C idle, preempting the 43 C pause; the pause at 43 handles hot
+    // phones. Warm and cool routing caps stay pinned at 42 C.
     return {
         std::min(profile_.t_idle_c + 3.0f, 42.0f), profile_.t_idle_c + 1.0f,
         std::min(profile_.t_idle_c + 4.5f, 42.0f), profile_.t_idle_c + 1.5f,
-        std::min(profile_.t_idle_c + 7.0f, 42.0f), profile_.t_idle_c + 1.0f,
+        k_kill_c, profile_.t_idle_c + 1.0f,
     };
 }
 
@@ -250,8 +259,9 @@ llama_governor_prefill_admission llama_governor_policy::admit_prefill(
     // Owner decision 2026-09-24: below the warn line the smallest chunk always
     // passes, so admission can only Wait at or above it. The per-row deltas are
     // unmeasured defaults (40051f8ae) applied to CPU and GPU prefill alike;
-    // without this floor they empty the table at now_c > 37.6 C and refuse
-    // every prefill, even a 2-token prompt.
+    // without this floor they empty the table at now_c > k_limit_c - 1.9 C
+    // (40.6 C at the 2026-09-25 lines) and refuse every prefill, even a
+    // 2-token prompt.
     const bool below_warn = now_c < k_warn_c;
     while (table > 0 && now_c + k_cpu_delta_c[table - 1] > k_limit_c) {
         if (table == 1 && below_warn) {

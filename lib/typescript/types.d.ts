@@ -542,6 +542,9 @@ export type NativeCompletionResult = {
         prefill_ms: number;
         forced: boolean;
     }>;
+    /** True when the completion executed more prefill chunks than
+     *  route_chunks can hold (the array is a capped prefix). */
+    route_chunks_truncated?: boolean;
     timings: NativeCompletionResultTimings;
     completion_probabilities?: Array<NativeCompletionTokenProb>;
     generated_token_ids?: Array<number>;

@@ -235,6 +235,7 @@ namespace rnllama_jsi {
                 }));
             }
             res["route_chunks"] = std::move(chunks);
+            res["route_chunks_truncated"] = governor_stats.route_chunks_truncated;
         }
         const bool governor_prefill = ctx->hasGovernor() && governor_stats.prefill_n > 0;
         t.prompt_n = governor_prefill

@@ -874,7 +874,10 @@ namespace rnllama_jsi {
                         }
                         const int code = mode == "cpu" ? 1 : mode == "gpu" ? 2 : 0;
                         if (!ctx->setPrefillOverride(code)) {
-                            return [](jsi::Runtime&) { return jsi::Value(false); };
+                            // Reject, never resolve false: the app maps a
+                            // rejection to route_push "failed"; a silent
+                            // false would read as applied.
+                            throw std::runtime_error("setPrefillOverride failed");
                         }
                         return [](jsi::Runtime&) { return jsi::Value(true); };
                     }, contextId);

@@ -24,7 +24,7 @@ const vendored = (name: string) =>
   fs.readFileSync(path.join(__dirname, '../../vendor/llama.cpp/src', name), 'utf8')
 
 const stripComments = (text: string) =>
-  text.replace(/\/\*[\S\s]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+  text.replace(/\/\*[\S\s]*?\*\//g, '').replace(/\/\/[^\n]*/g, '')
 
 /** Comment-free, whitespace-collapsed text between two markers, end included. */
 function block(source: string, start: string, end: string): string {
@@ -71,7 +71,7 @@ test('the JSI hop validates the mode, checks busy and governor, and forwards', (
       'throw std::runtime_error("Governor mode is not enabled"); } ' +
       'const int code = mode == "cpu" ? 1 : mode == "gpu" ? 2 : 0; ' +
       'if (!ctx->setPrefillOverride(code)) { ' +
-      'return [](jsi::Runtime&) { return jsi::Value(false); }; } ' +
+      'throw std::runtime_error("setPrefillOverride failed"); } ' +
       'return [](jsi::Runtime&) { return jsi::Value(true); }; ' +
       '}, contextId); } ); ' +
       'runtime.global().setProperty(runtime, "llamaSetPrefillOverride", setPrefillOverride);',
@@ -100,7 +100,7 @@ test('the completion result emits route_chunks with the six spec fields', () => 
   const emission = block(
     cpp('jsi/JSICompletion.h'),
     'const auto governor_stats = ctx->governorStats();',
-    'res["route_chunks"] = std::move(chunks);',
+    'res["route_chunks_truncated"] = governor_stats.route_chunks_truncated;',
   )
   expect(emission).toContain('if (ctx->hasGovernor())')
   ;['index', 'requested', 'actual', 'tokens', 'prefill_ms', 'forced'].forEach((field) =>
@@ -108,6 +108,7 @@ test('the completion result emits route_chunks with the six spec fields', () => 
   )
   expect(emission).toContain('prefillModeName(chunk.requested)')
   expect(emission).toContain('prefillModeName(chunk.actual)')
+  expect(emission).toContain('res["route_chunks_truncated"] = governor_stats.route_chunks_truncated')
 })
 
 test('the vendored engine declares the API, the facts, and safety before override', () => {
@@ -122,25 +123,39 @@ test('the vendored engine declares the API, the facts, and safety before overrid
   expect(
     block(
       vendored('llama-governor-policy.cpp'),
-      'llama_governor_engine llama_governor_policy::prefill_engine() const {',
+      'llama_governor_engine llama_governor_policy::prefill_engine(',
       'if (params_.bench_force_gpu_prefill',
     ),
   ).toBe(
-    'llama_governor_engine llama_governor_policy::prefill_engine() const { ' +
+    'llama_governor_engine llama_governor_policy::prefill_engine( ' +
+      'llama_governor_prefill_mode * mode_used, bool * override_decided) const { ' +
+      'const auto mode = prefill_override_.value.load(); ' +
+      'if (mode_used != nullptr) { *mode_used = mode; } ' +
+      'if (override_decided != nullptr) { *override_decided = false; } ' +
       'if (!valid_schema(params_) || !profile_valid_ || !have_profile_ || ' +
       'state_ == llama_governor_thermal_state::CRITICAL || ' +
       'state_ == llama_governor_thermal_state::Invalid || ' +
       'state_ == llama_governor_thermal_state::LOWBAT) { ' +
       'return llama_governor_engine::CPU; } ' +
-      'if (prefill_override_ == llama_governor_prefill_mode::CPU) { ' +
+      'if (mode == llama_governor_prefill_mode::CPU) { ' +
+      'if (override_decided != nullptr) { *override_decided = true; } ' +
       'return llama_governor_engine::CPU; } ' +
-      'if (prefill_override_ == llama_governor_prefill_mode::GPU) { ' +
-      'return params_.gpu_fit == llama_governor_fit::Fit ? llama_governor_engine::GPU ' +
-      ': llama_governor_engine::CPU; } if (params_.bench_force_gpu_prefill',
+      'if (mode == llama_governor_prefill_mode::GPU) { ' +
+      'const bool fit = params_.gpu_fit == llama_governor_fit::Fit; ' +
+      'if (override_decided != nullptr) { *override_decided = fit; } ' +
+      'return fit ? llama_governor_engine::GPU : llama_governor_engine::CPU; } ' +
+      'if (params_.bench_force_gpu_prefill',
   )
-  // Facts reset per completion, and every executed prefill records one.
+  expect(ext).toContain('bool route_chunks_truncated = false;')
+  // The public forced comment stays causal: safety preemption and the Fit
+  // gate are named, not "the modes matched".
+  expect(ext).toContain('the safety verdict did not preempt it')
+  // Facts reset per completion (flag included), overflow is flagged, and
+  // forced comes from the decision, not from comparing actual to mode.
   expect(vendored('llama-governor-runtime.cpp')).toContain('stats_.route_chunk_count = 0;')
-  expect(vendored('llama-governor.cpp')).toContain('chunk.forced = mode !=')
+  expect(vendored('llama-governor-runtime.cpp')).toContain('stats_.route_chunks_truncated = false;')
+  expect(vendored('llama-governor.cpp')).toContain('stats_.route_chunks_truncated = true;')
+  expect(vendored('llama-governor.cpp')).toContain('chunk.forced = turn_override_decided_;')
 })
 
 test('the generated declarations carry the new surface (stale lib fails)', () => {
@@ -156,4 +171,6 @@ test('the generated declarations carry the new surface (stale lib fails)', () =>
   const expected = ['actual', 'forced', 'index', 'prefill_ms', 'requested', 'tokens']
   expect(pick(src('types.ts'), 'route_chunks')).toEqual(expected)
   expect(pick(generated('types.d.ts'), 'route_chunks')).toEqual(expected)
+  expect(src('types.ts')).toContain('route_chunks_truncated?: boolean')
+  expect(generated('types.d.ts')).toContain('route_chunks_truncated?: boolean')
 })

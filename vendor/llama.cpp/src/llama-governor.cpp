@@ -95,12 +95,20 @@ bool llama_governor::commit_side(llama_context * src_ctx, llama_context * dst_ct
     }
     llama_pos dst_end = 0;
     if (sequence_end(dst_ctx, 0, dst_end) && dst_end > end) {
-        // The destination holds cells the source has already rewound past:
-        // the handoff would decode the next turn on stale state. A raw KV
-        // rewind bypassed the governor (use llama_governor_trim_sequence).
-        LLAMA_LOG_ERROR("%s: %s destination holds cells beyond the source end (%d > %d)\n",
-                        __func__, direction, (int) dst_end, (int) end);
-        return false;
+        // The destination is stale beyond the source end (a GPU prewarm left
+        // cells there while a CPU turn advanced the source, the 2026-09-24
+        // S23 reject). Rewind through the sanctioned trim - the hybrid path
+        // clears the untrimmable side wholesale and zeroes both watermarks,
+        // so the copy below re-commits [0, end). The refuse stays as the
+        // last line of defence for a trim that could not achieve even that.
+        LLAMA_LOG_WARN("%s: %s destination ahead of source (%d > %d); sanctioned trim\n",
+                       __func__, direction, (int) dst_end, (int) end);
+        if (!trim_sequence(end) ||
+            (sequence_end(dst_ctx, 0, dst_end) && dst_end > end)) {
+            LLAMA_LOG_ERROR("%s: %s destination holds cells beyond the source end (%d > %d)\n",
+                            __func__, direction, (int) dst_end, (int) end);
+            return false;
+        }
     }
     if (end > src.watermark) {
         size_t copied_bytes = 0;
@@ -281,6 +289,25 @@ int32_t llama_governor::decode_impl(llama_batch batch, bool allow_chunking) {
             // commit catch); keep it instead of overwriting with the generic
             // route Reject.
             return failed ? -1 : fail("route Reject during phase handoff");
+        }
+    }
+
+    // Invariant: every batch runs on a context that holds the whole logical
+    // sequence up to its start position. The CPU route runs on ctx_decode,
+    // but its conversation prefix may live on ctx_prefill (a GPU prewarm or
+    // GPU turn left it there) - the phase-handoff commit above cannot see a
+    // Prefill->Prefill route switch, so catch up here with the same commit
+    // the normal Prefill->Decode handoff does. Only when the prefill side is
+    // ahead: in a pure-CPU chat (or after any sync) the decode side already
+    // holds everything and this is a no-op.
+    if (cpu_prefill) {
+        llama_pos p_end = 0;
+        llama_pos d_end = 0;
+        if (sequence_end(ctx_prefill, 0, p_end) && sequence_end(ctx_decode, 0, d_end) &&
+            p_end > d_end) {
+            if (!commit_side(ctx_prefill, ctx_decode, prefill_state, decode_state, "cpu-route catch-up")) {
+                return failed ? -1 : fail("route Reject during CPU-route catch-up");
+            }
         }
     }
 

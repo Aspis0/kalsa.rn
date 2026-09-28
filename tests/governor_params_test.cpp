@@ -136,6 +136,65 @@ bool test_decode_repack_both_directions() {
     return !parses(governor, &ignored);
 }
 
+// npu_lane_enabled used to throw "Governor NPU lane is not supported" at
+// parse time; the engine now owns the lane (prefill_engine NPU branch), so
+// the binding must forward the flag untouched.
+static bool test_npu_lane_enabled_forwards() {
+    auto governor = base_governor();
+    governor["npu_lane_enabled"] = true;
+    llama_governor_params params{};
+    llama_governor_thermo_profile thermo{};
+    governor_load_options options{};
+    try {
+        if (!parse_governor_params(governor, params, thermo, options)) {
+            std::cerr << "parse_governor_params returned false" << std::endl;
+            return false;
+        }
+    } catch (const std::exception & e) {
+        std::cerr << "unexpected throw: " << e.what() << std::endl;
+        return false;
+    }
+    return params.npu_lane_enabled;
+}
+
+// decide() is pure booleans/strings (the resolver's HTP0 name check is the
+// engine's devices test): no ggml linkage, per this target's design.
+static bool test_prefill_device_plan() {
+    // Java-side HTP failure outranks a device that resolves.
+    const auto degraded = decide_governor_prefill_device(true, nullptr, "htp-libs-missing");
+    if (degraded.use_device || std::string(degraded.npu_device) != "GPU" ||
+        degraded.npu_fallback == nullptr || std::string(degraded.npu_fallback) != "htp-libs-missing") {
+        std::cerr << "java failure did not outrank the resolved device" << std::endl;
+        return false;
+    }
+    // Java failure outranks even an engine-side degrade reason.
+    const auto both = decide_governor_prefill_device(false, "htp-device-missing", "htp-env-missing");
+    if (both.use_device || std::string(both.npu_fallback) != "htp-env-missing") {
+        std::cerr << "java failure lost precedence over the engine reason" << std::endl;
+        return false;
+    }
+    // No device, no java failure: degrade with the engine's own reason.
+    const auto fallback = decide_governor_prefill_device(false, "htp-device-missing", nullptr);
+    if (fallback.use_device || std::string(fallback.npu_device) != "GPU" ||
+        fallback.npu_fallback == nullptr || std::string(fallback.npu_fallback) != "htp-device-missing") {
+        std::cerr << "missing device did not degrade with htp-device-missing" << std::endl;
+        return false;
+    }
+    // Resolved and quiet: the HTP0 lane with a clean plan.
+    const auto lane = decide_governor_prefill_device(true, nullptr, nullptr);
+    if (!lane.use_device || std::string(lane.npu_device) != "HTP0" || lane.npu_fallback != nullptr) {
+        std::cerr << "resolved device did not open the HTP0 lane" << std::endl;
+        return false;
+    }
+    // An empty reason string behaves like no reason.
+    const auto empty = decide_governor_prefill_device(false, "htp-device-missing", "");
+    if (empty.use_device || empty.npu_fallback == nullptr || std::string(empty.npu_fallback) != "htp-device-missing") {
+        std::cerr << "empty reason string did not behave as absent" << std::endl;
+        return false;
+    }
+    return true;
+}
+
 int main() {
     TestResults results;
     results.run_test("dead sensor refused at parse", test_dead_sensor_refused());
@@ -144,6 +203,8 @@ int main() {
     results.run_test("zero plugged baseline forwarded for the engine", test_zero_baseline_forwarded());
     results.run_test("decode rc failure discriminates on engine state", test_governor_decode_failed_discriminator());
     results.run_test("governor decode_repack parses both directions", test_decode_repack_both_directions());
+    results.run_test("npu_lane_enabled forwards without throwing", test_npu_lane_enabled_forwards());
+    results.run_test("prefill device plan degrades / opens HTP0", test_prefill_device_plan());
     results.print_summary();
     return (results.passed_tests == results.total_tests) ? 0 : 1;
 }

@@ -207,6 +207,20 @@ llama_governor_engine llama_governor_policy::prefill_engine(
     if (params_.bench_force_gpu_prefill && params_.gpu_fit == llama_governor_fit::Fit) {
         return llama_governor_engine::GPU;
     }
+    // Owner rule (2026-09-28): the NPU is the preferred prefill engine while
+    // cool (S23: 4.7x the GPU, 73% cooler per prompt), and CPU must not be
+    // picked while an accelerator qualifies. OFF unless npu_lane_enabled:
+    // npu_fit Fit, readable HTP weights (MoE streams experts too) and thermal
+    // state FAST — leaving FAST hops to the GPU plan below (hop thresholds
+    // pending the NPU heat arm). The bench/JS override above still outranks
+    // it, and every safety state returned above still keeps CPU.
+    if (params_.npu_lane_enabled &&
+        params_.npu_fit == llama_governor_fit::Fit &&
+        params_.htp_trunk_readable &&
+        (params_.model_kind != llama_governor_model_kind::MoE || params_.htp_experts_readable) &&
+        state_ == llama_governor_thermal_state::FAST) {
+        return llama_governor_engine::NPU;
+    }
     // measured: ALIVE #38: 8 Elite GPU prefill, G ttft 1434/1470 ms vs
     // C 16476/14412 ms (>=9.8x); decode 25.3/24.2 t/s >= C's.
     // V73 carries the owner's 2026-09-21 enablement decision, not a measurement.
@@ -221,6 +235,8 @@ llama_governor_engine llama_governor_policy::prefill_engine(
         params_.cool_prefill_eligible && params_.gpu_fit == llama_governor_fit::Fit && !hot_plugged_) {
         return llama_governor_engine::GPU_COOLMODE;
     }
+    // CPU stays the fallback only when no accelerator's own guard passed:
+    // the safety states returned at the top of this function.
     return llama_governor_engine::CPU;
 }
 
@@ -230,7 +246,8 @@ uint32_t llama_governor_policy::prefill_rule() const {
     }
     const auto engine = prefill_engine();
     return engine == llama_governor_engine::GPU ? 5 :
-           engine == llama_governor_engine::GPU_COOLMODE ? 8 : 9;
+           engine == llama_governor_engine::GPU_COOLMODE ? 8 :
+           engine == llama_governor_engine::NPU ? 2 : 9;
 }
 
 llama_governor_prefill_admission llama_governor_policy::admit_prefill(

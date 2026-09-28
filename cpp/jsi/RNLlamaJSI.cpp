@@ -908,6 +908,12 @@ namespace rnllama_jsi {
                             result.setProperty(rt, "prefill_ctx_ngl", (double) stats.prefill_ctx_ngl);
                             result.setProperty(rt, "thermal_state", governorThermalStateName(stats.thermal_state));
                             result.setProperty(rt, "failure_reason", jsi::String::createFromUtf8(rt, failure));
+                            // Plan fields for KALSA_GOVERNOR_PLAN: the resolved
+                            // prefill device and the degrade reason (null when the lane is on).
+                            result.setProperty(rt, "npu_device", jsi::String::createFromUtf8(rt, ctx->governor_npu_device));
+                            result.setProperty(rt, "npu_fallback",
+                                ctx->governor_npu_fallback ? jsi::String::createFromUtf8(rt, ctx->governor_npu_fallback)
+                                                            : jsi::Value::null());
                             return result;
                         };
                     }, contextId);

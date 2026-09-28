@@ -190,7 +190,7 @@ enum class llama_kv_commit_mode {
 enum class llama_governor_engine {
     CPU,
     GPU,
-    NPU,           // Deferred: v0.2 never selects this lane.
+    NPU,           // Selected by prefill_engine() when npu_lane_enabled (owner rule 2026-09-28).
     GPU_COOLMODE,
 };
 

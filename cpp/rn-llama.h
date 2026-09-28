@@ -175,6 +175,12 @@ struct llama_rn_context {
     // call's outcome; only valid while !governorFailed() — a failed governor
     // keeps its error path (and the "Governor decode failed: " prefix).
     const char * governorPause() const { return governor_pause_; }
+    // Plan fields for the app's KALSA_GOVERNOR_PLAN: which prefill device
+    // the governor lane resolved to, and why it degraded to GPU (set by
+    // load_governor_models, read by the getGovernorStats JSI map).
+    const char * governor_npu_device = "GPU";
+    const char * governor_npu_fallback = nullptr;
+
     bool hasGovernor() const;
     bool governorFailed() const;
     std::string governorFailureReason() const;

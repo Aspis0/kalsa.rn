@@ -121,6 +121,20 @@ public class RNLlama {
     }
   }
 
+  /**
+   * An HTP init failure is plan evidence, not just a log line: the native
+   * resolver reads this env in load_governor_models and reports it as the
+   * KALSA_GOVERNOR_PLAN npu_fallback, degrading the lane to GPU.
+   */
+  private static void noteHtpFallback(String reason) {
+    Log.w(NAME, "Hexagon disabled: " + reason);
+    try {
+      android.system.Os.setenv("KALSA_HTP_FALLBACK", reason, true);
+    } catch (Exception e) {
+      Log.w(NAME, "Failed to set KALSA_HTP_FALLBACK", e);
+    }
+  }
+
   private static boolean ensureHtpLibraries(android.content.Context context, File htpDir) {
     for (String libName : HTP_LIBS) {
       File outFile = new File(htpDir, libName);
@@ -149,14 +163,14 @@ public class RNLlama {
   private static void extractHtpLibrariesFromAssets(android.content.Context context) {
     File htpDir = resolveHtpDirectory(context);
     if (htpDir == null) {
-      Log.w(NAME, "Could not resolve HTP directory; Hexagon backend will be disabled");
+      noteHtpFallback("htp-dir-missing");
       return;
     }
 
     Log.d(NAME, "Using " + htpDir.getAbsolutePath() + " for HTP libraries");
 
     if (!ensureHtpLibraries(context, htpDir)) {
-      Log.w(NAME, "Could not install Hexagon libraries; Hexagon backend will be disabled");
+      noteHtpFallback("htp-libs-missing");
       return;
     }
 
@@ -166,7 +180,7 @@ public class RNLlama {
       android.system.Os.setenv("GGML_HEXAGON_DEVICES", "16", true);
       Log.d(NAME, "Set ADSP_LIBRARY_PATH=" + htpLibPath);
     } catch (Exception e) {
-      Log.w(NAME, "Failed to set ADSP_LIBRARY_PATH", e);
+      noteHtpFallback("htp-env-missing");
     }
   }
 

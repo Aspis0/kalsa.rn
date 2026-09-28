@@ -145,15 +145,32 @@ bool parse_governor_params(
         governor, "expert_cycle_bytes", params.expert_cycle_bytes);
     params.expert_substitution_lambda = value_or(
         governor, "expert_substitution_lambda", params.expert_substitution_lambda);
-    if (params.npu_lane_enabled) {
-        throw std::invalid_argument("Governor NPU lane is not supported");
-    }
+    // npu_lane_enabled is forwarded: the engine's prefill_engine owns the
+    // lane (owner rule 2026-09-28) and load_governor_models decides the
+    // device with llama_governor_resolve_prefill_device + degrade.
 
     thermo = parse_governor_thermo(governor.at("thermo"));
     if (!governor_thermo_profile_is_valid(thermo)) {
         throw std::invalid_argument("governor: thermo profile invalid");
     }
     return true;
+}
+
+governor_prefill_device_plan decide_governor_prefill_device(
+        bool device_resolved, const char * engine_fallback, const char * htp_init_reason) {
+    governor_prefill_device_plan plan{};
+    if (htp_init_reason != nullptr && *htp_init_reason != '\0') {
+        plan.npu_fallback = htp_init_reason;
+        return plan;
+    }
+    if (device_resolved) {
+        plan.use_device = true;
+        plan.npu_device = "HTP0";
+        plan.npu_fallback = engine_fallback;
+        return plan;
+    }
+    plan.npu_fallback = engine_fallback;
+    return plan;
 }
 
 } // namespace rnllama

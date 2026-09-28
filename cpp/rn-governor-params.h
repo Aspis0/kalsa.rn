@@ -27,4 +27,26 @@ llama_governor_thermo_profile parse_governor_thermo(
 bool governor_thermo_profile_is_valid(
     const llama_governor_thermo_profile & thermo);
 
+/** The prefill-device plan the loader applies and the app reports on the
+ *  KALSA_GOVERNOR_PLAN line: use_device (the loader sets
+ *  llama_model_params.devices = {device, nullptr} from the resolver's own
+ *  result), npu_device ("HTP0" | "GPU") and npu_fallback (null when the lane
+ *  resolves, otherwise the reason it degraded). Pure booleans/strings, so
+ *  this TU stays linkable without ggml. */
+struct governor_prefill_device_plan {
+    bool use_device = false;
+    const char * npu_device = "GPU";
+    const char * npu_fallback = nullptr;
+};
+
+/** Resolve-to-device decision, pure. `htp_init_reason` is the Java-side
+ *  KALSA_HTP_FALLBACK env (RNLlama.java noteHtpFallback) and outranks a
+ *  device that resolves: no ADSP dir/libs/env means HTP0 is unusable even
+ *  when the backend registers. `engine_fallback` is the resolver's own
+ *  npu_fallback ("htp-device-missing" | nullptr). */
+governor_prefill_device_plan decide_governor_prefill_device(
+    bool device_resolved,
+    const char * engine_fallback,
+    const char * htp_init_reason);
+
 } // namespace rnllama

@@ -5,8 +5,8 @@
 # See vendor/README.md.
 
 LLAMA_CPP_REPO=https://github.com/Aspis0/kalsallama
-LLAMA_CPP_REF=f25f0c1c5594963c23f0d6f943ddacd8fd052418
-LLAMA_CPP_COMMIT=f25f0c1c5594963c23f0d6f943ddacd8fd052418
+LLAMA_CPP_REF=45f097b74eb680e398d0f9d4c1894dab3ebf2d5b
+LLAMA_CPP_COMMIT=45f097b74eb680e398d0f9d4c1894dab3ebf2d5b
 
 CODEC_CPP_REPO=https://github.com/mybigday/codec.cpp
 CODEC_CPP_REF=63ade8bf2fa3451f9eca7ebaa39f792cc529438e

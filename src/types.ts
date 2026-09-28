@@ -256,6 +256,10 @@ export type GovernorStats = {
   prefill_ctx_ngl: number
   thermal_state: string
   failure_reason: string
+  /** Resolved prefill device of the governor lane ("HTP0" | "GPU"). */
+  npu_device: string
+  /** Why the lane degraded to GPU; null when HTP0 resolved. */
+  npu_fallback: string | null
 }
 
 export type NativeCompletionParams = {

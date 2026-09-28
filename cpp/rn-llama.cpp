@@ -6,6 +6,7 @@
 #include "rn-completion.h"
 #include "rn-governor.h"
 #include "rn-governor-params.h"
+#include "llama-governor-device.h"
 #include "rn-slot-manager.h"
 #include "rn-common.hpp"
 
@@ -17,6 +18,7 @@
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <stdexcept>
 
@@ -72,8 +74,22 @@ bool load_governor_models(llama_rn_context & owner,
                           const llama_governor_params & governor_params,
                           const llama_governor_thermo_profile & governor_thermo,
                           const governor_load_options & load_options) {
+    // Backend registration already happened in this SAME load step: the JSI
+    // task called ensureBackendInitialized() (jsi/RNLlamaJSI.cpp:660) before
+    // us, and the resolver never registers itself — the ggml registry is
+    // only ever touched here. Java-side HTP failures ride KALSA_HTP_FALLBACK
+    // (RNLlama.java noteHtpFallback) and outrank a device that resolves.
+    const char * htp_init_reason = std::getenv("KALSA_HTP_FALLBACK");
+    const auto resolved = llama_governor_resolve_prefill_device();
+    const auto device_plan = decide_governor_prefill_device(
+        resolved.device != nullptr, resolved.npu_fallback, htp_init_reason);
+    owner.governor_npu_device = device_plan.npu_device;
+    owner.governor_npu_fallback = device_plan.npu_fallback;
     common_params prefill_params = owner.params;
     common_params decode_params = owner.params;
+    if (device_plan.use_device) {
+        prefill_params.devices = { resolved.device, nullptr };
+    }
     prefill_params.n_gpu_layers = 99;
     decode_params.n_gpu_layers = 0;
     prefill_params.n_parallel = 1;

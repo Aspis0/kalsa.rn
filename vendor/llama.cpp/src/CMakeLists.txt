@@ -31,6 +31,7 @@ set(LLAMA_CORE_SOURCES
     llama-governor-runtime.cpp
     llama-governor-metrics.cpp
     llama-governor-policy.cpp
+    llama-governor-device.cpp
     llama-kv-cache-iswa.cpp
     llama-kv-cache-dsa.cpp
     llama-kv-cache-dsa-iswa.cpp

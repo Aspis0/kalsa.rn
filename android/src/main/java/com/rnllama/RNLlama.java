@@ -178,6 +178,10 @@ public class RNLlama {
       String htpLibPath = htpDir.getAbsolutePath();
       android.system.Os.setenv("ADSP_LIBRARY_PATH", htpLibPath, true);
       android.system.Os.setenv("GGML_HEXAGON_DEVICES", "16", true);
+      // Success clears a reason an EARLIER failed attempt recorded (Fast
+      // Refresh / Activity recreate): a stale KALSA_HTP_FALLBACK would keep
+      // the loader on a false GPU degrade while HTP works.
+      android.system.Os.setenv("KALSA_HTP_FALLBACK", "", true);
       Log.d(NAME, "Set ADSP_LIBRARY_PATH=" + htpLibPath);
     } catch (Exception e) {
       noteHtpFallback("htp-env-missing");

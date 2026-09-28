@@ -910,7 +910,9 @@ namespace rnllama_jsi {
                             result.setProperty(rt, "failure_reason", jsi::String::createFromUtf8(rt, failure));
                             // Plan fields for KALSA_GOVERNOR_PLAN: the resolved
                             // prefill device and the degrade reason (null when the lane is on).
-                            result.setProperty(rt, "npu_device", jsi::String::createFromUtf8(rt, ctx->governor_npu_device));
+                            result.setProperty(rt, "npu_device",
+                                ctx->governor_npu_device ? jsi::String::createFromUtf8(rt, ctx->governor_npu_device)
+                                                         : jsi::Value::null());
                             result.setProperty(rt, "npu_fallback",
                                 ctx->governor_npu_fallback ? jsi::String::createFromUtf8(rt, ctx->governor_npu_fallback)
                                                             : jsi::Value::null());

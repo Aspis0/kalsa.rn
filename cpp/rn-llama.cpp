@@ -79,16 +79,22 @@ bool load_governor_models(llama_rn_context & owner,
     // us, and the resolver never registers itself — the ggml registry is
     // only ever touched here. Java-side HTP failures ride KALSA_HTP_FALLBACK
     // (RNLlama.java noteHtpFallback) and outrank a device that resolves.
-    const char * htp_init_reason = std::getenv("KALSA_HTP_FALLBACK");
-    const auto resolved = llama_governor_resolve_prefill_device();
-    const auto device_plan = decide_governor_prefill_device(
-        resolved.device != nullptr, resolved.npu_fallback, htp_init_reason);
-    owner.governor_npu_device = device_plan.npu_device;
-    owner.governor_npu_fallback = device_plan.npu_fallback;
     common_params prefill_params = owner.params;
     common_params decode_params = owner.params;
-    if (device_plan.use_device) {
-        prefill_params.devices = { resolved.device, nullptr };
+    if (governor_params.npu_lane_enabled) {
+        // Lane asked for: resolve the device and fill the plan fields. With
+        // the lane off (today's default) the resolver is skipped and both
+        // fields stay null — a default plan must not claim htp-device-missing
+        // for a lane nobody asked for.
+        const char * htp_init_reason = std::getenv("KALSA_HTP_FALLBACK");
+        const auto resolved = llama_governor_resolve_prefill_device();
+        const auto device_plan = decide_governor_prefill_device(
+            resolved.device != nullptr, resolved.npu_fallback, htp_init_reason);
+        owner.governor_npu_device = device_plan.npu_device;
+        owner.governor_npu_fallback = device_plan.npu_fallback;
+        if (device_plan.use_device) {
+            prefill_params.devices = { resolved.device, nullptr };
+        }
     }
     prefill_params.n_gpu_layers = 99;
     decode_params.n_gpu_layers = 0;

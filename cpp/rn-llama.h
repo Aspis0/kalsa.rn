@@ -177,8 +177,9 @@ struct llama_rn_context {
     const char * governorPause() const { return governor_pause_; }
     // Plan fields for the app's KALSA_GOVERNOR_PLAN: which prefill device
     // the governor lane resolved to, and why it degraded to GPU (set by
-    // load_governor_models, read by the getGovernorStats JSI map).
-    const char * governor_npu_device = "GPU";
+    // load_governor_models only when npu_lane_enabled, read by the
+    // getGovernorStats JSI map). Both stay null with the lane off.
+    const char * governor_npu_device = nullptr;
     const char * governor_npu_fallback = nullptr;
 
     bool hasGovernor() const;

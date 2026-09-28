@@ -896,7 +896,12 @@ namespace rnllama_jsi {
                         const auto stats = ctx->governorStats();
                         const auto failure = ctx->governorFailureReason();
                         const bool active = ctx->hasGovernor();
-                        return [stats, failure, active](jsi::Runtime& rt) {
+                        const bool hasNpuDevice = ctx->governor_npu_device != nullptr;
+                        const std::string npuDevice = hasNpuDevice ? ctx->governor_npu_device : "";
+                        const bool hasNpuFallback = ctx->governor_npu_fallback != nullptr;
+                        const std::string npuFallback = hasNpuFallback ? ctx->governor_npu_fallback : "";
+                        return [stats, failure, active, hasNpuDevice, npuDevice,
+                                hasNpuFallback, npuFallback](jsi::Runtime& rt) {
                             jsi::Object result(rt);
                             result.setProperty(rt, "active", active);
                             result.setProperty(rt, "engine_prefill", governorEngineName(stats.prefill_engine));
@@ -911,11 +916,11 @@ namespace rnllama_jsi {
                             // Plan fields for KALSA_GOVERNOR_PLAN: the resolved
                             // prefill device and the degrade reason (null when the lane is on).
                             result.setProperty(rt, "npu_device",
-                                ctx->governor_npu_device ? jsi::String::createFromUtf8(rt, ctx->governor_npu_device)
-                                                         : jsi::Value::null());
+                                hasNpuDevice ? jsi::String::createFromUtf8(rt, npuDevice)
+                                             : jsi::Value::null());
                             result.setProperty(rt, "npu_fallback",
-                                ctx->governor_npu_fallback ? jsi::String::createFromUtf8(rt, ctx->governor_npu_fallback)
-                                                            : jsi::Value::null());
+                                hasNpuFallback ? jsi::String::createFromUtf8(rt, npuFallback)
+                                               : jsi::Value::null());
                             return result;
                         };
                     }, contextId);

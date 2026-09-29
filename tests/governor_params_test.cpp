@@ -220,6 +220,9 @@ static bool test_platform_thermal_status_parses() {
         {"integer 9 passes through", {{"sensor_valid", true}, {"platform_thermal_status", 9}}, 9},
         {"string 3 is absent", {{"sensor_valid", true}, {"platform_thermal_status", "3"}}, -1},
         {"null is absent", {{"sensor_valid", true}, {"platform_thermal_status", nullptr}}, -1},
+        {"boolean is absent", {{"sensor_valid", true}, {"platform_thermal_status", true}}, -1},
+        {"1e300 is absent", {{"sensor_valid", true}, {"platform_thermal_status", 1e300}}, -1},
+        {"negative zero is zero", {{"sensor_valid", true}, {"platform_thermal_status", -0.0}}, 0},
         {"fractional is absent", {{"sensor_valid", true}, {"platform_thermal_status", 3.5}}, -1},
     };
     for (const auto & c : cases) {

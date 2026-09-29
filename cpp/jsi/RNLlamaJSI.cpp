@@ -912,6 +912,9 @@ namespace rnllama_jsi {
                             result.setProperty(rt, "prefill_chunks", jsi::String::createFromUtf8(rt, stats.prefill_chunks));
                             result.setProperty(rt, "prefill_ctx_ngl", (double) stats.prefill_ctx_ngl);
                             result.setProperty(rt, "thermal_state", governorThermalStateName(stats.thermal_state));
+                            result.setProperty(rt, "platform_thermal_status", (double) stats.platform_thermal_status);
+                            result.setProperty(rt, "state_source",
+                                jsi::String::createFromUtf8(rt, stats.state_source));
                             result.setProperty(rt, "failure_reason", jsi::String::createFromUtf8(rt, failure));
                             // Plan fields for KALSA_GOVERNOR_PLAN: the resolved
                             // prefill device and the degrade reason (null when the lane is on).

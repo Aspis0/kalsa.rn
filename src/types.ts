@@ -258,6 +258,10 @@ export type GovernorStats = {
   prefill_chunks: string
   prefill_ctx_ngl: number
   thermal_state: string
+  /** Normalized platform thermal status the classifier last saw (-1 absent). */
+  platform_thermal_status: number
+  /** Which input decided thermal_state: "battery" | "platform". */
+  state_source: string
   failure_reason: string
   /** Resolved prefill device of the governor lane ("HTP0" | "GPU");
    *  null when the lane is off (npu_lane_enabled=false). */

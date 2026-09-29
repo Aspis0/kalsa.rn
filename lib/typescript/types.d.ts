@@ -41,6 +41,9 @@ export type GovernorThermoProfile = {
     t_idle_valid?: boolean;
     t_idle_c?: number;
     trend_c_per_min?: number;
+    /** Android PowerManager.getCurrentThermalStatus(): 0..6. Absent,
+     *  non-integer or out-of-range reads as -1 (no platform vote). */
+    platform_thermal_status?: number;
 };
 export type NativeContextParams = {
     model: string;
@@ -218,6 +221,10 @@ export type GovernorStats = {
     prefill_chunks: string;
     prefill_ctx_ngl: number;
     thermal_state: string;
+    /** Normalized platform thermal status the classifier last saw (-1 absent). */
+    platform_thermal_status: number;
+    /** Which input decided thermal_state: "battery" | "platform". */
+    state_source: string;
     failure_reason: string;
     /** Resolved prefill device of the governor lane ("HTP0" | "GPU");
      *  null when the lane is off (npu_lane_enabled=false). */

@@ -86,6 +86,20 @@ llama_governor_thermo_profile parse_governor_thermo(
     result.t_idle_valid = bool_or(thermo, "t_idle_valid", false);
     result.t_idle_c = value_or(thermo, "t_idle_c", 0.0f);
     result.trend_c_per_min = value_or(thermo, "trend_c_per_min", 0.0f);
+    // Absent, wrong type or fractional is -1: no platform vote, never a
+    // throw (value_or would throw on a string). JSI numbers arrive as
+    // doubles (toJson keeps number precision), so integrality is a value
+    // check; the int32 bounds keep the cast defined for Infinity/NaN.
+    // The engine owns the semantic range - it clamps out-of-range to
+    // absent at ingress - so no range check duplicates it here.
+    result.platform_thermal_status = -1;
+    const auto status = thermo.find("platform_thermal_status");
+    if (status != thermo.end() && status->is_number()) {
+        const double raw = status->get<double>();
+        if (raw == std::trunc(raw) && raw >= -2147483648.0 && raw <= 2147483647.0) {
+            result.platform_thermal_status = static_cast<int32_t>(raw);
+        }
+    }
     return result;
 }
 

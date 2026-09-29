@@ -195,6 +195,63 @@ static bool test_prefill_device_plan() {
     return true;
 }
 
+// platform_thermal_status is optional and the engine owns its range (it
+// clamps out-of-range to absent at ingress), so the binding forwards an
+// integral number untouched and maps absent / wrong type / fractional to
+// -1 (no platform vote) without throwing.
+static bool test_platform_thermal_status_parses() {
+    auto status_of = [](const nlohmann::ordered_json & thermo, int32_t * out) {
+        try {
+            *out = parse_governor_thermo(thermo).platform_thermal_status;
+            return true;
+        } catch (const std::exception & e) {
+            std::cerr << "unexpected throw: " << e.what() << std::endl;
+            return false;
+        }
+    };
+    struct status_case {
+        const char * name;
+        nlohmann::ordered_json thermo;
+        int32_t expected;
+    };
+    const status_case cases[] = {
+        {"absent", {{"sensor_valid", true}}, -1},
+        {"integer 3", {{"sensor_valid", true}, {"platform_thermal_status", 3}}, 3},
+        {"integer 9 passes through", {{"sensor_valid", true}, {"platform_thermal_status", 9}}, 9},
+        {"string 3 is absent", {{"sensor_valid", true}, {"platform_thermal_status", "3"}}, -1},
+        {"null is absent", {{"sensor_valid", true}, {"platform_thermal_status", nullptr}}, -1},
+        {"fractional is absent", {{"sensor_valid", true}, {"platform_thermal_status", 3.5}}, -1},
+    };
+    for (const auto & c : cases) {
+        int32_t got = 0;
+        if (!status_of(c.thermo, &got)) {
+            std::cerr << "case threw: " << c.name << std::endl;
+            return false;
+        }
+        if (got != c.expected) {
+            std::cerr << c.name << ": got " << got << ", want " << c.expected << std::endl;
+            return false;
+        }
+    }
+    // End to end: binding-side validity must not reject an out-of-range
+    // status either - 9 is forwarded for the engine to clamp.
+    auto governor = base_governor();
+    governor["thermo"]["platform_thermal_status"] = 9;
+    llama_governor_params params{};
+    llama_governor_thermo_profile thermo{};
+    governor_load_options options{};
+    try {
+        if (!parse_governor_params(governor, params, thermo, options)) {
+            std::cerr << "status 9 rejected by profile validity" << std::endl;
+            return false;
+        }
+    } catch (const std::exception & e) {
+        std::cerr << "unexpected throw: " << e.what() << std::endl;
+        return false;
+    }
+    return thermo.platform_thermal_status == 9;
+}
+
 int main() {
     TestResults results;
     results.run_test("dead sensor refused at parse", test_dead_sensor_refused());
@@ -205,6 +262,7 @@ int main() {
     results.run_test("governor decode_repack parses both directions", test_decode_repack_both_directions());
     results.run_test("npu_lane_enabled forwards without throwing", test_npu_lane_enabled_forwards());
     results.run_test("prefill device plan degrades / opens HTP0", test_prefill_device_plan());
+    results.run_test("platform_thermal_status optional, engine owns range", test_platform_thermal_status_parses());
     results.print_summary();
     return (results.passed_tests == results.total_tests) ? 0 : 1;
 }

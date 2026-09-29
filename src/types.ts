@@ -50,6 +50,9 @@ export type GovernorThermoProfile = {
   t_idle_valid?: boolean
   t_idle_c?: number
   trend_c_per_min?: number
+  /** Android PowerManager.getCurrentThermalStatus(): 0..6. Absent,
+   *  non-integer or out-of-range reads as -1 (no platform vote). */
+  platform_thermal_status?: number
 }
 
 export type NativeContextParams = {

@@ -57,7 +57,11 @@ void llama_governor::refresh_policy_stats() {
     } else if (prefill_route_ == prefill_route::CPU) {
         stats_.prefill_engine = llama_governor_engine::CPU;
     }
-    stats_.thermal_state = policy_.thermal_state();
+    // One snapshot: the stat triple agrees with the pause-log triple.
+    const auto thermal = policy_.thermal_snapshot();
+    stats_.thermal_state = thermal.state;
+    stats_.platform_thermal_status = thermal.platform_status;
+    stats_.state_source = thermal.from_platform ? "platform" : "battery";
     stats_.npu_fit = policy_.npu_fit();
     stats_.prefill_token_cap = policy_.prefill_token_cap();
     stats_.cpu_to_gpu_engagements = policy_.cpu_to_gpu_engagements();

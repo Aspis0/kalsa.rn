@@ -401,6 +401,12 @@ struct llama_governor_stats {
     llama_governor_route_chunk route_chunks[64] = {};
     uint32_t route_chunk_count = 0;
     bool route_chunks_truncated = false;
+    // Appended after the instrument-parsed fields above: the normalized
+    // platform thermal status the classifier last saw (-1 absent) and which
+    // input decided thermal_state - a pointer to the static strings
+    // "battery" / "platform" set by refresh_policy_stats, never freed.
+    int32_t platform_thermal_status = -1;
+    const char * state_source = "battery";
 };
 
 /** Cumulative optional telemetry supplied by a streaming/backend integration. */

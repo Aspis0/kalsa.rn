@@ -275,6 +275,18 @@ struct llama_governor_thermo_profile {
     bool t_idle_valid = false;
     float t_idle_c = 0.0f;
     float trend_c_per_min = 0.0f;
+    // Android PowerManager.getCurrentThermalStatus(): -1 absent/unknown,
+    // 0..6 NONE..SHUTDOWN; anything else is stored as absent (one clamp on
+    // the policy side), never as a profile fault - an invalid profile is
+    // what feeds the sticky abort. Absent means the platform never votes:
+    // classification follows the battery alone, but the battery-driven rules
+    // themselves moved on this branch (owner rule "NPU first": prefill may
+    // pick NPU in battery COOLMODE too), so absent is not the old behavior.
+    // The binding vendors the engine and compiles against this header, so
+    // the default -1 keeps an unaware caller at "absent"; feeding a real
+    // status requires the binding to parse the field, and until it does
+    // the status stays absent.
+    int32_t platform_thermal_status = -1;
 };
 
 /** Actual tensor_get/set counts for one commit. K is always naive, including in Staged mode. */

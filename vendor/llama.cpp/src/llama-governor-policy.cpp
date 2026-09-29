@@ -28,6 +28,36 @@ float temperature_c(const llama_governor_thermo_profile & profile) {
     return profile.batt_temp_tenths_c / 10.0f;
 }
 
+// Owner ladder (2026-09-29), hostile-audit fix: the platform status floors
+// the thermal state - it never cools it and never brakes it. Every status
+// 2..6 (MODERATE..SHUTDOWN) floors at COOLMODE, the state that prefers the
+// cool path (select_decode hands out GPU_COOLMODE only there). Engine
+// CRITICAL stays reachable from battery heat only: a transient Android
+// status 5 must not reach fail("decode admission aborted") and kill the
+// session; the platform emergency brake is the app's, which gates at
+// Android CRITICAL between turns and recovers. LOWBAT outranks the floor:
+// it guards a dying battery by forcing CPU, and a heat floor must not
+// silently re-enable the accelerators.
+llama_governor_thermal_state apply_platform_floor(
+        llama_governor_thermal_state state, int32_t platform_status) {
+    if (platform_status < 2) { // absent (-1), NONE (0), LIGHT (1): no escalation
+        return state;
+    }
+    if (state == llama_governor_thermal_state::FAST ||
+        state == llama_governor_thermal_state::WARM) {
+        return llama_governor_thermal_state::COOLMODE;
+    }
+    return state;
+}
+
+// One normalization point for the wire value: a status outside -1..6 means
+// the parser lied, so the field becomes absent (-1). Invalidating the
+// profile here would feed the sticky abort path for a value the platform
+// never sent.
+int32_t normalize_platform_status(int32_t platform_status) {
+    return platform_status < -1 || platform_status > 6 ? -1 : platform_status;
+}
+
 } // namespace
 
 bool llama_governor_expert_substitution_would_displace(
@@ -104,10 +134,12 @@ bool llama_governor_policy::can_leave(int64_t now_ms, float temperature, float e
 
 bool llama_governor_policy::update_thermal(const llama_governor_thermo_profile & profile, int64_t now_ms) {
     profile_ = profile;
+    profile_.platform_thermal_status = normalize_platform_status(profile.platform_thermal_status);
     if (!profile_is_valid(profile)) {
         profile_valid_ = false;
         have_profile_ = true;
         state_ = llama_governor_thermal_state::Invalid;
+        state_from_platform_ = false;
         state_since_ms_ = now_ms;
         return false;
     }
@@ -119,6 +151,7 @@ bool llama_governor_policy::update_thermal(const llama_governor_thermo_profile &
             profile_valid_ = false;
             have_profile_ = true;
             state_ = llama_governor_thermal_state::Invalid;
+            state_from_platform_ = false;
             state_since_ms_ = now_ms;
             return false;
         }
@@ -165,6 +198,24 @@ bool llama_governor_policy::update_thermal(const llama_governor_thermo_profile &
                                            : temp >= limits.warm_enter ? llama_governor_thermal_state::WARM
                                                                         : state_;
     }
+    // The battery machine above owns every transition and its dwell; the
+    // platform floor may only raise the result. state_since_ms_ below
+    // stamps the net change: a raise that changes the state restamps it,
+    // so the raised state leaves only through the same dwell gates as a
+    // battery transition.
+    const auto battery_state = state_;
+    state_ = apply_platform_floor(state_, profile_.platform_thermal_status);
+    // A platform-raised COOLMODE keeps the platform's attribution for its
+    // whole life, including the dwell after the status drops: flipping to
+    // battery there would buy GPU_COOLMODE decode plus a reload for heat
+    // the platform reported. It clears only when the state leaves COOLMODE
+    // or battery heat alone reaches the COOLMODE line.
+    if (state_ != battery_state) {
+        state_from_platform_ = true;
+    } else if (state_ != llama_governor_thermal_state::COOLMODE ||
+               temp >= limits.cool_enter) {
+        state_from_platform_ = false;
+    }
     if (state_ != old_state) {
         state_since_ms_ = now_ms;
     }
@@ -207,18 +258,23 @@ llama_governor_engine llama_governor_policy::prefill_engine(
     if (params_.bench_force_gpu_prefill && params_.gpu_fit == llama_governor_fit::Fit) {
         return llama_governor_engine::GPU;
     }
-    // Owner rule (2026-09-28): the NPU is the preferred prefill engine while
-    // cool (S23: 4.7x the GPU, 73% cooler per prompt), and CPU must not be
-    // picked while an accelerator qualifies. OFF unless npu_lane_enabled:
-    // npu_fit Fit, readable HTP weights (MoE streams experts too) and thermal
-    // state FAST — leaving FAST hops to the GPU plan below (hop thresholds
-    // pending the NPU heat arm). The bench/JS override above still outranks
-    // it, and every safety state returned above still keeps CPU.
+    // Owner rule (2026-09-28): NPU first for prefill, GPU when the NPU is
+    // hot, CPU never while an accelerator qualifies - and the NPU is the
+    // coolest prefill backend measured (S23 heat arms, lab
+    // s23-heat-arms-engine commit 147b0351: 6.45 / 24.17 / 44.59 C*s per
+    // 1k tokens NPU / GPU / CPU), so the lane stays eligible in FAST and in
+    // COOLMODE; the arms are measured, the old "hop thresholds pending the
+    // NPU heat arm" clause is closed. "GPU when the NPU is hot" needs an
+    // NPU temperature input that does not exist yet: a later step, not
+    // invented here. OFF unless npu_lane_enabled: npu_fit Fit, readable
+    // HTP weights (MoE streams experts too). The bench/JS override above
+    // still outranks it, and every safety state returned above still keeps CPU.
     if (params_.npu_lane_enabled &&
         params_.npu_fit == llama_governor_fit::Fit &&
         params_.htp_trunk_readable &&
         (params_.model_kind != llama_governor_model_kind::MoE || params_.htp_experts_readable) &&
-        state_ == llama_governor_thermal_state::FAST) {
+        (state_ == llama_governor_thermal_state::FAST ||
+         state_ == llama_governor_thermal_state::COOLMODE)) {
         return llama_governor_engine::NPU;
     }
     // measured: ALIVE #38: 8 Elite GPU prefill, G ttft 1434/1470 ms vs
@@ -231,8 +287,11 @@ llama_governor_engine llama_governor_policy::prefill_engine(
         params_.gpu_fit == llama_governor_fit::Fit && params_.gpu_prefill_measured) {
         return llama_governor_engine::GPU;
     }
+    // A platform-raised COOLMODE must not buy the cool prefill path;
+    // only battery heat takes it.
     if (params_.generation == llama_governor_generation::V73 && params_.model_kind == llama_governor_model_kind::MoE &&
-        params_.cool_prefill_eligible && params_.gpu_fit == llama_governor_fit::Fit && !hot_plugged_) {
+        params_.cool_prefill_eligible && params_.gpu_fit == llama_governor_fit::Fit && !hot_plugged_ &&
+        !state_from_platform_) {
         return llama_governor_engine::GPU_COOLMODE;
     }
     // CPU stays the fallback only when no accelerator's own guard passed:
@@ -346,8 +405,12 @@ llama_governor_decode_selection llama_governor_policy::select_decode(int64_t now
     }
     const bool budget_ok = last_gpu_engagement_ms_ < 0 || now_ms < last_gpu_engagement_ms_ ||
                            now_ms - last_gpu_engagement_ms_ >= k_flip_window_ms;
+    // GPU_COOLMODE is the hottest decode backend per token on the owner's
+    // heat arms (NPU coolest, CPU between, GPU hottest), so a COOLMODE the
+    // platform floor raised must not buy it: decode keeps today's engine.
+    // Battery-derived COOLMODE eligibility is untouched.
     const bool eligible = valid_schema(params_) && have_profile_ && profile_valid_ &&
-        state_ == llama_governor_thermal_state::COOLMODE && !hot_plugged_ &&
+        state_ == llama_governor_thermal_state::COOLMODE && !state_from_platform_ && !hot_plugged_ &&
         params_.generation == llama_governor_generation::V73 &&
         params_.gpu_fit == llama_governor_fit::Fit && params_.cool_delta_measured && params_.kexp_cool_scope &&
         params_.cool_pays != llama_governor_cool_pays::No && params_.reload_budget_available && budget_ok;
@@ -367,6 +430,10 @@ llama_governor_decode_selection llama_governor_policy::select_decode(int64_t now
 }
 
 llama_governor_thermal_state llama_governor_policy::thermal_state() const { return state_; }
+llama_governor_thermal_snapshot llama_governor_policy::thermal_snapshot() const {
+    return { state_, profile_.platform_thermal_status, state_from_platform_ };
+}
+bool llama_governor_policy::state_from_platform() const { return state_from_platform_; }
 llama_governor_fit llama_governor_policy::npu_fit() const { return params_.npu_fit; }
 float llama_governor_policy::current_temperature_c() const { return temperature_c(profile_); }
 uint32_t llama_governor_policy::prefill_token_cap() const {

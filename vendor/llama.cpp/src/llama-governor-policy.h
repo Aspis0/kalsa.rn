@@ -30,6 +30,19 @@ struct llama_governor_prefill_admission {
     uint32_t rule = 0;
 };
 
+// The three values the thermal log line stamps, read as one snapshot.
+// Read without a lock, exactly like the three separate reads it replaced:
+// the contract (llama-governor.h) is decode-thread-only - set_thermo_profile()
+// is a decode-thread method and must not overlap decode() - but the binding
+// is known to call it from its JSI ThreadPool (guarded only by
+// throwIfContextBusy), so the writer race is real; pre-existing, not
+// fixed here.
+struct llama_governor_thermal_snapshot {
+    llama_governor_thermal_state state;
+    int32_t platform_status;
+    bool from_platform;
+};
+
 struct llama_governor_decode_selection {
     llama_governor_engine engine = llama_governor_engine::CPU;
     bool requires_reload = false;
@@ -58,6 +71,10 @@ public:
     // llama_governor_prefill_mode (0..2); false on anything else.
     bool set_prefill_override(int mode);
     llama_governor_thermal_state thermal_state() const;
+    llama_governor_thermal_snapshot thermal_snapshot() const;
+    // True while a platform-raised COOLMODE stands that battery heat does
+    // not justify (sticky for the state's whole life, see update_thermal).
+    bool state_from_platform() const;
     llama_governor_fit npu_fit() const;
     float current_temperature_c() const;
     uint32_t prefill_token_cap() const;
@@ -89,6 +106,7 @@ private:
     uint64_t cpu_to_gpu_engagements_ = 0;
     bool profile_valid_ = false;
     bool have_profile_ = false;
+    bool state_from_platform_ = false;
     bool hot_plugged_ = false;
     bool cache_budget_warning_ = false;
     // /bench route dev hook; consulted only after the safety gates in

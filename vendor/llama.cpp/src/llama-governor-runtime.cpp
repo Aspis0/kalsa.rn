@@ -23,11 +23,14 @@ const char * thermal_state_name(llama_governor_thermal_state state) {
     return "?";
 }
 
-// One definition: this line is parsed as an API (prefix must stay stable).
-void log_thermal_pause(const char * func, float now_c, llama_governor_thermal_state state) {
+// One definition: this line is parsed as an API (prefix and existing keys
+// must stay stable; new keys may only be appended).
+void log_thermal_pause(const char * func, float now_c,
+                       const llama_governor_thermal_snapshot & snap) {
     LLAMA_LOG_WARN("%s: no safe prefill chunk under the thermal ceiling; pausing "
-                   "(now_c=%.1f state=%s)\n",
-                   func, now_c, thermal_state_name(state));
+                   "(now_c=%.1f state=%s platform_status=%d state_source=%s)\n",
+                   func, now_c, thermal_state_name(snap.state), snap.platform_status,
+                   snap.from_platform ? "platform" : "battery");
 }
 
 } // namespace
@@ -83,7 +86,7 @@ int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {
     if (admission.decision == llama_governor_decision::Wait) {
         // No chunk fits under the thermal ceiling. Reducing tokens is the only
         // allowed fallback; never switch to another engine. Pause this turn.
-        log_thermal_pause(__func__, now_c, policy_.thermal_state());
+        log_thermal_pause(__func__, now_c, policy_.thermal_snapshot());
         return -2;
     }
     if (prefill_route_ == prefill_route::Undecided) {
@@ -134,7 +137,7 @@ int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {
             // thermal warn and rule-0 stamp, before the tokens==0 guard below
             // would swallow the Wait into a silent, mislabelled -2.
             stats_.last_router_rule = next.rule;
-            log_thermal_pause(__func__, policy_.current_temperature_c(), policy_.thermal_state());
+            log_thermal_pause(__func__, policy_.current_temperature_c(), policy_.thermal_snapshot());
             return -2;
         }
         if (next.decision == llama_governor_decision::Abort || next.tokens == 0) {

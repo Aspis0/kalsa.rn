@@ -196,7 +196,7 @@ std::vector<ggml_backend_dev_t> devices_excluding_registry(
     std::vector<ggml_backend_dev_t> kept;
     kept.reserve(devs.size());
     for (ggml_backend_dev_t dev : devs) {
-        if (dev->reg != excluded) {
+        if (dev != nullptr && dev->reg != excluded) {
             kept.push_back(dev);
         }
     }

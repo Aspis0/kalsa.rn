@@ -230,6 +230,27 @@ static bool test_devices_excluding_registry() {
         return false;
     }
 
+    // An explicitly requested list reaches the loader WITH its null
+    // terminator (JSI buildDeviceOverrides appends one) and may name HTP
+    // (that path runs no HTP filter of its own — the lane-off loader
+    // filters here). Terminators pass through skipped, HTP goes.
+    const std::vector<ggml_backend_dev_t> explicit_list = {&htp0_dev, &opencl_dev, nullptr};
+    const auto filtered = devices_excluding_registry(explicit_list, &htp_reg);
+    if (filtered.size() != 1 || filtered[0] != &opencl_dev) {
+        std::cerr << "explicit list with terminator did not filter to the non-HTP device" << std::endl;
+        return false;
+    }
+
+    // HTP-only device set (no OpenCL): filters to the empty list, which the
+    // loader turns into [nullptr] — the explicit CPU-only load. A bare
+    // terminator-only list must survive the filter too, not crash on it.
+    const auto htp_only = devices_excluding_registry({&htp0_dev, nullptr}, &htp_reg);
+    const auto terminator_only = devices_excluding_registry({nullptr}, &htp_reg);
+    if (!htp_only.empty() || !terminator_only.empty()) {
+        std::cerr << "HTP-only or terminator-only input did not filter to empty" << std::endl;
+        return false;
+    }
+
     // Hexagon not compiled in: no registry to exclude, the list passes through.
     const auto passthrough = devices_excluding_registry(mixed, nullptr);
     if (passthrough.size() != mixed.size()) {
@@ -237,11 +258,10 @@ static bool test_devices_excluding_registry() {
         return false;
     }
 
-    // An all-HTP list empties out, and an empty input stays empty.
-    const auto only_htp = devices_excluding_registry({&htp0_dev}, &htp_reg);
+    // An empty input stays empty.
     const auto empty = devices_excluding_registry({}, &htp_reg);
-    if (!only_htp.empty() || !empty.empty()) {
-        std::cerr << "HTP-only or empty input did not filter to empty" << std::endl;
+    if (!empty.empty()) {
+        std::cerr << "empty input did not stay empty" << std::endl;
         return false;
     }
     return true;

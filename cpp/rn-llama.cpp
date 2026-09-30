@@ -71,19 +71,26 @@ void log_governor_fallback(const char * stage, int models_loaded,
 }
 
 #if defined(__ANDROID__)
-// Registered GPU-type devices outside the Hexagon registry, in registry
-// order. The caller appends the null terminator the engine's device loop
-// expects. reg_by_name looks the registry up without registering anything:
-// the JSI task has already run ensureBackendInitialized() before this runs.
-std::vector<ggml_backend_dev_t> gpu_devices_excluding_hexagon() {
-    std::vector<ggml_backend_dev_t> gpus;
-    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-            gpus.push_back(dev);
+// Device list for a lane-off load: HTP must appear nowhere, neither in
+// prefill placement nor in the decode model's host-buffer pick (the Hexagon
+// device exposes a host buffer type, ggml-hexagon.cpp, so an HTP entry would
+// map decode weights through FastRPC). A pinned list is filtered as-is —
+// the JSI default list already excludes HTP, an explicitly requested one
+// does not — and with no list at all the registered non-HTP GPUs replace
+// the engine's implicit sweep, which would include HTP. reg_by_name
+// registers nothing: the JSI task has already run
+// ensureBackendInitialized() before this runs.
+std::vector<ggml_backend_dev_t> lane_off_devices(const std::vector<ggml_backend_dev_t> & requested) {
+    std::vector<ggml_backend_dev_t> source = requested;
+    if (source.empty()) {
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                source.push_back(dev);
+            }
         }
     }
-    return devices_excluding_registry(gpus, ggml_backend_reg_by_name("HTP"));
+    return devices_excluding_registry(source, ggml_backend_reg_by_name("HTP"));
 }
 #endif
 
@@ -113,16 +120,20 @@ bool load_governor_models(llama_rn_context & owner,
             prefill_params.devices = { resolved.device, nullptr };
         }
 #if defined(__ANDROID__)
-    } else if (owner.params.devices.empty()) {
-        // The lane is off and the JSI layer pinned no device list (its
-        // Android filter found no GPU — e.g. OpenCL dead while HTP still
-        // registers). The engine's default sweep would then pull HTP into
-        // every prefill load. Pin the registered non-HTP GPUs; an empty
-        // result stays an explicit empty list, which loads CPU-only exactly
-        // as today. A non-empty owner list is kept as-is: the JSI filter
-        // already excludes HTP (RNLlamaJSI.cpp shouldExcludeHexagonDevice).
-        prefill_params.devices = gpu_devices_excluding_hexagon();
+    } else {
+        // Lane off: what the CPU/OpenCL-only build did, byte for byte — HTP
+        // joins no list, explicit or swept. An empty result stays an
+        // explicit empty list ([nullptr]): the engine assigns zero GPU
+        // layers instead of running its implicit sweep, which would include
+        // HTP. Nothing in the binding or the app ever sets split_mode, so
+        // the engine's tensor-split ">= 1 devices" refusal cannot fire from
+        // this list; if a future caller did set it, this list fails that
+        // load loudly (governor fallback) rather than offload to HTP.
+        const auto lane_off = lane_off_devices(owner.params.devices);
+        prefill_params.devices = lane_off;
         prefill_params.devices.push_back(nullptr);
+        decode_params.devices = lane_off;
+        decode_params.devices.push_back(nullptr);
 #endif
     }
     prefill_params.n_gpu_layers = 99;

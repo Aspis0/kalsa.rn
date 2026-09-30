@@ -14,6 +14,28 @@ import { join } from "path";
 
 const source = readFileSync(join(__dirname, "../../cpp/rn-llama.cpp"), "utf8");
 
+/**
+ * Body of the block opened at `marker` (the first `{` at or after it),
+ * found by brace matching so the slice cannot cross the block's closing
+ * brace the way a flat `.*` regex would. Nothing in the matched region
+ * has braces inside comments or string literals.
+ */
+function blockAfter(text: string, marker: string): string | null {
+  const at = text.indexOf(marker);
+  if (at === -1) return null;
+  const open = text.indexOf("{", at);
+  if (open === -1) return null;
+  let depth = 0;
+  for (let i = open; i < text.length; i += 1) {
+    if (text[i] === "{") depth += 1;
+    else if (text[i] === "}") {
+      depth -= 1;
+      if (depth === 0) return text.slice(open + 1, i);
+    }
+  }
+  return null;
+}
+
 describe("governor lane KV placement pin", () => {
   const lane = source.match(
     /bool load_governor_models\([\S\s]{0,6000}?common_init_from_params\(prefill_params/,
@@ -31,11 +53,16 @@ describe("governor lane KV placement pin", () => {
   test("the KV pin is scoped to the resolved HTP device, not the whole lane", () => {
     // A lane that degraded to GPU keeps the OpenCL placement the GPU route
     // has always used, so the assignment must sit inside the use_device
-    // block that only fires when HTP0 resolved.
-    const branch = lane![0].match(
-      /if \(device_plan\.use_device\) {[\S\s]*?prefill_params\.no_kv_offload = true;/,
-    );
-    expect(branch).not.toBeNull();
+    // block that only fires when HTP0 resolved — and nowhere else in
+    // load_governor_models, or a GPU-degraded lane would move its whole KV
+    // to host memory under a gpu_fit plan computed for device KV.
+    const fn = blockAfter(source, "bool load_governor_models(");
+    const useDevice = blockAfter(fn ?? "", "if (device_plan.use_device) {");
+    const pin = "prefill_params.no_kv_offload = true;";
+    expect(fn).not.toBeNull();
+    expect(useDevice).not.toBeNull();
+    expect(useDevice).toContain(pin);
+    expect(fn!.split(pin).length - 1).toBe(1);
   });
 
   test("the lane-off branch places no no_kv_offload of its own", () => {

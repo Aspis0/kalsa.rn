@@ -119,13 +119,13 @@ bool load_governor_models(llama_rn_context & owner,
         if (device_plan.use_device) {
             prefill_params.devices = { resolved.device, nullptr };
             // KV buffers follow the layer device (llama-kv-cache.cpp) unless
-            // no_kv_offload: on HTP0 the V-cache write has no backend — the
-            // HTP SET_ROWS only takes F32/F16/Q8_0 dst and the app ships a
-            // q4_0 V cache — and the scheduler cannot reroute a pre-allocated
-            // destination, so the load aborts (S23, ggml-backend.cpp:941).
-            // The lane's validated shape keeps the prefill attention/KV in
-            // host memory the CPU decode context also reads (HTP prefill
-            // spike, offload_kqv=false).
+            // no_kv_offload: on HTP0 the V-cache write has no backend — HTP
+            // SET_ROWS takes only F32/F16/Q8_0 dst, the app ships a q4_0 V,
+            // and the scheduler cannot reroute a pre-allocated dst, so the
+            // load aborts (S23, ggml-backend.cpp:941). With host-memory KV
+            // the prefill->decode commit is a host memcpy (MirrorAndCopy,
+            // llama-kv-commit.cpp) instead of a read back out of the DSP
+            // buffer.
             prefill_params.no_kv_offload = true;
         }
 #if defined(__ANDROID__)

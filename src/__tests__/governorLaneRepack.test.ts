@@ -15,8 +15,10 @@ const paramsSource = readFileSync(
 
 describe("governor lane repack pin", () => {
   test("no_extra_bufts on the decode params is conditional on decode_repack", () => {
+    // Window: function start to the prefill init. Was 2400 and went stale
+    // when the lane device-resolution block grew the function past it.
     const lane = source.match(
-      /bool load_governor_models\([\S\s]{0,2400}?common_init_from_params\(prefill_params/,
+      /bool load_governor_models\([\S\s]{0,6000}?common_init_from_params\(prefill_params/,
     );
     expect(lane).not.toBeNull();
     expect(lane![0]).toContain("if (!load_options.decode_repack) {");

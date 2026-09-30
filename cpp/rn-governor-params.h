@@ -3,6 +3,10 @@
 #include "llama-ext.h"
 #include "nlohmann/json.hpp"
 
+#include "ggml-backend.h"
+
+#include <vector>
+
 namespace rnllama {
 
 // Binding-level governor load options: they shape how the two models are
@@ -48,5 +52,14 @@ governor_prefill_device_plan decide_governor_prefill_device(
     bool device_resolved,
     const char * engine_fallback,
     const char * htp_init_reason);
+
+/** Registered devices minus every device of the `excluded` registry, order
+ *  preserved. Pointer filtering only (reads dev->reg, calls no ggml symbol),
+ *  so this TU stays linkable without ggml and the host test drives it with
+ *  fabricated devices. The caller resolves `excluded`
+ *  (ggml_backend_reg_by_name("HTP") — nullptr when Hexagon is not compiled
+ *  in) and appends the null terminator the engine's device loop expects. */
+std::vector<ggml_backend_dev_t> devices_excluding_registry(
+    const std::vector<ggml_backend_dev_t> & devs, ggml_backend_reg_t excluded);
 
 } // namespace rnllama

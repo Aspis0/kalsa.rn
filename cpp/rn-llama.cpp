@@ -70,6 +70,23 @@ void log_governor_fallback(const char * stage, int models_loaded,
         stage, models_loaded, reason.c_str(), (int) gpu_fit, (int) profile_valid);
 }
 
+#if defined(__ANDROID__)
+// Registered GPU-type devices outside the Hexagon registry, in registry
+// order. The caller appends the null terminator the engine's device loop
+// expects. reg_by_name looks the registry up without registering anything:
+// the JSI task has already run ensureBackendInitialized() before this runs.
+std::vector<ggml_backend_dev_t> gpu_devices_excluding_hexagon() {
+    std::vector<ggml_backend_dev_t> gpus;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpus.push_back(dev);
+        }
+    }
+    return devices_excluding_registry(gpus, ggml_backend_reg_by_name("HTP"));
+}
+#endif
+
 bool load_governor_models(llama_rn_context & owner,
                           const llama_governor_params & governor_params,
                           const llama_governor_thermo_profile & governor_thermo,
@@ -95,6 +112,18 @@ bool load_governor_models(llama_rn_context & owner,
         if (device_plan.use_device) {
             prefill_params.devices = { resolved.device, nullptr };
         }
+#if defined(__ANDROID__)
+    } else if (owner.params.devices.empty()) {
+        // The lane is off and the JSI layer pinned no device list (its
+        // Android filter found no GPU — e.g. OpenCL dead while HTP still
+        // registers). The engine's default sweep would then pull HTP into
+        // every prefill load. Pin the registered non-HTP GPUs; an empty
+        // result stays an explicit empty list, which loads CPU-only exactly
+        // as today. A non-empty owner list is kept as-is: the JSI filter
+        // already excludes HTP (RNLlamaJSI.cpp shouldExcludeHexagonDevice).
+        prefill_params.devices = gpu_devices_excluding_hexagon();
+        prefill_params.devices.push_back(nullptr);
+#endif
     }
     prefill_params.n_gpu_layers = 99;
     decode_params.n_gpu_layers = 0;

@@ -177,7 +177,8 @@ public class RNLlama {
     try {
       String htpLibPath = htpDir.getAbsolutePath();
       android.system.Os.setenv("ADSP_LIBRARY_PATH", htpLibPath, true);
-      android.system.Os.setenv("GGML_HEXAGON_DEVICES", "16", true);
+      // One HTP session: the governor lane drives HTP0 only, and upstream's "16" made startup probe 16 FastRPC sessions nothing here uses.
+      android.system.Os.setenv("GGML_HEXAGON_DEVICES", "1", true);
       // Success clears a reason an EARLIER failed attempt recorded (Fast
       // Refresh / Activity recreate): a stale KALSA_HTP_FALLBACK would keep
       // the loader on a false GPU degrade while HTP works.

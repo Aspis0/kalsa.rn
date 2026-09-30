@@ -195,6 +195,58 @@ static bool test_prefill_device_plan() {
     return true;
 }
 
+// devices_excluding_registry backs the lane-off prefill pin (rn-llama.cpp):
+// once the Hexagon backend registers, reproducing today's device list means
+// dropping every HTP session and keeping the rest in registry order. The
+// filter is pointer work by contract (rn-governor-params.h), so fabricated
+// devices drive it without ggml linkage — same rule as decide() above.
+#include "ggml-backend-impl.h"
+
+namespace {
+
+int fake_opencl_reg_ctx, fake_htp_reg_ctx, fake_cpu_reg_ctx;
+
+ggml_backend_reg opencl_reg{0, {}, &fake_opencl_reg_ctx};
+ggml_backend_reg htp_reg{0, {}, &fake_htp_reg_ctx};
+ggml_backend_reg cpu_reg{0, {}, &fake_cpu_reg_ctx};
+
+ggml_backend_device opencl_dev{{}, &opencl_reg, nullptr};
+ggml_backend_device htp0_dev{{}, &htp_reg, nullptr};
+ggml_backend_device htp1_dev{{}, &htp_reg, nullptr};
+ggml_backend_device cpu_dev{{}, &cpu_reg, nullptr};
+
+} // namespace
+
+static bool test_devices_excluding_registry() {
+    using rnllama::devices_excluding_registry;
+    // Registry order as the ggml registry constructs it: OpenCL, then the
+    // Hexagon sessions (GGML_HEXAGON_DEVICES=1 gives one, but keep two here
+    // to pin that EVERY excluded-registry device goes), then CPU.
+    const std::vector<ggml_backend_dev_t> mixed = {&opencl_dev, &htp0_dev, &htp1_dev, &cpu_dev};
+
+    const auto without_htp = devices_excluding_registry(mixed, &htp_reg);
+    if (without_htp.size() != 2 || without_htp[0] != &opencl_dev || without_htp[1] != &cpu_dev) {
+        std::cerr << "HTP exclusion dropped or reordered the non-HTP devices" << std::endl;
+        return false;
+    }
+
+    // Hexagon not compiled in: no registry to exclude, the list passes through.
+    const auto passthrough = devices_excluding_registry(mixed, nullptr);
+    if (passthrough.size() != mixed.size()) {
+        std::cerr << "null exclusion did not pass the devices through" << std::endl;
+        return false;
+    }
+
+    // An all-HTP list empties out, and an empty input stays empty.
+    const auto only_htp = devices_excluding_registry({&htp0_dev}, &htp_reg);
+    const auto empty = devices_excluding_registry({}, &htp_reg);
+    if (!only_htp.empty() || !empty.empty()) {
+        std::cerr << "HTP-only or empty input did not filter to empty" << std::endl;
+        return false;
+    }
+    return true;
+}
+
 // platform_thermal_status is optional and the engine owns its range (it
 // clamps out-of-range to absent at ingress), so the binding forwards an
 // integral number untouched and maps absent / wrong type / fractional to
@@ -265,6 +317,7 @@ int main() {
     results.run_test("governor decode_repack parses both directions", test_decode_repack_both_directions());
     results.run_test("npu_lane_enabled forwards without throwing", test_npu_lane_enabled_forwards());
     results.run_test("prefill device plan degrades / opens HTP0", test_prefill_device_plan());
+    results.run_test("registry exclusion keeps non-HTP order", test_devices_excluding_registry());
     results.run_test("platform_thermal_status optional, engine owns range", test_platform_thermal_status_parses());
     results.print_summary();
     return (results.passed_tests == results.total_tests) ? 0 : 1;

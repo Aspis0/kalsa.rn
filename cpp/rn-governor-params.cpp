@@ -1,5 +1,9 @@
 #include "rn-governor-params.h"
 
+// struct ggml_backend_device definition: the registry filter below reads
+// dev->reg. Header-only — the TU still links without ggml.
+#include "ggml-backend-impl.h"
+
 #include <cmath>
 #include <string>
 #include <stdexcept>
@@ -185,6 +189,18 @@ governor_prefill_device_plan decide_governor_prefill_device(
     }
     plan.npu_fallback = engine_fallback;
     return plan;
+}
+
+std::vector<ggml_backend_dev_t> devices_excluding_registry(
+        const std::vector<ggml_backend_dev_t> & devs, ggml_backend_reg_t excluded) {
+    std::vector<ggml_backend_dev_t> kept;
+    kept.reserve(devs.size());
+    for (ggml_backend_dev_t dev : devs) {
+        if (dev->reg != excluded) {
+            kept.push_back(dev);
+        }
+    }
+    return kept;
 }
 
 } // namespace rnllama

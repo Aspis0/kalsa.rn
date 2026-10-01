@@ -16,7 +16,10 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE="ghcr.io/snapdragon-toolchain/arm64-android:v0.7"
+# Tag v0.7, pinned by digest -- the OCI index carrying linux/amd64, and the
+# image the committed skels were built in. A mutable tag would let a refreshed
+# or locally stale image drift under an unchanged recipe.
+IMAGE="ghcr.io/snapdragon-toolchain/arm64-android@sha256:91714433626f0d94a926538a1e46ec43756c5b8e3262b91b95df1e812940aed1"
 PLATFORM="linux/amd64"
 MANIFEST="$ROOT_DIR/bin/arm64-v8a/HTP_SKELS"
 

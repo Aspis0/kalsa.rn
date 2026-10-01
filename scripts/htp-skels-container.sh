@@ -1,11 +1,16 @@
 #!/bin/bash
 # Container-side half of scripts/build-htp-skels.sh; not runnable standalone.
 #
-# Runs inside ghcr.io/snapdragon-toolchain/arm64-android:v0.7 (Hexagon SDK
-# 6.6.0.0, tools 19.0.07). /kalsa/src.tar is a git archive of the binding
-# repo's vendored engine tree; /artifacts receives the four skels, the per-DSP
-# logs, and the QAIC host stub pair. The repo checkout is never bind-mounted.
-set -u
+# Runs inside ghcr.io/snapdragon-toolchain/arm64-android, tag v0.7 pinned by
+# digest (Hexagon SDK 6.6.0.0, tools 19.0.07). /kalsa/src.tar is a git archive
+# of the binding repo's vendored engine tree; /artifacts receives the skels,
+# the per-DSP logs, and the QAIC host stub pair. The repo checkout is never
+# bind-mounted.
+#
+# Errexit is on, so every command whose failure the script must bookkeep
+# (extract, configure, build attempts, install) is guarded with ||rc=$? -- an
+# unguarded failure would exit before its status line and the retry loop.
+set -euo pipefail
 
 # Fixed extraction path: the compiler bakes it into the binaries (FARF takes
 # __FILE__), so every build from this recipe carries the same prefix and the
@@ -16,8 +21,10 @@ ART=/artifacts
 
 rm -rf /tmp/kalsa-htp
 mkdir -p "$SRC" "$ART"
-tar -x -C "$SRC" -f /kalsa/src.tar
-echo "ARCHIVE EXTRACT EXIT=$?"
+extract_rc=0
+tar -x -C "$SRC" -f /kalsa/src.tar || extract_rc=$?
+echo "ARCHIVE EXTRACT EXIT=$extract_rc"
+if [ "$extract_rc" -ne 0 ]; then exit 1; fi
 
 HTP_SRC="$SRC/vendor/llama.cpp/ggml/src/ggml-hexagon/htp"
 cd "$HTP_SRC" || exit 1
@@ -51,6 +58,7 @@ for v in $HTP_DSP_VERSIONS; do
     mkdir -p "$build_dir"
     cd "$build_dir"
 
+    conf_rc=0
     cmake "$HTP_SRC" -G Ninja \
         -DCMAKE_TOOLCHAIN_FILE="$HTP_SRC/cmake-toolchain.cmake" \
         -DCMAKE_BUILD_TYPE=Release \
@@ -60,21 +68,22 @@ for v in $HTP_DSP_VERSIONS; do
         -DDSP_VERSION="$v" \
         -DPREBUILT_LIB_DIR="toolv19_$v" \
         -DHEXAGON_HTP_DEBUG=OFF \
-        > "$ART/conf-$v.log" 2>&1
-    conf_rc=$?
+        > "$ART/conf-$v.log" 2>&1 || conf_rc=$?
     echo "CONF $v EXIT=$conf_rc"
     if [ "$conf_rc" -ne 0 ]; then
         overall_rc=1
         continue
     fi
 
-    # The QNX-side DSP compiler occasionally fails to claim its license slot
-    # under emulation; a clean re-run of the same build dir has always
-    # succeeded. Three attempts, then give up so the driver fails loudly.
+    # The observed transient is the embed_kernel build step (a license-slot
+    # miss under emulation); a clean re-run of the same build dir has always
+    # succeeded. Three real attempts under errexit -- each guarded so the
+    # failure reaches this loop instead of killing the shell -- then give up
+    # so the driver fails loudly.
     build_rc=1
     for attempt in 1 2 3; do
-        cmake --build . --config Release > "$ART/build-$v-attempt-$attempt.log" 2>&1
-        build_rc=$?
+        build_rc=0
+        cmake --build . --config Release > "$ART/build-$v-attempt-$attempt.log" 2>&1 || build_rc=$?
         echo "BUILD $v ATTEMPT $attempt EXIT=$build_rc"
         if [ "$build_rc" -eq 0 ]; then break; fi
     done
@@ -83,8 +92,12 @@ for v in $HTP_DSP_VERSIONS; do
         continue
     fi
 
-    cmake --install . > "$ART/install-$v.log" 2>&1
-    echo "INSTALL $v EXIT=$?"
+    install_rc=0
+    cmake --install . > "$ART/install-$v.log" 2>&1 || install_rc=$?
+    echo "INSTALL $v EXIT=$install_rc"
+    if [ "$install_rc" -ne 0 ]; then
+        overall_rc=1
+    fi
 done
 
 # The Android host build compiles the v73 QAIC stub; ship the pair beside the
@@ -96,9 +109,9 @@ for f in htp_iface.h htp_iface_stub.c; do
 done
 
 echo "=== sha256 ==="
-sha256sum "$ART"/libggml-htp-*.so 2>/dev/null
+sha256sum "$ART"/libggml-htp-*.so 2>/dev/null || true
 echo "=== versions ==="
 echo "SDK: $HEXAGON_SDK_ROOT"
-"$HEXAGON_TOOLS_ROOT/Tools/bin/hexagon-clang --version" 2>/dev/null | head -1
+"$HEXAGON_TOOLS_ROOT/Tools/bin/hexagon-clang" --version 2>/dev/null | head -1 || true
 echo "SCRIPT DONE overall_rc=$overall_rc"
 exit "$overall_rc"

@@ -19,20 +19,14 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE="ghcr.io/snapdragon-toolchain/arm64-android:v0.7"
 PLATFORM="linux/amd64"
 MANIFEST="$ROOT_DIR/bin/arm64-v8a/HTP_SKELS"
-DSP_VERSIONS="v73 v75 v79 v81"
+
+# The supported DSP versions and the sha256 helpers are shared with the skew
+# gate, which requires exactly this set (missing or extra skels fail).
+. "$ROOT_DIR/scripts/htp-skels-common.sh"
 
 ENGINE_SHA="$(sed -n 's/^LLAMA_CPP_COMMIT=//p' "$ROOT_DIR/vendor/VERSIONS")"
 [[ "$ENGINE_SHA" =~ ^[0-9a-f]{40}$ ]] \
   || { echo "build-htp-skels: vendor/VERSIONS LLAMA_CPP_COMMIT='$ENGINE_SHA' is not a full sha; run npm run sync:vendor first" >&2; exit 1; }
-
-# sha256sum on Linux (the CI runner), shasum on macOS (local runs).
-sha256_of() {
-  if command -v sha256sum > /dev/null 2>&1; then
-    sha256sum "$1" | awk '{print $1}'
-  else
-    shasum -a 256 "$1" | awk '{print $1}'
-  fi
-}
 
 # The source of truth is `git archive HEAD`: it exports tracked content
 # only, so uncommitted modifications of tracked files would silently build
@@ -78,15 +72,16 @@ docker run --rm --platform "$PLATFORM" \
   -v "$ROOT_DIR/scripts/htp-skels-container.sh:/kalsa/build-inner.sh:ro" \
   -v "$WORK/out:/artifacts" \
   -e "KALSA_HTP_ENGINE_SHA=$ENGINE_SHA" \
+  -e "HTP_DSP_VERSIONS=$HTP_DSP_VERSIONS" \
   "$IMAGE" \
   bash /kalsa/build-inner.sh
 
-for f in $DSP_VERSIONS; do
+for f in $HTP_DSP_VERSIONS; do
   [ -f "$WORK/out/libggml-htp-$f.so" ] || { echo "build-htp-skels: the container produced no libggml-htp-$f.so" >&2; exit 1; }
 done
 
 mkdir -p "$ROOT_DIR/bin/arm64-v8a"
-for f in $DSP_VERSIONS; do
+for f in $HTP_DSP_VERSIONS; do
   cp "$WORK/out/libggml-htp-$f.so" "$ROOT_DIR/bin/arm64-v8a/"
 done
 
@@ -96,8 +91,8 @@ mkdir -p "$HTP_STUB_DIR"
 cp "$WORK/out/htp_iface.h" "$WORK/out/htp_iface_stub.c" "$HTP_STUB_DIR/"
 
 # Regenerate the vouched digests; the prose stays hand-maintained.
-for f in $DSP_VERSIONS; do
-  sha="$(sha256_of "$ROOT_DIR/bin/arm64-v8a/libggml-htp-$f.so")"
+for f in $HTP_DSP_VERSIONS; do
+  sha="$(htp_sha256_of "$ROOT_DIR/bin/arm64-v8a/libggml-htp-$f.so")"
   if grep -q "^libggml-htp-$f\.so=" "$MANIFEST"; then
     sed -i.bak "s/^libggml-htp-$f\.so=.*/libggml-htp-$f.so=$sha/" "$MANIFEST"
   else

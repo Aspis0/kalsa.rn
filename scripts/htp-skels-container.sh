@@ -43,7 +43,10 @@ export DEFAULT_NO_QURT_INC="${DEFAULT_NO_QURT_INC:-0}"
 : "${HEXAGON_TOOLS_ROOT:?image env missing HEXAGON_TOOLS_ROOT}"
 
 overall_rc=0
-for v in v73 v75 v79 v81; do
+# The supported set comes from the driver, which reads it from
+# scripts/htp-skels-common.sh -- the same list the gate requires.
+: "${HTP_DSP_VERSIONS:?"driver must export HTP_DSP_VERSIONS (scripts/htp-skels-common.sh)"}"
+for v in $HTP_DSP_VERSIONS; do
     build_dir="/tmp/kalsa-htp/build-$v"
     mkdir -p "$build_dir"
     cd "$build_dir"

@@ -15,9 +15,10 @@
 #   1. bin/arm64-v8a/HTP_SKELS is missing or malformed
 #   2. the manifest's ENGINE_COMMIT differs from vendor/VERSIONS
 #      LLAMA_CPP_COMMIT -- the skels were not rebuilt after a vendor bump
-#   3. a shipped libggml-htp-*.so has no manifest entry, is listed but
-#      absent, or its sha256 differs from the manifest -- the committed
-#      binary is not the one the manifest vouches for
+#   3. the shipped set is not exactly the supported DSP versions (see
+#      scripts/htp-skels-common.sh), a shipped libggml-htp-*.so has no
+#      manifest entry, is listed but absent, or its sha256 differs from the
+#      manifest -- the committed binary is not the one the manifest vouches for
 #   4. a shipped skel is not a QDSP6 ELF of plausible size, or does not
 #      carry exactly one KALSA_HTP_ENGINE=<LLAMA_CPP_COMMIT> string -- the
 #      identity lives in the binary itself (scripts/htp-skels-container.sh
@@ -34,6 +35,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MANIFEST="$ROOT_DIR/bin/arm64-v8a/HTP_SKELS"
 VERSIONS="$ROOT_DIR/vendor/VERSIONS"
 BIN_DIR="$ROOT_DIR/bin/arm64-v8a"
+
+# Supported DSP versions + sha256 helpers, shared with the build recipe.
+. "$ROOT_DIR/scripts/htp-skels-common.sh"
 
 fail() { echo "assert-htp-skels: $*" >&2; exit 1; }
 
@@ -71,6 +75,16 @@ fi
 # manifest, so a renamed or newly added skel cannot pass unvouched.
 shipped="$(find "$BIN_DIR" -maxdepth 1 -name 'libggml-htp-*.so' -exec basename {} \; | sort)"
 [ -n "$shipped" ] || fail "no libggml-htp-*.so under $BIN_DIR -- nothing ships, which is itself a change to prove"
+
+# The shipped set must be EXACTLY the supported versions. A missing version
+# silently drops a DSP the host can ask for; an extra one is an unreviewed
+# protocol surface (the example app's Gradle task also lists all four, but
+# this gate is what fails a drift).
+expected="$(printf 'libggml-htp-%s.so\n' $HTP_DSP_VERSIONS | sort)"
+shipped_set="$(printf '%s\n' "$shipped" | sort)"
+if [ "$shipped_set" != "$expected" ]; then
+  fail "shipped skels [$(printf '%s' "$shipped_set" | tr '\n' ' ')] != the supported set [$(printf '%s' "$expected" | tr '\n' ' ')] -- rebuild exactly $HTP_DSP_VERSIONS (scripts/build-htp-skels.sh)"
+fi
 
 manifest_list="$(sed -n 's/^\(libggml-htp-.*\.so\)=[0-9a-f]\{64\}$/\1/p' "$MANIFEST" | sort)"
 [ -n "$manifest_list" ] \

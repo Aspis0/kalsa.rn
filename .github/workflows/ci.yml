@@ -52,10 +52,25 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
+      # No `lfs: true` here: the ~63 MB model would be pulled from LFS storage
+      # on every run. The cache below restores the materialized file instead,
+      # keyed by the checkout's pointer file (its content -- and so its hash --
+      # changes only when the LFS oid changes).
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Cache the LFS test model
+        uses: actions/cache@v4
+        id: lfs-model
         with:
-          lfs: true
+          path: tests/tiny-random-llama.gguf
+          key: lfs-tiny-random-llama-${{ hashFiles('tests/tiny-random-llama.gguf') }}
+
+      # Cache miss: pull the one object straight from LFS. On a hit the cached
+      # file already replaced the pointer, so nothing is downloaded.
+      - name: Pull the LFS test model on a cache miss
+        if: steps.lfs-model.outputs.cache-hit != 'true'
+        run: git lfs pull --include tests/tiny-random-llama.gguf
 
       - name: Setup
         uses: ./.github/actions/setup

@@ -31,6 +31,15 @@ ENGINE_SHA="$(sed -n 's/^LLAMA_CPP_COMMIT=//p' "$ROOT_DIR/vendor/VERSIONS")"
 [[ "$ENGINE_SHA" =~ ^[0-9a-f]{40}$ ]] \
   || { echo "build-htp-skels: vendor/VERSIONS LLAMA_CPP_COMMIT='$ENGINE_SHA' is not a full sha; run npm run sync:vendor first" >&2; exit 1; }
 
+# Content fingerprint of the committed sources (scripts/htp-skels-common.sh):
+# stamped into every skel next to the engine sha, and recomputed by the gate,
+# so a committed source edit under the same upstream sha cannot ship old
+# skels against a new host protocol.
+SRC_FP="$(htp_src_fingerprint)" \
+  || { echo "build-htp-skels: cannot fingerprint the committed sources (git rev-parse failed)" >&2; exit 1; }
+[[ "$SRC_FP" =~ ^[0-9a-f]{64}$ ]] \
+  || { echo "build-htp-skels: source fingerprint '$SRC_FP' is not a sha256" >&2; exit 1; }
+
 # The source of truth is `git archive HEAD`: it exports tracked content
 # only, so uncommitted modifications of tracked files would silently build
 # skels no commit can vouch for. (Untracked files cannot enter the archive.)
@@ -52,22 +61,11 @@ mkdir -p "${HOME:?}/.cache"
 WORK="$(mktemp -d "${HOME:?}/.cache/htp-skels-build.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
-# Exactly the paths the htp DSP project compiles against: the public ggml
-# headers, the six ggml root headers the htp sources include, and the whole
-# ggml-hexagon tree (host backend + htp/ DSP project). Archive paths are
-# repo-relative, so the extraction mirrors the repo layout.
-ARCHIVE_PATHS=(
-  vendor/llama.cpp/ggml/include
-  vendor/llama.cpp/ggml/src/ggml-backend-impl.h
-  vendor/llama.cpp/ggml/src/ggml-common.h
-  vendor/llama.cpp/ggml/src/ggml-feats.h
-  vendor/llama.cpp/ggml/src/ggml-impl.h
-  vendor/llama.cpp/ggml/src/ggml-quants.h
-  vendor/llama.cpp/ggml/src/ggml-threading.h
-  vendor/llama.cpp/ggml/src/ggml-hexagon
-)
-# -o would restrict the target to inside the repo; plain stdout does not.
-git -C "$ROOT_DIR" archive HEAD -- "${ARCHIVE_PATHS[@]}" > "$WORK/src.tar"
+# Exactly the paths the htp DSP project compiles against and the host hexagon
+# backend compiles from (HTP_SRC_PATHS in scripts/htp-skels-common.sh, which
+# also defines the fingerprint over them). Archive paths are repo-relative,
+# so the extraction mirrors the repo layout.
+git -C "$ROOT_DIR" archive HEAD -- "${HTP_SRC_PATHS[@]}" > "$WORK/src.tar"
 
 docker run --rm --platform "$PLATFORM" \
   -u "$(id -u):$(id -g)" \
@@ -75,6 +73,7 @@ docker run --rm --platform "$PLATFORM" \
   -v "$ROOT_DIR/scripts/htp-skels-container.sh:/kalsa/build-inner.sh:ro" \
   -v "$WORK/out:/artifacts" \
   -e "KALSA_HTP_ENGINE_SHA=$ENGINE_SHA" \
+  -e "KALSA_HTP_SRC_FP=$SRC_FP" \
   -e "HTP_DSP_VERSIONS=$HTP_DSP_VERSIONS" \
   "$IMAGE" \
   bash /kalsa/build-inner.sh
@@ -109,6 +108,12 @@ if grep -q "^ENGINE_COMMIT=" "$MANIFEST"; then
 else
   echo "build-htp-skels: $MANIFEST has no ENGINE_COMMIT line; add it" >&2
   exit 1
+fi
+if grep -q "^SRC_FINGERPRINT=" "$MANIFEST"; then
+  sed -i.bak "s/^SRC_FINGERPRINT=.*/SRC_FINGERPRINT=$SRC_FP/" "$MANIFEST"
+  rm -f "$MANIFEST".bak
+else
+  printf 'SRC_FINGERPRINT=%s\n' "$SRC_FP" >> "$MANIFEST"
 fi
 
 echo "build-htp-skels: manifest refreshed; running the skew gate"

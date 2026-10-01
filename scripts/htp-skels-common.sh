@@ -6,6 +6,25 @@
 
 HTP_DSP_VERSIONS="v73 v75 v79 v81"
 
+# The vendored source both sides of the host/DSP protocol are built from:
+# the HTP DSP project compiles against the public ggml headers, the ggml root
+# headers the htp sources include, and the whole ggml-hexagon tree (the
+# recipe's archive list), and the Android host hexagon backend compiles
+# ggml-hexagon.cpp + htp-drv.cpp + the tracked QAIC stub (htp/v73/) from the
+# same tree (android/src/main/rnllama/CMakeLists.txt). One list, two
+# consumers: the recipe archives exactly these paths, and htp_src_fingerprint
+# hashes them.
+HTP_SRC_PATHS=(
+  vendor/llama.cpp/ggml/include
+  vendor/llama.cpp/ggml/src/ggml-backend-impl.h
+  vendor/llama.cpp/ggml/src/ggml-common.h
+  vendor/llama.cpp/ggml/src/ggml-feats.h
+  vendor/llama.cpp/ggml/src/ggml-impl.h
+  vendor/llama.cpp/ggml/src/ggml-quants.h
+  vendor/llama.cpp/ggml/src/ggml-threading.h
+  vendor/llama.cpp/ggml/src/ggml-hexagon
+)
+
 # sha256sum on Linux (the CI runner), shasum on macOS (local runs); both
 # print the hex digest as the first field of line one.
 htp_sha256_of() {
@@ -14,4 +33,26 @@ htp_sha256_of() {
   else
     shasum -a 256 "$1" | awk '{print $1}'
   fi
+}
+
+htp_sha256_stdin() {
+  if command -v sha256sum > /dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  else
+    shasum -a 256 | awk '{print $1}'
+  fi
+}
+
+# Content fingerprint of the committed sources: the git tree/blob hash of
+# every HTP_SRC_PATHS entry at HEAD, hashed together with the path names, so
+# an edit under any path -- or a change to the path list itself -- moves the
+# fingerprint. Computed from HEAD, the committed tree the recipe archives;
+# uncommitted worktree edits under the same paths are a separate explicit
+# check in the gate, never a silent fingerprint change.
+htp_src_fingerprint() {
+  local p hash
+  for p in "${HTP_SRC_PATHS[@]}"; do
+    hash="$(git rev-parse "HEAD:$p")" || return 1
+    printf '%s %s\n' "$p" "$hash"
+  done | htp_sha256_stdin
 }

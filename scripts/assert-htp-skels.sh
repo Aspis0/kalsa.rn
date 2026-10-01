@@ -15,16 +15,20 @@
 #   1. bin/arm64-v8a/HTP_SKELS is missing or malformed
 #   2. the manifest's ENGINE_COMMIT differs from vendor/VERSIONS
 #      LLAMA_CPP_COMMIT -- the skels were not rebuilt after a vendor bump
-#   3. the shipped set is not exactly the supported DSP versions (see
+#   3. the source fingerprint (git tree hashes of the vendored paths both
+#      the DSP skels and the host hexagon backend build from, see
+#      scripts/htp-skels-common.sh) differs between the manifest/skels and
+#      this checkout, or the working tree has uncommitted edits under those
+#      paths -- a source change moved the protocol without a skel rebuild
+#   4. the shipped set is not exactly the supported DSP versions (see
 #      scripts/htp-skels-common.sh), a shipped libggml-htp-*.so has no
 #      manifest entry, is listed but absent, or its sha256 differs from the
 #      manifest -- the committed binary is not the one the manifest vouches for
-#   4. a shipped skel is not a QDSP6 ELF of plausible size, or does not
-#      carry exactly one KALSA_HTP_ENGINE=<LLAMA_CPP_COMMIT> string -- the
-#      identity lives in the binary itself (scripts/htp-skels-container.sh
-#      links a generated stamp TU into every skel), so no text edit can
-#      vouch for a stale skel: only a rebuild through the committed recipe
-#      can satisfy this leg
+#   5. a shipped skel is not a QDSP6 ELF of plausible size, or does not
+#      carry exactly one KALSA_HTP_ENGINE and one KALSA_HTP_SRC stamp with
+#      the expected values -- the identity lives inside the binary (a stamp
+#      TU scripts/htp-skels-container.sh links into every skel), so editing
+#      text or appending a stamp string cannot vouch for stale bytes
 #
 # The manifest also carries the build provenance (SDK/tools/image versions);
 # those lines are informational and unchecked -- a gate on them could not be
@@ -70,6 +74,24 @@ if [ "$manifest_engine" != "$pin_engine" ]; then
   fail "skel engine sha ${manifest_engine:0:7} != vendored engine sha ${pin_engine:0:7} -- the DSP skels were not rebuilt from the vendored tree; rebuild them (see the provenance block in bin/arm64-v8a/HTP_SKELS)"
 fi
 
+# (a2) the skels must come from the exact committed sources the host hexagon
+# backend compiles. The fingerprint (htp_src_fingerprint, from HEAD -- the
+# committed tree the recipe archives) is recomputed here and compared against
+# both the manifest and each skel; uncommitted edits under the fingerprinted
+# paths fail the dirt check, so a working-tree change can never pass
+# unnoticed either way.
+if [ -n "$(git -C "$ROOT_DIR" status --porcelain -- "${HTP_SRC_PATHS[@]}")" ]; then
+  fail "uncommitted changes under the fingerprinted sources (ggml headers / ggml-hexagon) -- commit or stash; rebuild the skels if the sources moved (scripts/build-htp-skels.sh)"
+fi
+src_fp="$(htp_src_fingerprint)" \
+  || fail "cannot fingerprint the committed sources (git rev-parse failed)"
+
+manifest_fp="$(sed -n 's/^SRC_FINGERPRINT=//p' "$MANIFEST")"
+[ -n "$manifest_fp" ] \
+  || fail "HTP_SKELS has no SRC_FINGERPRINT line -- rebuild the skels (scripts/build-htp-skels.sh)"
+[ "$manifest_fp" = "$src_fp" ] \
+  || fail "manifest source fingerprint ${manifest_fp:0:7} != recomputed ${src_fp:0:7} -- the vendored sources moved without a skel rebuild"
+
 # Every manifest entry must be "name=64-hex" and the name must be a shipped
 # skel; every shipped skel must have an entry. Walk the real files, not the
 # manifest, so a renamed or newly added skel cannot pass unvouched.
@@ -112,13 +134,30 @@ done <<< "$shipped"
 [ "$mismatches" -eq 0 ] \
   || fail "$mismatches skel file(s) do not match HTP_SKELS -- the shipped binary is not the one the manifest vouches for"
 
-# (c) each shipped skel must BE a Hexagon DSP skel and must name its engine.
-# Header: ELF magic, 32-bit little-endian, e_machine = 164 (EM_QDSP6), bytes
-# 0..19 via od; size floor 256 KB (real skels are ~0.9 MB, and the failure
-# this catches is a placeholder/garbage file far below it). Stamp: exactly
-# one KALSA_HTP_ENGINE=<40 hex> string, equal to the pin -- a second or
-# different engine sha means mixed-provenance bytes.
+# (c) each shipped skel must BE a Hexagon DSP skel and must name both its
+# engine and its sources. Header: ELF magic, 32-bit little-endian, e_machine
+# = 164 (EM_QDSP6), bytes 0..19 via od; size floor 256 KB (real skels are
+# ~0.9 MB, and the failure this catches is a placeholder/garbage file far
+# below it). Stamps: exactly one KALSA_HTP_ENGINE=<40 hex> equal to the pin
+# and one KALSA_HTP_SRC=<64 hex> equal to the recomputed fingerprint -- a
+# second or different identity means mixed-provenance bytes.
 size_floor=$((256 * 1024))
+# check_stamp <name> <file> <regex> <prefix> <want> <what>: exactly one
+# occurrence of the stamp string, and its value must equal <want>.
+check_stamp() {
+  local stamps count got
+  stamps="$(grep -aoE "$3" "$2" || true)"
+  count="$(printf '%s' "$stamps" | grep -c "$4" || true)"
+  if [ "$count" -ne 1 ]; then
+    echo "assert-htp-skels: $1 carries $count $6 stamps (want exactly 1) -- rebuild through scripts/build-htp-skels.sh" >&2
+    return 1
+  fi
+  got="${stamps#*=}"
+  if [ "$got" != "$5" ]; then
+    echo "assert-htp-skels: $1 $6 ${got:0:7} != expected ${5:0:7} -- the skel bytes predate the current sources; rebuild (scripts/build-htp-skels.sh)" >&2
+    return 1
+  fi
+}
 bad_identity=0
 while IFS= read -r name; do
   file="$BIN_DIR/$name"
@@ -134,20 +173,12 @@ while IFS= read -r name; do
     bad_identity=$((bad_identity + 1))
     continue
   fi
-  stamps="$(grep -aoE 'KALSA_HTP_ENGINE=[0-9a-f]{40}' "$file" || true)"
-  count="$(printf '%s' "$stamps" | grep -c 'KALSA_HTP_ENGINE=' || true)"
-  if [ "$count" -ne 1 ]; then
-    echo "assert-htp-skels: $name carries $count KALSA_HTP_ENGINE stamps (want exactly 1) -- rebuild through scripts/build-htp-skels.sh" >&2
-    bad_identity=$((bad_identity + 1))
-    continue
-  fi
-  skel_engine="${stamps#KALSA_HTP_ENGINE=}"
-  if [ "$skel_engine" != "$pin_engine" ]; then
-    echo "assert-htp-skels: $name engine sha ${skel_engine:0:7} != vendored engine sha ${pin_engine:0:7} -- the skel bytes predate the pin; rebuild (scripts/build-htp-skels.sh)" >&2
-    bad_identity=$((bad_identity + 1))
-  fi
+  check_stamp "$name" "$file" 'KALSA_HTP_ENGINE=[0-9a-f]{40}' 'KALSA_HTP_ENGINE=' "$pin_engine" engine \
+    || { bad_identity=$((bad_identity + 1)); continue; }
+  check_stamp "$name" "$file" 'KALSA_HTP_SRC=[0-9a-f]{64}' 'KALSA_HTP_SRC=' "$src_fp" source \
+    || bad_identity=$((bad_identity + 1))
 done <<< "$shipped"
 [ "$bad_identity" -eq 0 ] \
   || fail "$bad_identity skel file(s) fail the binary identity check"
 
-echo "assert-htp-skels: ok (engine ${manifest_engine:0:7}, $(printf '%s\n' "$shipped" | wc -l | tr -d ' ') skels match the manifest, each names its engine)"
+echo "assert-htp-skels: ok (engine ${manifest_engine:0:7}, src ${src_fp:0:7}, $(printf '%s\n' "$shipped" | wc -l | tr -d ' ') skels match the manifest, each names its engine and sources)"

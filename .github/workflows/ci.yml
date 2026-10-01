@@ -15,10 +15,12 @@ concurrency:
 
 jobs:
   vendor:
-    # Unconditional on purpose: vendor/ is checked in and must stay valid on
-    # every branch. No `if:` here, so no gating is inherited or widened -- this
-    # job simply always runs, and it is the cheapest one in the file (a checkout
-    # and two shell assertions, no node setup).
+    # Real triggers of THIS workflow: pushes to main and kalsa, pull requests
+    # targeting main, and manual dispatch -- a direct push to any other branch
+    # does not run it, and no local commit hook runs the gate either. The job
+    # has no `if:` on purpose, so it runs on every one of those triggers, and
+    # it is the cheapest one in the file (a checkout and three shell
+    # assertions, no node setup).
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

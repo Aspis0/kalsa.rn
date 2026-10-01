@@ -76,6 +76,12 @@ jobs:
           echo "tag=$TAG_NAME" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
+      # The release APK below ships the committed bin/ skels and builds its
+      # host Hexagon backend from vendor/llama.cpp; run the skew gate first so
+      # a stale or mismatched skel cannot reach the uploaded artifact.
+      - name: Assert the shipped HTP skels
+        run: ./scripts/assert-htp-skels.sh
+
       - name: Build Android release
         working-directory: example/android
         env:

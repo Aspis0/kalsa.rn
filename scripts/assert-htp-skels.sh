@@ -9,7 +9,10 @@
 # control-plane RPCs still succeed, and the first in-app prefill batch hangs
 # forever or aborts (the 2026-09 dspqueue hang, scratchpad
 # inapp-htp-dspqueue-hang/DIAGNOSIS.md H2). This gate turns that drift into a
-# red build, at commit time and in CI.
+# red build in CI: the vendor job (pushes to main/kalsa, PRs to main, manual
+# dispatch) plus a pre-build step in every Android build workflow. Nothing
+# runs it at commit time -- after touching the skels or vendored sources, run
+# it by hand.
 #
 # Fails when:
 #   1. bin/arm64-v8a/HTP_SKELS is missing or malformed

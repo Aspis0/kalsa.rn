@@ -17,9 +17,11 @@ const recorder = () =>
 test('a real governor decode failure records the runtime fallback', () => {
   // Inside the only real-failure branch (rc fails the engine-state
   // discriminator and the failure is fresh), before the KALSA_GOVERNOR_FALLBACK
-  // log the app's scan keys on — never on the flow-control -2 path.
+  // log the app's scan keys on — never on the flow-control -2 path. The
+  // recorder rides the HTP attribution gate (see the pure helper's contract):
+  // a KV-commit or CPU-routed failure must not kill the lane.
   expect(rnLlama).toMatch(
-    /governor_decode_failed\(result, governor->engine_failed\(\)\) && !was_failed\) {\s*\n\s*note_htp_runtime_fallback\(\);/,
+    /governor_decode_failed\(result, governor->engine_failed\(\)\) && !was_failed\) {\s*\n\s*const std::string & reason = governor->failure_reason\(\);[\S\s]*?htp_prefill_runtime_failure\([\S\s]*?reason\.c_str\(\)\)\) {\s*\n\s*note_htp_runtime_fallback\(\);/,
   )
 })
 

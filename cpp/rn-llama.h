@@ -198,9 +198,10 @@ struct llama_rn_context {
     // Bench route dev hook: "cpu" | "gpu" | "auto" parsed by the JSI layer.
     bool setPrefillOverride(int mode);
     llama_governor_stats governorStats() const;
-    // Record the session degrade after a real governor decode failure with
-    // the HTP lane engaged: governor_npu_fallback (stats/KALSA_GOVERNOR) and
-    // the KALSA_HTP_FALLBACK env (every later load of this process degrades).
+    // Record the session degrade after a decode failure attributed to the
+    // HTP prefill compute (htp_prefill_runtime_failure) with the lane
+    // engaged: governor_npu_fallback (stats/KALSA_GOVERNOR) and the
+    // KALSA_HTP_FALLBACK env (every later load of this process degrades).
     void note_htp_runtime_fallback();
     bool hasDraftModel() const;
     llama_model * getMTPDraftModel() const;

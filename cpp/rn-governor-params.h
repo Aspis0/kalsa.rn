@@ -52,6 +52,27 @@ struct governor_prefill_device_plan {
  *  use_device=false, prefill on the non-HTP path). */
 constexpr char KALSA_HTP_RUNTIME_FALLBACK[] = "htp-runtime-error";
 
+/** True when one governor decode failure is attributable to the HTP prefill
+ *  device — the only failure that may kill the lane for the session. The
+ *  inputs are exactly what the decode wrapper has after the engine returns:
+ *  n_tokens > 1 is the engine's own is_prefill predicate
+ *  (llama-governor.cpp decode_impl); prefill_engine is the route latch's
+ *  stamp for THIS batch (llama-governor-runtime.cpp:
+ *  stats_.prefill_engine = admission.engine — a CPU-latched prefill reports
+ *  CPU); rc == -3 is the engine's compute-failure map (llama-context.cpp
+ *  "case GGML_STATUS_FAILED: return -3"); and the reason prefix confirms
+ *  the batch failed inside llama_decode itself, not in a host-side phase
+ *  handoff ("KV commit failed: ..." from the OpenCL set_tensor path,
+ *  "route Reject during ...", llama-governor.cpp commit_side) — those never
+ *  touched the DSP. Anything else keeps the lane on: only a confident HTP
+ *  attribution disables it. Pure, so the host test drives it with
+ *  literals. */
+bool htp_prefill_runtime_failure(
+    int32_t n_tokens,
+    llama_governor_engine prefill_engine,
+    int32_t rc,
+    const char * failure_reason);
+
 /** Resolve-to-device decision, pure. `htp_init_reason` is the Java-side
  *  KALSA_HTP_FALLBACK env (RNLlama.java noteHtpFallback) and outranks a
  *  device that resolves: no ADSP dir/libs/env means HTP0 is unusable even

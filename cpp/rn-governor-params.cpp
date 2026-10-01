@@ -6,6 +6,7 @@
 
 #include <cmath>
 #include <string>
+#include <string_view>
 #include <stdexcept>
 
 namespace rnllama {
@@ -189,6 +190,16 @@ governor_prefill_device_plan decide_governor_prefill_device(
     }
     plan.npu_fallback = engine_fallback;
     return plan;
+}
+
+bool htp_prefill_runtime_failure(
+        int32_t n_tokens, llama_governor_engine prefill_engine, int32_t rc,
+        const char * failure_reason) {
+    if (n_tokens <= 1 || prefill_engine != llama_governor_engine::NPU || rc != -3) {
+        return false;
+    }
+    return failure_reason != nullptr &&
+        std::string_view(failure_reason).rfind("llama_decode failed with rc=", 0) == 0;
 }
 
 std::vector<ggml_backend_dev_t> devices_excluding_registry(

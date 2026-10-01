@@ -751,8 +751,13 @@ int32_t llama_rn_context::decode(llama_batch batch) {
     const bool was_failed = governor->failed();
     const int32_t result = governor->decode(batch);
     if (governor_decode_failed(result, governor->engine_failed()) && !was_failed) {
-        note_htp_runtime_fallback();
         const std::string & reason = governor->failure_reason();
+        // Only a compute failure of the HTP-routed prefill kills the lane;
+        // a KV-commit (host/OpenCL) or CPU-routed failure must not.
+        if (htp_prefill_runtime_failure(
+                batch.n_tokens, governor->stats().prefill_engine, result, reason.c_str())) {
+            note_htp_runtime_fallback();
+        }
         const bool route_rejected = reason.find("route Reject") != std::string::npos;
         LOG_ERROR(
             "KALSA_GOVERNOR_FALLBACK {stage:\"%s\", models_loaded:2, reason:\"%s\", gpu_fit:%d, profile_valid:%d}",
@@ -823,10 +828,12 @@ bool llama_rn_context::setPrefillOverride(int mode) {
 }
 
 void llama_rn_context::note_htp_runtime_fallback() {
-    // Only a real HTP-lane failure degrades: no lane resolved (prefill
-    // already runs on the non-HTP path), or a fallback reason is already
-    // recorded. HTP errors before the lane opened ride the env instead
-    // (Java noteHtpFallback / the resolver's own reason).
+    // The decode wrapper has already attributed this failure to the HTP
+    // prefill compute (htp_prefill_runtime_failure); the recorder enforces
+    // what it owns: the lane resolved (governor_npu_device — without one,
+    // prefill already runs on the non-HTP path) and no reason is recorded
+    // yet. HTP errors before the lane opened ride the env instead (Java
+    // noteHtpFallback / the resolver's own reason).
     if (governor_npu_device == nullptr || governor_npu_fallback != nullptr) {
         return;
     }

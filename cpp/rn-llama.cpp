@@ -115,15 +115,10 @@ bool load_governor_models(llama_rn_context & owner,
         const auto device_plan = decide_governor_prefill_device(
             resolved.device != nullptr, resolved.npu_fallback, htp_init_reason);
         owner.governor_npu_device = device_plan.npu_device;
-        if (device_plan.npu_fallback != nullptr) {
-            // The plan reason can be the getenv pointer itself; the runtime
-            // fallback's setenv (note_htp_runtime_fallback) may reallocate
-            // environ, so the published const char * must not point into it.
-            owner.governor_npu_fallback_storage = device_plan.npu_fallback;
-            owner.governor_npu_fallback = owner.governor_npu_fallback_storage.c_str();
-        } else {
-            owner.governor_npu_fallback = nullptr;
-        }
+        // The accessor copies the reason bytes out of environ; the runtime
+        // fallback's setenv (note_htp_runtime_fallback) is allowed to
+        // reallocate it.
+        owner.setGovernorNpuFallback(device_plan.npu_fallback);
         if (device_plan.use_device) {
             prefill_params.devices = { resolved.device, nullptr };
             // KV buffers follow the layer device (llama-kv-cache.cpp) unless
@@ -763,10 +758,13 @@ int32_t llama_rn_context::decode(llama_batch batch) {
         // end-of-turn KALSA_GOVERNOR telemetry is skipped on the throwing
         // turn and the retry's reload suppresses the plan line, so without
         // the field here the recorded constant is invisible to the lab.
+        // Snapshot under the mutex: the recorder may be writing this very
+        // reason on another thread's failed decode.
+        const std::string npu_fallback = governorNpuFallback();
         LOG_ERROR(
             "KALSA_GOVERNOR_FALLBACK {stage:\"%s\", models_loaded:2, reason:\"%s\", npu_fallback:\"%s\", gpu_fit:%d, profile_valid:%d}",
             route_rejected ? "route_reject" : "decode",
-            reason.c_str(), governor_npu_fallback == nullptr ? "" : governor_npu_fallback,
+            reason.c_str(), npu_fallback.c_str(),
             (int) governor->gpu_fit(), (int) governor->profile_valid());
     }
     if (result == -2 && !governor->failed()) {
@@ -832,17 +830,34 @@ bool llama_rn_context::setPrefillOverride(int mode) {
     return governor != nullptr && governor->set_prefill_override(mode);
 }
 
+void llama_rn_context::setGovernorNpuFallback(const char * reason) {
+    std::lock_guard<std::mutex> lock(npu_fallback_mutex_);
+    governor_npu_fallback_ = reason == nullptr ? "" : reason;
+}
+
+std::string llama_rn_context::governorNpuFallback() const {
+    std::lock_guard<std::mutex> lock(npu_fallback_mutex_);
+    return governor_npu_fallback_;
+}
+
 void llama_rn_context::note_htp_runtime_fallback() {
     // The decode wrapper has already attributed this failure to the HTP
     // prefill compute (htp_prefill_runtime_failure); the recorder enforces
     // what it owns: the lane resolved (governor_npu_device — without one,
     // prefill already runs on the non-HTP path) and no reason is recorded
-    // yet. HTP errors before the lane opened ride the env instead (Java
+    // yet — first writer wins, under the mutex the stats task also takes.
+    // HTP errors before the lane opened ride the env instead (Java
     // noteHtpFallback / the resolver's own reason).
-    if (governor_npu_device == nullptr || governor_npu_fallback != nullptr) {
+    if (governor_npu_device == nullptr) {
         return;
     }
-    governor_npu_fallback = KALSA_HTP_RUNTIME_FALLBACK;
+    {
+        std::lock_guard<std::mutex> lock(npu_fallback_mutex_);
+        if (!governor_npu_fallback_.empty()) {
+            return;
+        }
+        governor_npu_fallback_ = KALSA_HTP_RUNTIME_FALLBACK;
+    }
     // The engine governor is sticky-failed, so no in-place retry exists on
     // this context pair; the failed turn fails cleanly to the caller (the
     // completion throws "Governor decode failed: ..."). The app's retry

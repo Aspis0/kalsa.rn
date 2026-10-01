@@ -30,7 +30,11 @@ test('the recorder degrades only an engaged, not-yet-degraded lane', () => {
   expect(fn).not.toBeNull()
   // governor_npu_device is set only when the lane resolved to HTP0; a
   // recorded reason means an earlier degrade (init or runtime) already won.
-  expect(fn![0]).toContain('governor_npu_device == nullptr || governor_npu_fallback != nullptr')
+  expect(fn![0]).toContain('governor_npu_device == nullptr')
+  // First writer wins under the mutex: the stats task reads the reason from
+  // a JSI worker thread while a decode may be recording it.
+  expect(fn![0]).toContain('!governor_npu_fallback_.empty()')
+  expect(fn![0]).toContain('std::lock_guard<std::mutex>')
 })
 
 test('the recorder sets the env with overwrite, never a parallel route path', () => {
@@ -44,14 +48,16 @@ test('the recorder sets the env with overwrite, never a parallel route path', ()
   expect(fn![0]).not.toContain('set_prefill_override')
 })
 
-test('each load reads the env fresh and owns the published reason bytes', () => {
+test('each load reads the env fresh; the published reason is mutex-guarded', () => {
   // No caching of the reason across loads: the runtime setenv must be seen
   // by the next load_governor_models.
   expect(rnLlama).toContain('std::getenv("KALSA_HTP_FALLBACK")')
-  // setenv(3) may reallocate environ and dangle a getenv pointer; the const
-  // char * the JSI map publishes must point into owner-owned storage.
-  expect(rnLlama).toContain('owner.governor_npu_fallback_storage = device_plan.npu_fallback;')
-  expect(rnLlamaHeader).toContain('governor_npu_fallback_storage')
+  // setenv(3) may reallocate environ, so nothing holds a getenv pointer: the
+  // load copies the reason bytes through the synchronized accessor, and the
+  // stats task reads a copy through the same mutex.
+  expect(rnLlama).toContain('owner.setGovernorNpuFallback(device_plan.npu_fallback);')
+  expect(rnLlamaHeader).toContain('std::mutex npu_fallback_mutex_')
+  expect(rnLlamaHeader).toContain("std::string governorNpuFallback() const;")
 })
 
 test('the recorded reason rides the log line the lab parses, at failure time', () => {

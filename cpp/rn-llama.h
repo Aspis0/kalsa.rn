@@ -3,6 +3,7 @@
 
 #include <sstream>
 #include <iostream>
+#include <mutex>
 #include <thread>
 #include <codecvt>
 #include "chat.h"
@@ -184,11 +185,15 @@ struct llama_rn_context {
     // load_governor_models only when npu_lane_enabled, read by the
     // getGovernorStats JSI map). Both stay null with the lane off.
     const char * governor_npu_device = nullptr;
-    const char * governor_npu_fallback = nullptr;
-    // Owns the bytes governor_npu_fallback may point at: the plan reason can
-    // be the getenv(3) pointer, and the runtime fallback's setenv(3) is
-    // allowed to reallocate environ and dangle it.
-    std::string governor_npu_fallback_storage;
+    // The HTP degrade reason, empty when the lane is on: the plan reason from
+    // the load step, or the runtime fallback recorded on the decode thread.
+    // The stats task copies it from a JSI worker thread while a decode may be
+    // recording it — a data race on the old bare pointer — so every access
+    // goes through the mutex-guarded accessors, and readers hold copies.
+    void setGovernorNpuFallback(const char * reason);
+    std::string governorNpuFallback() const;
+    mutable std::mutex npu_fallback_mutex_;
+    std::string governor_npu_fallback_;
 
     bool hasGovernor() const;
     bool governorFailed() const;
@@ -200,7 +205,7 @@ struct llama_rn_context {
     llama_governor_stats governorStats() const;
     // Record the session degrade after a decode failure attributed to the
     // HTP prefill compute (htp_prefill_runtime_failure) with the lane
-    // engaged: governor_npu_fallback (stats/KALSA_GOVERNOR) and the
+    // engaged: the fallback reason (stats/KALSA_GOVERNOR) and the
     // KALSA_HTP_FALLBACK env (every later load of this process degrades).
     void note_htp_runtime_fallback();
     bool hasDraftModel() const;

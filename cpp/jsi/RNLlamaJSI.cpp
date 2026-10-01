@@ -898,8 +898,10 @@ namespace rnllama_jsi {
                         const bool active = ctx->hasGovernor();
                         const bool hasNpuDevice = ctx->governor_npu_device != nullptr;
                         const std::string npuDevice = hasNpuDevice ? ctx->governor_npu_device : "";
-                        const bool hasNpuFallback = ctx->governor_npu_fallback != nullptr;
-                        const std::string npuFallback = hasNpuFallback ? ctx->governor_npu_fallback : "";
+                        // Mutex-guarded copy: the decode thread may be
+                        // recording the fallback while this task runs.
+                        const std::string npuFallback = ctx->governorNpuFallback();
+                        const bool hasNpuFallback = !npuFallback.empty();
                         return [stats, failure, active, hasNpuDevice, npuDevice,
                                 hasNpuFallback, npuFallback](jsi::Runtime& rt) {
                             jsi::Object result(rt);

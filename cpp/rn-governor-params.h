@@ -45,7 +45,7 @@ struct governor_prefill_device_plan {
 
 /** The reason recorded when the HTP prefill compute fails mid-session (the
  *  engine returns an error instead of hanging on a DSP timeout/skew). The
- *  recorder stores it in owner.governor_npu_fallback - getGovernorStats
+ *  recorder stores it via owner.setGovernorNpuFallback - getGovernorStats
  *  publishes it and the binding's KALSA_GOVERNOR_FALLBACK log line carries
  *  it at failure time - and in the KALSA_HTP_FALLBACK env, which
  *  decide_governor_prefill_device reads at every governor load: the app's

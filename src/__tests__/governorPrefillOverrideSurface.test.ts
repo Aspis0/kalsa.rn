@@ -1,7 +1,7 @@
 /**
  * The /bench route surface as CHAIN, not fragments: JS wrapper → JSI host
  * function → context → rn_governor → engine C API, the completion-result
- * emission with its six fields, and the engine's safety-before-override
+ * emission with its seven fields, and the engine's safety-before-override
  * order — each sliced between markers and compared token-for-token
  * (comments stripped), so a dropped hop or a moved gate fails loudly.
  * The TS shape is pinned against the GENERATED declarations, so a stale
@@ -96,18 +96,21 @@ test('the context and rn_governor hops forward to the engine call', () => {
   )
 })
 
-test('the completion result emits route_chunks with the six spec fields', () => {
+test('the completion result emits route_chunks with the seven spec fields', () => {
   const emission = block(
     cpp('jsi/JSICompletion.h'),
     'const auto governor_stats = ctx->governorStats();',
     'res["route_chunks_truncated"] = governor_stats.route_chunks_truncated;',
   )
   expect(emission).toContain('if (ctx->hasGovernor())')
-  ;['index', 'requested', 'actual', 'tokens', 'prefill_ms', 'forced'].forEach((field) =>
+  ;['index', 'requested', 'actual', 'tokens', 'prefill_ms', 'forced', 'layers_device'].forEach((field) =>
     expect(emission).toContain(`{"${field}"`),
   )
   expect(emission).toContain('prefillModeName(chunk.requested)')
   expect(emission).toContain('prefillModeName(chunk.actual)')
+  // The device fact is emitted as the char[32] member itself: a string, and an
+  // empty name stays '', never null.
+  expect(emission).toContain('{"layers_device", chunk.layers_device}')
   expect(emission).toContain('res["route_chunks_truncated"] = governor_stats.route_chunks_truncated')
 })
 
@@ -115,7 +118,7 @@ test('the vendored engine declares the API, the facts, and safety before overrid
   const ext = vendored('llama-ext.h')
   expect(ext).toContain('LLAMA_API bool llama_governor_set_prefill_override(')
   const struct = block(ext, 'struct llama_governor_route_chunk {', '};')
-  ;['index', 'requested', 'actual', 'tokens', 'prefill_ms', 'forced'].forEach((field) =>
+  ;['index', 'requested', 'actual', 'tokens', 'prefill_ms', 'forced', 'layers_device'].forEach((field) =>
     expect(struct).toContain(field),
   )
   // The safety gate must come before the override consult: slice from the
@@ -168,7 +171,7 @@ test('the generated declarations carry the new surface (stale lib fails)', () =>
     const body = match[1] ?? ''
     return [...body.matchAll(/([A-Z_a-z]+)\??:/g)].map((m) => m[1] ?? '').sort()
   }
-  const expected = ['actual', 'forced', 'index', 'prefill_ms', 'requested', 'tokens']
+  const expected = ['actual', 'forced', 'index', 'layers_device', 'prefill_ms', 'requested', 'tokens']
   expect(pick(src('types.ts'), 'route_chunks')).toEqual(expected)
   expect(pick(generated('types.d.ts'), 'route_chunks')).toEqual(expected)
   expect(src('types.ts')).toContain('route_chunks_truncated?: boolean')

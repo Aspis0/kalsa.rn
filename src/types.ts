@@ -597,6 +597,10 @@ export type NativeCompletionResult = {
    * context has no governor): the pushed override mode, where the chunk
    * actually ran, its size and prefill ms, and whether an active override
    * demanded that engine (a safety/fit veto records forced=false).
+   * `layers_device` names the ggml backend device behind most of the layers of
+   * the context that ran the chunk, which is not what `actual` says: on a
+   * phone NPU prefill the route is 'gpu' while the layers live on "HTP0". It
+   * is '' when no layer device can be named.
    */
   route_chunks?: Array<{
     index: number
@@ -605,6 +609,7 @@ export type NativeCompletionResult = {
     tokens: number
     prefill_ms: number
     forced: boolean
+    layers_device: string
   }>
   /** True when the completion executed more prefill chunks than
    *  route_chunks can hold (the array is a capped prefix). */

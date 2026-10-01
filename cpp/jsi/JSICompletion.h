@@ -232,6 +232,7 @@ namespace rnllama_jsi {
                     {"tokens", chunk.tokens},
                     {"prefill_ms", chunk.prefill_ms},
                     {"forced", chunk.forced},
+                    {"layers_device", chunk.layers_device},
                 }));
             }
             res["route_chunks"] = std::move(chunks);

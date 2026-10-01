@@ -26,9 +26,10 @@
 #      manifest -- the committed binary is not the one the manifest vouches for
 #   5. a shipped skel is not a QDSP6 ELF of plausible size, or does not
 #      carry exactly one KALSA_HTP_ENGINE and one KALSA_HTP_SRC stamp with
-#      the expected values -- the identity lives inside the binary (a stamp
-#      TU scripts/htp-skels-container.sh links into every skel), so editing
-#      text or appending a stamp string cannot vouch for stale bytes
+#      the expected values -- each stamp is read from its ELF symbol
+#      (scripts/htp_elf_symbol.py resolves it through .symtab), so a string
+#      appended to old bytes cannot vouch for them; forging the symbol table
+#      is deliberate forgery, which this gate does not chase
 #
 # The manifest also carries the build provenance (SDK/tools/image versions);
 # those lines are informational and unchecked -- a gate on them could not be
@@ -36,6 +37,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPTS_DIR="$ROOT_DIR/scripts"
 MANIFEST="$ROOT_DIR/bin/arm64-v8a/HTP_SKELS"
 VERSIONS="$ROOT_DIR/vendor/VERSIONS"
 BIN_DIR="$ROOT_DIR/bin/arm64-v8a"
@@ -142,17 +144,26 @@ done <<< "$shipped"
 # and one KALSA_HTP_SRC=<64 hex> equal to the recomputed fingerprint -- a
 # second or different identity means mixed-provenance bytes.
 size_floor=$((256 * 1024))
-# check_stamp <name> <file> <regex> <prefix> <want> <what>: exactly one
-# occurrence of the stamp string, and its value must equal <want>.
+# check_stamp <name> <file> <symbol> <prefix> <want> <what>: the stamp is read
+# from the ELF symbol (<symbol> resolves through .symtab to the one string the
+# linker recorded), not from a raw byte scan -- an appended look-alike string
+# past the section bounds changes no symbol, so it cannot vouch for old bytes.
+# One raw occurrence is still required, so appending a duplicate stamp to the
+# real bytes fails too. Rewriting the ELF itself to forge a symbol is
+# deliberate forgery and out of scope for this gate.
 check_stamp() {
-  local stamps count got
-  stamps="$(grep -aoE "$3" "$2" || true)"
-  count="$(printf '%s' "$stamps" | grep -c "$4" || true)"
+  local raw count got
+  raw="$(grep -aoE "$4[0-9a-f]{40}|$4[0-9a-f]{64}" "$2" || true)"
+  count="$(printf '%s' "$raw" | grep -c "$4" || true)"
   if [ "$count" -ne 1 ]; then
     echo "assert-htp-skels: $1 carries $count $6 stamps (want exactly 1) -- rebuild through scripts/build-htp-skels.sh" >&2
     return 1
   fi
-  got="${stamps#*=}"
+  if ! got="$(python3 "$SCRIPTS_DIR/htp_elf_symbol.py" "$2" "$3" 2>&1)"; then
+    echo "assert-htp-skels: $1: $got" >&2
+    return 1
+  fi
+  got="${got#"$4"}"
   if [ "$got" != "$5" ]; then
     echo "assert-htp-skels: $1 $6 ${got:0:7} != expected ${5:0:7} -- the skel bytes predate the current sources; rebuild (scripts/build-htp-skels.sh)" >&2
     return 1
@@ -173,9 +184,9 @@ while IFS= read -r name; do
     bad_identity=$((bad_identity + 1))
     continue
   fi
-  check_stamp "$name" "$file" 'KALSA_HTP_ENGINE=[0-9a-f]{40}' 'KALSA_HTP_ENGINE=' "$pin_engine" engine \
+  check_stamp "$name" "$file" kalsa_htp_engine_stamp 'KALSA_HTP_ENGINE=' "$pin_engine" engine \
     || { bad_identity=$((bad_identity + 1)); continue; }
-  check_stamp "$name" "$file" 'KALSA_HTP_SRC=[0-9a-f]{64}' 'KALSA_HTP_SRC=' "$src_fp" source \
+  check_stamp "$name" "$file" kalsa_htp_src_stamp 'KALSA_HTP_SRC=' "$src_fp" source \
     || bad_identity=$((bad_identity + 1))
 done <<< "$shipped"
 [ "$bad_identity" -eq 0 ] \

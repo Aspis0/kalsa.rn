@@ -300,7 +300,9 @@ apply_patches() {
   for patch_file in "$dir"/*.patch; do
     [ -e "$patch_file" ] || continue
     echo "  patch: $(basename "$patch_file")"
-    patch -p1 -d "$dest" < "$patch_file"
+    # fuzz=0 on purpose: a hunk that applies only by fuzzing lands in a spot
+    # the author never checked (upstream drift must regenerate the patch).
+    patch -p1 --fuzz=0 -d "$dest" < "$patch_file"
   done
   find "$dest" \( -name '*.orig' -o -name '*.rej' \) -delete
 }

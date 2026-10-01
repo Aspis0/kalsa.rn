@@ -207,8 +207,11 @@ bool test_slot_manager_initialization() {
         params.no_kv_offload = true;
 
         if (!ctx.loadModel(params)) {
-            std::cout << "[SKIP: Model not loaded] ";
-            return true; // Skip test if model can't load
+            // Not a passable skip: the model is LFS-tracked and CI checks it
+            // out with lfs:true, so a load failure is an environment defect.
+            std::cout << "[FAIL: ../tiny-random-llama.gguf did not load - run"
+                         " git lfs install && git lfs pull]" << std::endl;
+            return false;
         }
 
         // Enable parallel mode
@@ -393,8 +396,11 @@ bool test_parallel_mode_toggle() {
         params.no_kv_offload = true;
 
         if (!ctx.loadModel(params)) {
-            std::cout << "[SKIP: Model not loaded] ";
-            return true;
+            // Not a passable skip: the model is LFS-tracked and CI checks it
+            // out with lfs:true, so a load failure is an environment defect.
+            std::cout << "[FAIL: ../tiny-random-llama.gguf did not load - run"
+                         " git lfs install && git lfs pull]" << std::endl;
+            return false;
         }
 
         // Initially not in parallel mode
@@ -432,8 +438,11 @@ bool test_multiple_slots_independence() {
         params.no_kv_offload = true;
 
         if (!ctx.loadModel(params)) {
-            std::cout << "[SKIP: Model not loaded] ";
-            return true;
+            // Not a passable skip: the model is LFS-tracked and CI checks it
+            // out with lfs:true, so a load failure is an environment defect.
+            std::cout << "[FAIL: ../tiny-random-llama.gguf did not load - run"
+                         " git lfs install && git lfs pull]" << std::endl;
+            return false;
         }
 
         ctx.enableParallelMode(3, 128);
@@ -547,8 +556,11 @@ bool test_single_request_completion() {
         params.n_predict = 5; // Generate only 5 tokens
 
         if (!ctx.loadModel(params)) {
-            std::cout << "[SKIP: Model not loaded] ";
-            return true;
+            // Not a passable skip: the model is LFS-tracked and CI checks it
+            // out with lfs:true, so a load failure is an environment defect.
+            std::cout << "[FAIL: ../tiny-random-llama.gguf did not load - run"
+                         " git lfs install && git lfs pull]" << std::endl;
+            return false;
         }
 
         // Enable parallel mode with 2 slots
@@ -644,8 +656,11 @@ bool test_request_cancellation() {
         params.n_predict = 50;
 
         if (!ctx.loadModel(params)) {
-            std::cout << "[SKIP: Model not loaded] ";
-            return true;
+            // Not a passable skip: the model is LFS-tracked and CI checks it
+            // out with lfs:true, so a load failure is an environment defect.
+            std::cout << "[FAIL: ../tiny-random-llama.gguf did not load - run"
+                         " git lfs install && git lfs pull]" << std::endl;
+            return false;
         }
 
         ctx.enableParallelMode(1, 128);
@@ -760,8 +775,11 @@ bool test_sequential_requests() {
         params.n_predict = 2;
 
         if (!ctx.loadModel(params)) {
-            std::cout << "[SKIP: Model not loaded] ";
-            return true;
+            // Not a passable skip: the model is LFS-tracked and CI checks it
+            // out with lfs:true, so a load failure is an environment defect.
+            std::cout << "[FAIL: ../tiny-random-llama.gguf did not load - run"
+                         " git lfs install && git lfs pull]" << std::endl;
+            return false;
         }
 
         ctx.enableParallelMode(1, 128); // Only 1 slot
@@ -815,8 +833,11 @@ bool test_queue_overflow() {
         params.n_predict = 2;
 
         if (!ctx.loadModel(params)) {
-            std::cout << "[SKIP: Model not loaded] ";
-            return true;
+            // Not a passable skip: the model is LFS-tracked and CI checks it
+            // out with lfs:true, so a load failure is an environment defect.
+            std::cout << "[FAIL: ../tiny-random-llama.gguf did not load - run"
+                         " git lfs install && git lfs pull]" << std::endl;
+            return false;
         }
 
         ctx.enableParallelMode(2, 128); // 2 slots
@@ -869,8 +890,11 @@ bool test_queue_request_with_state() {
         params.n_predict = 50;  // Generate many tokens
 
         if (!ctx.loadModel(params)) {
-            std::cout << "[SKIP: Model not loaded] ";
-            return true;
+            // Not a passable skip: the model is LFS-tracked and CI checks it
+            // out with lfs:true, so a load failure is an environment defect.
+            std::cout << "[FAIL: ../tiny-random-llama.gguf did not load - run"
+                         " git lfs install && git lfs pull]" << std::endl;
+            return false;
         }
 
         ctx.enableParallelMode(1, 128);
@@ -1034,8 +1058,11 @@ bool test_state_reuse() {
         params.n_predict = 5;
 
         if (!ctx.loadModel(params)) {
-            std::cout << "[SKIP: Model not loaded] ";
-            return true;
+            // Not a passable skip: the model is LFS-tracked and CI checks it
+            // out with lfs:true, so a load failure is an environment defect.
+            std::cout << "[FAIL: ../tiny-random-llama.gguf did not load - run"
+                         " git lfs install && git lfs pull]" << std::endl;
+            return false;
         }
 
         ctx.enableParallelMode(1, 128);
@@ -1168,8 +1195,11 @@ bool test_status_api_basic() {
         params.n_predict = 5;
 
         if (!ctx.loadModel(params)) {
-            std::cout << "[SKIP: Model not loaded] ";
-            return true;
+            // Not a passable skip: the model is LFS-tracked and CI checks it
+            // out with lfs:true, so a load failure is an environment defect.
+            std::cout << "[FAIL: ../tiny-random-llama.gguf did not load - run"
+                         " git lfs install && git lfs pull]" << std::endl;
+            return false;
         }
 
         ctx.enableParallelMode(2, 128);
@@ -1219,8 +1249,11 @@ bool test_status_after_queue() {
         params.n_predict = 50; // Longer to see status changes
 
         if (!ctx.loadModel(params)) {
-            std::cout << "[SKIP: Model not loaded] ";
-            return true;
+            // Not a passable skip: the model is LFS-tracked and CI checks it
+            // out with lfs:true, so a load failure is an environment defect.
+            std::cout << "[FAIL: ../tiny-random-llama.gguf did not load - run"
+                         " git lfs install && git lfs pull]" << std::endl;
+            return false;
         }
 
         ctx.enableParallelMode(2, 128);
@@ -1304,8 +1337,11 @@ bool test_status_subscription() {
         params.n_predict = 3;
 
         if (!ctx.loadModel(params)) {
-            std::cout << "[SKIP: Model not loaded] ";
-            return true;
+            // Not a passable skip: the model is LFS-tracked and CI checks it
+            // out with lfs:true, so a load failure is an environment defect.
+            std::cout << "[FAIL: ../tiny-random-llama.gguf did not load - run"
+                         " git lfs install && git lfs pull]" << std::endl;
+            return false;
         }
 
         ctx.enableParallelMode(1, 128);
@@ -1380,8 +1416,11 @@ bool test_status_unsubscribe() {
         params.n_predict = 3;
 
         if (!ctx.loadModel(params)) {
-            std::cout << "[SKIP: Model not loaded] ";
-            return true;
+            // Not a passable skip: the model is LFS-tracked and CI checks it
+            // out with lfs:true, so a load failure is an environment defect.
+            std::cout << "[FAIL: ../tiny-random-llama.gguf did not load - run"
+                         " git lfs install && git lfs pull]" << std::endl;
+            return false;
         }
 
         ctx.enableParallelMode(1, 128);
@@ -1446,8 +1485,11 @@ bool test_status_request_metrics() {
         params.n_predict = 10;
 
         if (!ctx.loadModel(params)) {
-            std::cout << "[SKIP: Model not loaded] ";
-            return true;
+            // Not a passable skip: the model is LFS-tracked and CI checks it
+            // out with lfs:true, so a load failure is an environment defect.
+            std::cout << "[FAIL: ../tiny-random-llama.gguf did not load - run"
+                         " git lfs install && git lfs pull]" << std::endl;
+            return false;
         }
 
         ctx.enableParallelMode(1, 128);

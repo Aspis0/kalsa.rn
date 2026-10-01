@@ -215,6 +215,69 @@ llama_kv_cache::llama_kv_cache(
 
                 const auto & layer_share = other->layers[it->second];
 
+                // the aliased tensors run in this context's graphs, so the
+                // scheduler must be able to keep them where they are: some
+                // backend this context will hold has to accept the tensor's
+                // buffer type for the op. That is exactly what graph reserve
+                // checks (ggml-backend.cpp ggml_backend_sched_backend_from_buffer),
+                // except there it is a hard GGML_ABORT: the Windows repro put
+                // the MTP drafter on Vulkan0 while the aliased K/V lived in a
+                // Vulkan1 buffer, and the process died at load instead of
+                // refusing. Host-visible buffers always pass: host memory is
+                // readable from any backend in place, so aliasing it cannot
+                // strand the graph. Do not read that skip as covering GPU
+                // memory - all three Metal buffer types report is_host == false.
+                // A CPU drafter over Metal-shared K/V passes anyway, because
+                // device selection does not depend on -ngl: the drafter's
+                // device list still contains the Metal device that owns the
+                // buffer, so the loop below accepts it.
+                for (const ggml_tensor * t : { layer_share.k, layer_share.v }) {
+                    if (t == nullptr || t->buffer == nullptr) {
+                        continue;
+                    }
+
+                    const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+                    if (ggml_backend_buft_is_host(buft)) {
+                        continue;
+                    }
+
+                    bool allowed = false;
+                    for (const auto & dev : model.devices) {
+                        // a meta device accepts only its own buffer type, and
+                        // only when the buft's device is a meta device wrapping
+                        // the identical device set (ggml-backend-meta.cpp
+                        // ggml_backend_meta_device_supports_buft). That is
+                        // exactly the tensor-split case: model.devices holds
+                        // the one meta device and the shared K/V buffers are
+                        // allocated from its buffer type.
+                        if (ggml_backend_dev_supports_buft(dev.dev, buft)) {
+                            allowed = true;
+                            break;
+                        }
+                    }
+
+                    if (!allowed) {
+                        std::string mine;
+                        for (const auto & dev : model.devices) {
+                            if (!mine.empty()) {
+                                mine += ", ";
+                            }
+                            mine += ggml_backend_dev_name(dev.dev);
+                        }
+                        if (mine.empty()) {
+                            mine = "CPU";
+                        }
+
+                        throw std::runtime_error(format(
+                                "cannot share KV cells: layer %d would alias the shared %s tensor, "
+                                "which lives in a %s buffer on device %s, but this context runs on %s - "
+                                "the drafter and the shared K/V must be on the same device",
+                                il, t == layer_share.k ? "K" : "V",
+                                ggml_backend_buft_name(buft),
+                                ggml_backend_dev_name(ggml_backend_buft_get_device(buft)), mine.c_str()));
+                    }
+                }
+
                 LLAMA_LOG_WARN("%s: layer %3d: sharing with layer %d. k = %p, v = %p\n", __func__, il, il_share,
                         layer_share.k->data, layer_share.v->data);
 
@@ -2146,10 +2209,16 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
     // source's when the layers were aliased by `share` (own rows otherwise,
     // which hold no sequence state worth saving)
     if (other) {
-        LLAMA_LOG_WARN("%s: shared view - skipping state write for %s; "
-                       "the shared cells are covered by the source cache's state IO "
-                       "(layer tensors are the source's when aliased)\n",
-                       __func__, state_seq_scope(seq_id).c_str());
+        if (!other->state_shared_write_warned) {
+            other->state_shared_write_warned = true;
+            LLAMA_LOG_WARN("%s: shared view - skipping state write for %s; "
+                           "the shared cells are covered by the source cache's state IO "
+                           "(layer tensors are the source's when aliased)\n",
+                           __func__, state_seq_scope(seq_id).c_str());
+        } else {
+            LLAMA_LOG_DEBUG("%s: shared view - skipping state write for %s\n",
+                            __func__, state_seq_scope(seq_id).c_str());
+        }
         return;
     }
 
@@ -2232,10 +2301,16 @@ const slot_info_vec_t *   sinfos_in) {
     // state_read restores them; this view carries nothing to restore (the
     // layer tensors are the source's when aliased, own rows otherwise)
     if (other) {
-        LLAMA_LOG_WARN("%s: shared view - skipping state read for %s; "
-                       "the shared cells are covered by the source cache's state IO "
-                       "(layer tensors are the source's when aliased)\n",
-                       __func__, state_seq_scope(seq_id).c_str());
+        if (!other->state_shared_read_warned) {
+            other->state_shared_read_warned = true;
+            LLAMA_LOG_WARN("%s: shared view - skipping state read for %s; "
+                           "the shared cells are covered by the source cache's state IO "
+                           "(layer tensors are the source's when aliased)\n",
+                           __func__, state_seq_scope(seq_id).c_str());
+        } else {
+            LLAMA_LOG_DEBUG("%s: shared view - skipping state read for %s\n",
+                            __func__, state_seq_scope(seq_id).c_str());
+        }
         return;
     }
 

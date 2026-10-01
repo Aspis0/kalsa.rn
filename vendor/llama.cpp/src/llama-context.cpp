@@ -3356,7 +3356,18 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
             LLAMA_LOG_ERROR("%s: failed to restore sequence state\n", __func__);
             return 0;
         }
-        GGML_ASSERT(nread <= state_size);
+        // the buffered file reader clamps reads at EOF, so a half-truncated
+        // file (disk full, crash mid-write) yields a short state instead of a
+        // thrown read error; refuse it through the API's error path (0, which
+        // the server turns into a 400) rather than aborting the process
+        if (nread > state_size) {
+            LLAMA_LOG_ERROR("%s: truncated sequence state file: state size %zu, read %zu\n", __func__, state_size, nread);
+            // the failed read already restored the cell metadata, so the
+            // sequence holds a half-restored state here; drop it like the
+            // other failed-restore paths leave the sequence empty
+            memory->seq_rm(seq_id, -1, -1);
+            return 0;
+        }
         GGML_ASSERT(nread + sizeof(uint32_t) * 3 + sizeof(llama_token) * *n_token_count_out == file.tell());
     }
 
@@ -3439,7 +3450,16 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     if (memory) {
-        memory->state_read(io, seq_id, flags);
+        try {
+            memory->state_read(io, seq_id, flags);
+        } catch (...) {
+            // multi-cache memories (msa, iswa, hybrid) restore their caches one
+            // after another and only the failing cache undoes itself, so a cache
+            // restored before the throw stays behind; a failed seq restore must
+            // leave the target sequence empty, like the other failure paths do
+            memory->seq_rm(seq_id, -1, -1);
+            throw;
+        }
     }
 
     return io.n_bytes();

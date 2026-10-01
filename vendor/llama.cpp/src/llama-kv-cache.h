@@ -318,6 +318,12 @@ private:
     // TODO: temporary until we refactor to be able to share the same cells between 2 kv caches [TAG_KV_CACHE_SHARE_CELLS]
     llama_kv_cache * other;
 
+    // a shared view has nothing of its own in the state IO, so it only notes
+    // the skip once per source cache and direction (there is one view per
+    // aliased layer group, which warned 12-18x per save/restore otherwise)
+    mutable bool state_shared_write_warned = false;
+    mutable bool state_shared_read_warned  = false;
+
     std::shared_ptr<llama_kv_cells_vec> v_cells_impl;
 
     llama_kv_cells_vec & v_cells;

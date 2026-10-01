@@ -339,6 +339,16 @@ struct llama_governor_route_chunk {
     // override - the safety verdict did not preempt it and, for GPU, the
     // gpu_fit==Fit gate allowed it. LOWBAT+cpu and NotFit+gpu are false.
     bool forced = false;
+    // ggml backend device name of the device that holds most of the layers of
+    // the model behind the context that ran the chunk ("HTP0", "GPUOpenCL",
+    // "CPU"). `actual` names the ROUTE, and a phone NPU load labels the route
+    // GPU while Hexagon runs the matmuls, so consumers that need the device
+    // read this. With the KV cache not offloaded (offload_kqv false, the NPU
+    // prefill lane's no_kv_offload) the graph pins the nodes between the KV
+    // store and the attention output to the CPU (llama-graph.cpp), so those
+    // attention nodes do not run on this device. Fixed capacity,
+    // NUL-terminated; longer names are truncated.
+    char layers_device[32] = "";
 };
 
 /**

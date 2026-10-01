@@ -1,6 +1,7 @@
 #include "llama-governor.h"
 
 #include "llama-context.h"
+#include "llama-governor-device.h"
 #include "llama-kv-commit.h"
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -9,6 +10,24 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <string>
+#include <vector>
+
+// The device that holds most of the context model's repeating layers, i.e. the
+// one the bulk of a chunk's matmuls run on. This is not dev_output(): that is
+// the output layer's device, which under partial offload or a multi-device
+// split is not where the bulk of the layers live. dev_layer() is sized to
+// n_layer_all, so a zero-layer model contributes no names instead of throwing.
+// Resolved once per context at construction; decode_impl copies the cached name.
+static std::string context_layers_device(llama_context * ctx) {
+    const llama_model & model = ctx->get_model();
+    std::vector<std::string> layer_devices;
+    layer_devices.reserve(model.hparams.n_layer_all);
+    for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
+        layer_devices.emplace_back(ggml_backend_dev_name(model.dev_layer(static_cast<int>(il))));
+    }
+    return llama_governor_majority_device(layer_devices);
+}
 
 llama_governor::llama_governor(llama_model * model_prefill, llama_model * model_decode,
                                llama_context_params params_prefill, llama_context_params params_decode)
@@ -52,6 +71,8 @@ llama_governor::llama_governor(llama_model * model_prefill, llama_model * model_
         ctx_prefill = nullptr;
         throw std::runtime_error("governor contexts have incompatible KV routes");
     }
+    prefill_layers_device_ = context_layers_device(ctx_prefill);
+    decode_layers_device_ = context_layers_device(ctx_decode);
     stats_.npu_fit = policy_.npu_fit();
     stats_.prefill_token_cap = policy_.prefill_token_cap();
     stats_.expert_substitution_lambda = governor_params.expert_substitution_lambda;
@@ -349,6 +370,11 @@ int32_t llama_governor::decode_impl(llama_batch batch, bool allow_chunking) {
             // Causal: true only when prefill_engine() took the override
             // branch (no safety preemption, Fit gate passed for GPU).
             chunk.forced = turn_override_decided_;
+            // The CPU route runs on ctx_decode, so the device fact follows the
+            // context that executed the chunk, not `actual`.
+            std::snprintf(chunk.layers_device, sizeof(chunk.layers_device), "%s",
+                          cpu_prefill ? decode_layers_device_.c_str()
+                                      : prefill_layers_device_.c_str());
             ++stats_.route_chunk_count;
         } else {
             stats_.route_chunks_truncated = true;

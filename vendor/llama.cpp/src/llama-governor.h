@@ -93,6 +93,12 @@ private:
     llama_context * ctx_prefill = nullptr;
     llama_context * ctx_decode = nullptr;
     llama_context * last_ctx = nullptr;
+    // Backend device name of the device holding most of each context model's
+    // repeating layers, resolved once in the constructor (llama-governor.cpp):
+    // the route facts copy one of these per prefill chunk instead of counting
+    // layers on the decode path.
+    std::string prefill_layers_device_;
+    std::string decode_layers_device_;
     side_state prefill_state;
     side_state decode_state;
     llama_governor_policy policy_;

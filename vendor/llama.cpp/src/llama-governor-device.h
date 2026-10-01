@@ -2,6 +2,9 @@
 
 #include "ggml-backend.h"
 
+#include <string>
+#include <vector>
+
 /**
  * Resolution of the HTP prefill device for the governor's NPU lane.
  *
@@ -35,3 +38,16 @@ struct llama_governor_prefill_device {
  * load step.
  */
 llama_governor_prefill_device llama_governor_resolve_prefill_device();
+
+/**
+ * The device that holds the most of a model's repeating layers, from the
+ * per-layer device names in layer order. A tie goes to the device of the
+ * higher layer index; an empty list gives an empty name. Pure over names, so
+ * the rule is testable without a model or a backend registry.
+ *
+ * This is deliberately NOT the output layer's device (llama_model::dev_output):
+ * under partial offload or a multi-device split the output layer sits on
+ * another device than the bulk of the layers, and with the KV cache not
+ * offloaded the attention between the KV store and its output runs on the CPU.
+ */
+std::string llama_governor_majority_device(const std::vector<std::string> & layer_devices);

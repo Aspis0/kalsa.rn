@@ -113,7 +113,12 @@ llama_kv_cache::llama_kv_cache(
         if (n_pad != other->n_pad || n_swa != other->n_swa || swa_type != other->swa_type || v_trans != other->v_trans) {
             throw std::runtime_error("cannot share KV cells with an incompatible cache layout");
         }
-        if (hparams.n_layer_all != other->hparams.n_layer_all) {
+        // Equal counts is the unmapped case. A share callback maps each of this
+        // cache's layers onto one of the source's (gemma4 assistant: its
+        // n_layer_nextn blocks onto the target's last two), so the counts
+        // legitimately differ there; the mapping itself is resolved when the
+        // shared layers are wired, below.
+        if (!share && hparams.n_layer_all != other->hparams.n_layer_all) {
             throw std::runtime_error("cannot share KV cells with a different layer count");
         }
     }
@@ -200,7 +205,15 @@ llama_kv_cache::llama_kv_cache(
             const int32_t il_share = share(il);
 
             if (il_share >= 0) {
-                const auto & layer_share = other->layers[other->map_layer_ids[il_share]];
+                // operator[] on an unmapped id would silently insert 0 and wire
+                // this layer onto the source's layer 0, so look it up and fail
+                // loudly instead
+                const auto it = other->map_layer_ids.find(il_share);
+                if (il_share >= (int32_t) other->hparams.n_layer_all || it == other->map_layer_ids.end()) {
+                    throw std::runtime_error(format("cannot share KV cells: layer %d is not in the source cache", il_share));
+                }
+
+                const auto & layer_share = other->layers[it->second];
 
                 LLAMA_LOG_WARN("%s: layer %3d: sharing with layer %d. k = %p, v = %p\n", __func__, il, il_share,
                         layer_share.k->data, layer_share.v->data);
@@ -391,10 +404,9 @@ llama_kv_cache::llama_kv_cache(
 
 void llama_kv_cache::clear(bool data) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
-    if (other) {
-        LLAMA_LOG_ERROR("%s: clear is not allowed from a shared KV cache\n", __func__);
-        return;
-    }
+    // a shared view holds the source cache's cells, so this clears the one cell
+    // store both caches see; zeroing ctxs_bufs only touches this cache's own
+    // tensors
 
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
@@ -410,9 +422,11 @@ void llama_kv_cache::clear(bool data) {
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    // the cells are the source cache's object, so its seq_rm already removed
+    // them from this view; running the removal here again would scan the same
+    // cells a second time to free nothing
     if (other) {
-        LLAMA_LOG_ERROR("%s: sequence removal is not allowed from a shared KV cache\n", __func__);
-        return false;
+        return true;
     }
 
     // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
@@ -481,7 +495,6 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
-        LLAMA_LOG_ERROR("%s: sequence copy is not allowed from a shared KV cache\n", __func__);
         return;
     }
 
@@ -574,7 +587,6 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
-        LLAMA_LOG_ERROR("%s: sequence keep is not allowed from a shared KV cache\n", __func__);
         return;
     }
 
@@ -601,8 +613,11 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    // shifting cells is the source cache's job: it owns the rope-shift graph
+    // over the K tensors, and the shared cells carry the shifted positions to
+    // this view; shifting again here would move them twice
     if (other) {
-        GGML_ABORT("sequence shifting is not allowed from a shared KV cache");
+        return;
     }
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
@@ -652,7 +667,6 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
-        LLAMA_LOG_ERROR("%s: sequence division is not allowed from a shared KV cache\n", __func__);
         return;
     }
 
@@ -753,12 +767,6 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
             bool embd_all) {
     GGML_UNUSED(embd_all);
 
-    // TODO [TAG_KV_CACHE_SHARE_CELLS]: step 3/4's commit primitive will lift this fence.
-    if (other) {
-        LLAMA_LOG_ERROR("%s: decode is not allowed from a shared KV cache\n", __func__);
-        return std::make_unique<llama_kv_cache_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
-    }
-
     do {
         balloc.split_reset();
 
@@ -799,22 +807,14 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 
     bool do_shift = get_has_shift();
 
-    if (other && (do_shift || !sc_info.empty())) {
-        LLAMA_LOG_ERROR("%s: memory update is not allowed from a shared KV cache\n", __func__);
-        return std::make_unique<llama_kv_cache_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
-    }
-
+    // any do_shift seen here is a no-op: update() skips the shift and
+    // stream-copy graphs for a shared view — the source cache owns the K
+    // tensors and runs them once, on the tensors this cache reads
     return std::make_unique<llama_kv_cache_context>(this, lctx, do_shift, std::move(sc_info));
 }
 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
     llama_kv_cache::slot_info_vec_t res;
-
-    // TODO [TAG_KV_CACHE_SHARE_CELLS]: step 3/4's commit primitive will lift this fence.
-    if (other) {
-        LLAMA_LOG_ERROR("%s: decode is not allowed from a shared KV cache\n", __func__);
-        return {};
-    }
 
     struct state_t {
         slot_info sinfo; // slot info for the ubatch
@@ -881,11 +881,10 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
 bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    // shift and stream-copy run on the source cache's K tensors only — this
+    // view has no tensors of its own when its layers are shared, and rerunning
+    // the graphs here would shift the shared tensors twice
     if (other) {
-        if (do_shift || !sc_info.empty()) {
-            LLAMA_LOG_ERROR("%s: memory update is not allowed from a shared KV cache\n", __func__);
-            return false;
-        }
         return true;
     }
 
@@ -965,14 +964,12 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 }
 
 llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {
-    const auto & heads = other ? other->v_heads : v_heads;
-
     if (debug > 0) {
         for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
             const auto seq_id = ubatch.seq_id_unq[s];
             const auto stream_id = seq_to_stream[seq_id];
             const auto & cells = v_cells[stream_id];
-            const uint32_t head_cur = heads[stream_id];
+            const uint32_t head_cur = v_heads[stream_id];
 
             LLAMA_LOG_DEBUG("%s: stream[%d], n = %5d, used = %5d, head = %5d, size = %5d, n_swa = %5d\n",
                     __func__, stream_id, cells.used_max_p1(), cells.get_used(), head_cur, get_size(), n_swa);
@@ -1068,7 +1065,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         const auto & cells = v_cells[seq_to_stream[seq_id]];
 
-        uint32_t head_cur = heads[seq_to_stream[seq_id]];
+        uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
 
         // if we have enough unused cells before the current head ->
         //   better to start searching from the beginning of the cache, hoping to fill it
@@ -1166,8 +1163,10 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    // cell bookkeeping for a shared view happened when the source cache placed
+    // its ubatch: this view's decode only picks free cells (find_slot) and
+    // writes K/V through the shared layers
     if (other) {
-        LLAMA_LOG_ERROR("%s: decode is not allowed from a shared KV cache\n", __func__);
         return;
     }
 
@@ -1273,6 +1272,10 @@ uint32_t llama_kv_cache::get_size() const {
     return cells.size();
 }
 
+uint32_t llama_kv_cache::get_n_seq_max() const {
+    return n_seq_max;
+}
+
 uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }
@@ -1316,6 +1319,12 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     return v_cells[seq_to_stream[seq_id]];
+}
+
+uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    return seq_to_stream[seq_id];
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
@@ -1483,6 +1492,7 @@ ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama
     ggml_tensor * k_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
 
     ggml_set_input(k_idxs);
+    ggml_set_name(k_idxs, "attn_inp_k_idxs");
 
     return k_idxs;
 }
@@ -1499,6 +1509,7 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
     }
 
     ggml_set_input(v_idxs);
+    ggml_set_name(v_idxs, "attn_inp_v_idxs");
 
     return v_idxs;
 }
@@ -2121,10 +2132,25 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
     return gf;
 }
 
+// seq_id -1 is the internal "whole context" wildcard (state_write_data passes
+// the default straight through); printed raw it reads as a negative sequence
+// id and sends the reader hunting for a bug that is not there
+static std::string state_seq_scope(llama_seq_id seq_id) {
+    return seq_id >= 0 ? format("seq_id=%d", seq_id) : std::string("all sequences");
+}
+
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    // nothing here belongs to this view: the cells are the source cache's
+    // object and its state_write covers them; the layer tensors are the
+    // source's when the layers were aliased by `share` (own rows otherwise,
+    // which hold no sequence state worth saving)
     if (other) {
-        throw std::runtime_error("state IO is not supported on a shared KV cache");
+        LLAMA_LOG_WARN("%s: shared view - skipping state write for %s; "
+                       "the shared cells are covered by the source cache's state IO "
+                       "(layer tensors are the source's when aliased)\n",
+                       __func__, state_seq_scope(seq_id).c_str());
+        return;
     }
 
     GGML_UNUSED(flags);
@@ -2202,8 +2228,15 @@ void llama_kv_cache::state_read_sinfo(
       slot_info_vec_t *   sinfos_out,
 const slot_info_vec_t *   sinfos_in) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    // mirror of state_write: the cells belong to the source cache and its
+    // state_read restores them; this view carries nothing to restore (the
+    // layer tensors are the source's when aliased, own rows otherwise)
     if (other) {
-        throw std::runtime_error("state IO is not supported on a shared KV cache");
+        LLAMA_LOG_WARN("%s: shared view - skipping state read for %s; "
+                       "the shared cells are covered by the source cache's state IO "
+                       "(layer tensors are the source's when aliased)\n",
+                       __func__, state_seq_scope(seq_id).c_str());
+        return;
     }
 
     GGML_UNUSED(flags);
@@ -2257,11 +2290,7 @@ const slot_info_vec_t *   sinfos_in) {
         }
 
         if (!res) {
-            if (seq_id == -1) {
-                clear(true);
-            } else {
-                seq_rm(seq_id, -1, -1);
-            }
+            state_clear(seq_id, strm, sinfo);
             throw std::runtime_error("failed to restore kv cache");
         }
 
@@ -2409,6 +2438,11 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
     if (dest_seq_id != -1) {
         // single sequence
+        if (cell_count > cells.size()) {
+            LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
+            return false;
+        }
+
         seq_rm(dest_seq_id, -1, -1);
 
         llama_batch_allocr balloc(hparams.n_pos_per_embd());
@@ -2730,6 +2764,112 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
     }
 
     return true;
+}
+
+void llama_kv_cache::state_clear(llama_seq_id seq_id) {
+    if (seq_id == -1) {
+        clear(true);
+        return;
+    }
+
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    const uint32_t strm = seq_to_stream[seq_id];
+
+    const auto & cells = v_cells[strm];
+
+    slot_info sinfo;
+    sinfo.s0 = strm;
+    sinfo.s1 = strm;
+    sinfo.resize(1);
+    sinfo.strm[0] = strm;
+
+    // a cell that another sequence still uses keeps its data
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.seq_has(i, seq_id) && cells.seq_count(i) == 1) {
+            sinfo.idxs[0].push_back(i);
+        }
+    }
+
+    state_clear(seq_id, strm, sinfo);
+}
+
+// the cleared ranges mirror the write pattern of state_read_data() - keep both in sync
+void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo) {
+    if (seq_id == -1) {
+        clear(true);
+        return;
+    }
+
+    seq_rm(seq_id, -1, -1);
+
+    // zero the K/V data of the failed restore attempt - the attention can still read the data of free cells
+    if (sinfo.empty() || sinfo.size() == 0) {
+        return;
+    }
+
+    const auto & cells = v_cells[strm];
+
+    const uint32_t cell_count = sinfo.size();
+
+    const bool is_contiguous = sinfo.is_contiguous();
+
+    for (const auto & layer : layers) {
+        const uint32_t il = layer.il;
+
+        const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+
+        auto * k = layer.k_stream[strm];
+
+        const size_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
+
+        if (is_contiguous) {
+            llama_clear_tensor_data(k, sinfo.head() * k_size_row, cell_count * k_size_row);
+        } else {
+            for (uint32_t i = 0; i < cell_count; ++i) {
+                llama_clear_tensor_data(k, sinfo.idxs[0][i] * k_size_row, k_size_row);
+            }
+        }
+    }
+
+    for (const auto & layer : layers) {
+        const uint32_t il = layer.il;
+
+        const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
+
+        auto * v = layer.v_stream[strm];
+        if (!v) {
+            continue;
+        }
+
+        if (!v_trans) {
+            const size_t v_size_row = ggml_row_size(v->type, n_embd_v_gqa);
+
+            if (is_contiguous) {
+                llama_clear_tensor_data(v, sinfo.head() * v_size_row, cell_count * v_size_row);
+            } else {
+                for (uint32_t i = 0; i < cell_count; ++i) {
+                    llama_clear_tensor_data(v, sinfo.idxs[0][i] * v_size_row, v_size_row);
+                }
+            }
+        } else {
+            const size_t v_size_el = ggml_type_size(v->type);
+
+            if (is_contiguous) {
+                const uint32_t h = sinfo.head();
+
+                for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+                    llama_clear_tensor_data(v, (h + j * cells.size()) * v_size_el, cell_count * v_size_el);
+                }
+            } else {
+                for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+                    for (uint32_t i = 0; i < cell_count; ++i) {
+                        llama_clear_tensor_data(v, (sinfo.idxs[0][i] + j * cells.size()) * v_size_el, v_size_el);
+                    }
+                }
+            }
+        }
+    }
 }
 
 //

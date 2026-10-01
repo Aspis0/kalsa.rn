@@ -451,7 +451,14 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 op->type != GGML_TYPE_IQ1_S   &&
                 op->type != GGML_TYPE_IQ1_M; // missing type_traits.from_float
         case GGML_OP_MUL_MAT:
-            return src1->type == GGML_TYPE_F32 || src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type;
+            if (ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+                src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) {
+                return src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16;
+            }
+            // BF16 in src1 is widened into the F32 work buffer
+            return src1->type == GGML_TYPE_F32 ||
+                   src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type ||
+                   (src1->type == GGML_TYPE_BF16 && ggml_get_type_traits_cpu(src0->type)->vec_dot_type == GGML_TYPE_F32);
         case GGML_OP_SOFT_MAX_BACK: {
             if (op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32) {
                 return false;
@@ -671,6 +678,13 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_cpu_set_use_ref") == 0) {
         return (void *)ggml_backend_cpu_set_use_ref;
+    }
+    // fork-only: expert-ready hook registration for out-of-band expert
+    // streaming. Resolved through the registry by libllama (bmoe), never
+    // linked directly: under GGML_BACKEND_DL this backend is a loadable
+    // module and its symbols are not visible to the linker.
+    if (strcmp(name, "ggml_cpu_set_expert_ready_hook") == 0) {
+        return (void *)ggml_cpu_set_expert_ready_hook;
     }
 
     // threadpool - TODO:  move to ggml-base

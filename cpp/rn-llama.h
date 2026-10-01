@@ -167,6 +167,10 @@ struct llama_rn_context {
         const governor_load_options & load_options = governor_load_options{});
     llama_context * active_ctx() const;
     int32_t decode(llama_batch batch);
+    // Ext-batch form for the common_batch wrapper (speculative/MTP). The
+    // governor refuses speculative modes at load, so this never runs with a
+    // governor attached - llama_governor_decode has no ext entry point.
+    int32_t decode(llama_batch_ext * batch);
     // The flow-control pause of the LAST decode() call, or nullptr when that
     // call was not one: "thermal" (prefill refused under the thermal ceiling),
     // "profile" (prefill/decode waiting for a valid thermal profile),

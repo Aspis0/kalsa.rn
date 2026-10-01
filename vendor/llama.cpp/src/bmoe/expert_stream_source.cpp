@@ -2,7 +2,6 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
-#include "ggml-cpu.h" // ggml_cpu_set_expert_ready_hook (fork-only)
 
 #include <algorithm>
 #include <chrono>
@@ -1381,9 +1380,45 @@ void ExpertStreamSource::on_expert_ready(const ggml_tensor * src0, int expert) {
     stall_ns_.fetch_add((long long) std::chrono::duration_cast<std::chrono::nanoseconds>(clock_t_::now() - t0).count());
 }
 
-void ExpertStreamSource::enable_overlap_hook() {
-    ggml_cpu_set_expert_ready_hook(&ExpertStreamSource::c_expert_ready, this);
+bool ExpertStreamSource::enable_overlap_hook() {
+    // Already installed: rescanning would replace hook_setters_ and forget the
+    // modules the first call installed on, which shutdown would then leave
+    // registered.
+    if (hook_registered_) {
+        return true;
+    }
+    // Resolve the hook setter through the backend registry, the way llama.cpp
+    // resolves backend-specific functions it cannot link (ggml_backend_set_n_threads,
+    // src/llama-context.cpp:360-369). Every registered backend is asked, not just
+    // ggml_backend_reg_by_name("CPU"): with GGML_CPU_ALL_VARIANTS under
+    // GGML_BACKEND_DL each CPU variant is its own module with its own copy of
+    // the process-global hook, and which of them the loader registers (and
+    // then computes on) is decided by ggml_backend_score at load time and
+    // varies with the host. Installing wherever the proc exists covers
+    // whichever module ends up computing; modules that never compute simply
+    // never fire it.
+    hook_setters_.clear();
+    const size_t n_reg = ggml_backend_reg_count();
+    for (size_t i = 0; i < n_reg; ++i) {
+        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+        if (reg == nullptr) continue;
+        auto setter = (set_expert_ready_hook_fn) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_set_expert_ready_hook");
+        if (setter == nullptr) continue;
+        setter(&ExpertStreamSource::c_expert_ready, this);
+        hook_setters_.push_back(setter);
+    }
+    if (hook_setters_.empty()) {
+        // No CPU backend, or one built without the fork hook. Without the hook the
+        // CPU matmul would read experts that are not resident yet, so the caller
+        // must keep the serial, non-overlap behaviour; we log once and say so.
+        if (!hook_absent_logged_) {
+            std::fprintf(stderr, "bmoe: no CPU backend provides the expert-ready hook; overlap mode is unavailable\n");
+            hook_absent_logged_ = true;
+        }
+        return false;
+    }
     hook_registered_ = true;
+    return true;
 }
 
 IExpertSource::Stats ExpertStreamSource::stats() const {
@@ -1421,9 +1456,11 @@ IExpertSource::Stats ExpertStreamSource::stats() const {
 void ExpertStreamSource::shutdown() {
     if (!active_) return;
     // Unregister the process-global hook FIRST: after this no compute thread can enter
-    // on_expert_ready and touch members we are about to tear down.
+    // on_expert_ready and touch members we are about to tear down. One unregister per
+    // module the hook was installed on (see enable_overlap_hook).
     if (hook_registered_) {
-        ggml_cpu_set_expert_ready_hook(nullptr, nullptr);
+        for (auto setter : hook_setters_) setter(nullptr, nullptr);
+        hook_setters_.clear();
         hook_registered_ = false;
     }
     // Wake any straggler blocked on a readiness flag so it observes fatal_ and unwinds.

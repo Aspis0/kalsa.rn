@@ -80,8 +80,9 @@ LLAMA_CPP_PATHS=(
   ggml/src/ggml-cpu/ggml-cpu.cpp
   ggml/src/ggml-cpu/hbm.cpp
   ggml/src/ggml-cpu/hbm.h
-  ggml/src/ggml-cpu/iqp.cpp
-  ggml/src/ggml-cpu/iqp.h
+  # Upstream replaced the iqp panel-gemm files with the tiled kernels
+  # (ggml-cpu.c includes "tiled/tiled.h").
+  ggml/src/ggml-cpu/tiled
   ggml/src/ggml-cpu/ops.cpp
   ggml/src/ggml-cpu/ops.h
   ggml/src/ggml-cpu/quants.c

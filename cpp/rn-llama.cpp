@@ -780,6 +780,13 @@ int32_t llama_rn_context::decode(llama_batch batch) {
     return result;
 }
 
+int32_t llama_rn_context::decode(llama_batch_ext * batch) {
+    // The ext form arrives only from the speculative/MTP paths (common_batch),
+    // which governor mode refuses at load. Raw rc: the caller throws its own
+    // error with the batch context in it.
+    return llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch);
+}
+
 bool llama_rn_context::hasGovernor() const {
     return governor != nullptr;
 }

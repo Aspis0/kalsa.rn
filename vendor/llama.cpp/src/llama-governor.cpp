@@ -191,6 +191,11 @@ bool llama_governor::trim_sequence(llama_pos p) {
     bool untrimmable[2] = { false, false };
     for (int i = 0; i < 2; ++i) {
         llama_memory_t mem = llama_get_memory(sides[i].ctx);
+        // WHY pos_max decides here and not seq_rm's return value: for a shared
+        // KV view seq_rm answers true without removing anything (the shared
+        // early return in llama-kv-cache.cpp:427), so a "true" there never means
+        // "trimmed". The trap is unreachable today: the governor ctor refuses
+        // ctx_other, so a governor context is never a shared view.
         llama_memory_seq_rm(mem, 0, p, -1);
         const llama_pos pos_max = llama_memory_seq_pos_max(mem, 0);
         if (pos_max != -1 && pos_max >= p) {

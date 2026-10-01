@@ -52,6 +52,14 @@ struct LayerExperts {
     ExpertTensorRef proj[MoeRecipe::max_exps];
 };
 
+// The fork-only CPU expert-ready hook, resolved through the backend registry instead of
+// linked: under GGML_BACKEND_DL the CPU backend is a loadable module (one module per
+// variant with GGML_CPU_ALL_VARIANTS), so libllama cannot reference its symbols
+// directly. The signatures must match ggml/include/ggml-cpu.h, which stays internal
+// to ggml.
+using expert_ready_hook_fn     = void (*)(const struct ggml_tensor * src0, int expert, void * user_data);
+using set_expert_ready_hook_fn = void (*)(expert_ready_hook_fn hook, void * user_data);
+
 class ExpertStreamSource final : public IExpertSource {
 public:
     ExpertStreamSource() = default;
@@ -84,9 +92,12 @@ public:
     Stats stats() const override;
 
     // Register the process-global expert-ready hook so the CPU matmul blocks per expert
-    // until its slice is resident. Only meaningful in overlap mode; a no-op if the fork
-    // hook was not compiled in. Paired with shutdown(), which unregisters it.
-    void enable_overlap_hook();
+    // until its slice is resident. Only meaningful in overlap mode. The setter is
+    // resolved through the backend registry, so this links under GGML_BACKEND_DL and is
+    // a no-op returning false on a build whose CPU backend does not provide the hook;
+    // the caller must then keep the serial, non-overlap behaviour. Paired with
+    // shutdown(), which unregisters it.
+    bool enable_overlap_hook();
 
     // True once an async read has failed or the source is shutting down. Wired to
     // llama_set_abort_callback so a mid-decode I/O failure aborts the graph cleanly
@@ -340,6 +351,10 @@ private:
     std::vector<std::pair<const void *, uint32_t>> texp_;
     std::vector<int> staged_; // per-load sorted unique expert scratch
     bool hook_registered_ = false;
+    bool hook_absent_logged_ = false; // the hook-unavailable log fires once per source
+    // The setter(s) the hook was installed through, one per CPU backend module
+    // that provided it, so shutdown unregisters exactly where it registered.
+    std::vector<set_expert_ready_hook_fn> hook_setters_;
 };
 
 } // namespace bmoe

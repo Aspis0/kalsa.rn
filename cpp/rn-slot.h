@@ -121,8 +121,9 @@ struct llama_rn_slot {
     // Set when the draft's KV refuses seq_rm (shared with the target): the
     // rollback is advisory, so we stop asking instead of logging per refill.
     bool draft_rollback_fenced = false;
-    llama_batch spec_batch = {};
-    bool spec_batch_initialized = false;
+    // The common_batch wrapper owns the ext batch the new speculative API
+    // consumes; the legacy llama_batch form is gone from common/.
+    common_batch spec_batch;
     llama_tokens spec_prompt;
     llama_token spec_id_last = LLAMA_TOKEN_NULL;
     llama_pos spec_n_past = 0;
@@ -180,6 +181,12 @@ struct llama_rn_slot {
 
     // Destructor
     ~llama_rn_slot();
+
+    // Movable for the slot manager's vector::resize: the destructor suppresses
+    // the implicit move, and common_batch (unique_ptr member) suppresses the
+    // copy the resize would otherwise fall back to.
+    llama_rn_slot(llama_rn_slot &&) = default;
+    llama_rn_slot & operator=(llama_rn_slot &&) = default;
 
     // Methods
     void reset();                          // Reset to IDLE state

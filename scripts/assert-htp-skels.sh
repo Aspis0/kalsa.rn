@@ -18,6 +18,12 @@
 #   3. a shipped libggml-htp-*.so has no manifest entry, is listed but
 #      absent, or its sha256 differs from the manifest -- the committed
 #      binary is not the one the manifest vouches for
+#   4. a shipped skel is not a QDSP6 ELF of plausible size, or does not
+#      carry exactly one KALSA_HTP_ENGINE=<LLAMA_CPP_COMMIT> string -- the
+#      identity lives in the binary itself (scripts/htp-skels-container.sh
+#      links a generated stamp TU into every skel), so no text edit can
+#      vouch for a stale skel: only a rebuild through the committed recipe
+#      can satisfy this leg
 #
 # The manifest also carries the build provenance (SDK/tools/image versions);
 # those lines are informational and unchecked -- a gate on them could not be
@@ -92,4 +98,42 @@ done <<< "$shipped"
 [ "$mismatches" -eq 0 ] \
   || fail "$mismatches skel file(s) do not match HTP_SKELS -- the shipped binary is not the one the manifest vouches for"
 
-echo "assert-htp-skels: ok (engine ${manifest_engine:0:7}, $(printf '%s\n' "$shipped" | wc -l | tr -d ' ') skels match the manifest)"
+# (c) each shipped skel must BE a Hexagon DSP skel and must name its engine.
+# Header: ELF magic, 32-bit little-endian, e_machine = 164 (EM_QDSP6), bytes
+# 0..19 via od; size floor 256 KB (real skels are ~0.9 MB, and the failure
+# this catches is a placeholder/garbage file far below it). Stamp: exactly
+# one KALSA_HTP_ENGINE=<40 hex> string, equal to the pin -- a second or
+# different engine sha means mixed-provenance bytes.
+size_floor=$((256 * 1024))
+bad_identity=0
+while IFS= read -r name; do
+  file="$BIN_DIR/$name"
+  if [ "$(wc -c < "$file")" -lt "$size_floor" ] \
+    || ! od -An -tu1 -v -N20 "$file" | awk '{
+        for (i = 1; i <= NF; i++) { n++; b[n] = $i }
+      }
+      END {
+        exit (b[1] == 127 && b[2] == 69 && b[3] == 76 && b[4] == 70 &&
+              b[5] == 1 && b[6] == 1 && b[19] == 164 && b[20] == 0) ? 0 : 1
+      }'; then
+    echo "assert-htp-skels: $name is not a QDSP6 ELF of plausible size" >&2
+    bad_identity=$((bad_identity + 1))
+    continue
+  fi
+  stamps="$(grep -aoE 'KALSA_HTP_ENGINE=[0-9a-f]{40}' "$file" || true)"
+  count="$(printf '%s' "$stamps" | grep -c 'KALSA_HTP_ENGINE=' || true)"
+  if [ "$count" -ne 1 ]; then
+    echo "assert-htp-skels: $name carries $count KALSA_HTP_ENGINE stamps (want exactly 1) -- rebuild through scripts/build-htp-skels.sh" >&2
+    bad_identity=$((bad_identity + 1))
+    continue
+  fi
+  skel_engine="${stamps#KALSA_HTP_ENGINE=}"
+  if [ "$skel_engine" != "$pin_engine" ]; then
+    echo "assert-htp-skels: $name engine sha ${skel_engine:0:7} != vendored engine sha ${pin_engine:0:7} -- the skel bytes predate the pin; rebuild (scripts/build-htp-skels.sh)" >&2
+    bad_identity=$((bad_identity + 1))
+  fi
+done <<< "$shipped"
+[ "$bad_identity" -eq 0 ] \
+  || fail "$bad_identity skel file(s) fail the binary identity check"
+
+echo "assert-htp-skels: ok (engine ${manifest_engine:0:7}, $(printf '%s\n' "$shipped" | wc -l | tr -d ' ') skels match the manifest, each names its engine)"

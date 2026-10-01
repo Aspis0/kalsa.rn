@@ -77,6 +77,7 @@ docker run --rm --platform "$PLATFORM" \
   -v "$WORK/src.tar:/kalsa/src.tar:ro" \
   -v "$ROOT_DIR/scripts/htp-skels-container.sh:/kalsa/build-inner.sh:ro" \
   -v "$WORK/out:/artifacts" \
+  -e "KALSA_HTP_ENGINE_SHA=$ENGINE_SHA" \
   "$IMAGE" \
   bash /kalsa/build-inner.sh
 

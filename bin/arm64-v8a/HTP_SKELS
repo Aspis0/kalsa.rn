@@ -13,10 +13,10 @@
 
 ENGINE_COMMIT=61c9094811cb200fd475491f18f594fbde77634b
 
-libggml-htp-v73.so=2369e1f76fbd234b888b469f4b0e150067cb38620c94e2589ecd49380116b4b3
-libggml-htp-v75.so=ecf14ed106749af8634112f7453ec65d67089089819a568b5a2b3bf592727331
-libggml-htp-v79.so=daa166a66517eb4e4faf1fde592238fc355a438128e65a1e47fbc112796146f6
-libggml-htp-v81.so=df92e54aeced1d1788381036f8764bdadae4a88f1343a787cb6e8a25ce249a01
+libggml-htp-v73.so=9a3b17d7bb510c0e0f5819fea98b71b7e50070badf893e28ac1dd34889a3d015
+libggml-htp-v75.so=21d5faa3ae77cacde5a13cbd66e2f6b9ae0554234e4f834f86602e60c43b03b3
+libggml-htp-v79.so=225ce49a0b52a8256d7abdc96337cce44aa30afb4ab35a79275735d16c7a954b
+libggml-htp-v81.so=10b7f9dffb021cc40360a5d8d1a8ffb5daaf1f382add912cf080522a85e47b80
 
 # Build provenance (informational; the gate checks the two blocks above and,
 # inside each .so, the identity string). The bytes come from the committed

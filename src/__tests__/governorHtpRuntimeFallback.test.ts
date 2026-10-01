@@ -53,3 +53,13 @@ test('each load reads the env fresh and owns the published reason bytes', () => 
   expect(rnLlama).toContain('owner.governor_npu_fallback_storage = device_plan.npu_fallback;')
   expect(rnLlamaHeader).toContain('governor_npu_fallback_storage')
 })
+
+test('the recorded reason rides the log line the lab parses, at failure time', () => {
+  // The end-of-turn KALSA_GOVERNOR telemetry is skipped on the throwing turn
+  // and the retry's reload suppresses the plan line, so the
+  // KALSA_GOVERNOR_FALLBACK line is the only surface that fires when the
+  // failure happens; it must carry the recorded constant, not only the
+  // engine's raw reason.
+  expect(rnLlama).toMatch(/KALSA_GOVERNOR_FALLBACK {[^]*?npu_fallback:\\"%s\\"/)
+  expect(rnLlama).toMatch(/npu_fallback:\\"%s\\", gpu_fit:%d/)
+})

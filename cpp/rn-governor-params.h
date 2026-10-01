@@ -43,13 +43,14 @@ struct governor_prefill_device_plan {
     const char * npu_fallback = nullptr;
 };
 
-/** The reason recorded when the HTP prefill context fails a decode
- *  mid-session (the engine returns an error instead of hanging on a DSP
- *  timeout/skew). The recorder stores it in owner.governor_npu_fallback (so
- *  getGovernorStats publishes it and the app's KALSA_GOVERNOR line carries
- *  it) and in the KALSA_HTP_FALLBACK env (so the reload the app's retry
- *  performs decides the load with the same machinery an init failure uses:
- *  use_device=false, prefill on the non-HTP path). */
+/** The reason recorded when the HTP prefill compute fails mid-session (the
+ *  engine returns an error instead of hanging on a DSP timeout/skew). The
+ *  recorder stores it in owner.governor_npu_fallback - getGovernorStats
+ *  publishes it and the binding's KALSA_GOVERNOR_FALLBACK log line carries
+ *  it at failure time - and in the KALSA_HTP_FALLBACK env, which
+ *  decide_governor_prefill_device reads at every governor load: the app's
+ *  retry reload itself runs CPU-only (governor off), and the env is what
+ *  keeps the NEXT governor load off HTP even when the device resolves. */
 constexpr char KALSA_HTP_RUNTIME_FALLBACK[] = "htp-runtime-error";
 
 /** True when one governor decode failure is attributable to the HTP prefill

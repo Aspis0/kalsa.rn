@@ -759,10 +759,15 @@ int32_t llama_rn_context::decode(llama_batch batch) {
             note_htp_runtime_fallback();
         }
         const bool route_rejected = reason.find("route Reject") != std::string::npos;
+        // This line is the one surface that fires at failure time: the
+        // end-of-turn KALSA_GOVERNOR telemetry is skipped on the throwing
+        // turn and the retry's reload suppresses the plan line, so without
+        // the field here the recorded constant is invisible to the lab.
         LOG_ERROR(
-            "KALSA_GOVERNOR_FALLBACK {stage:\"%s\", models_loaded:2, reason:\"%s\", gpu_fit:%d, profile_valid:%d}",
+            "KALSA_GOVERNOR_FALLBACK {stage:\"%s\", models_loaded:2, reason:\"%s\", npu_fallback:\"%s\", gpu_fit:%d, profile_valid:%d}",
             route_rejected ? "route_reject" : "decode",
-            reason.c_str(), (int) governor->gpu_fit(), (int) governor->profile_valid());
+            reason.c_str(), governor_npu_fallback == nullptr ? "" : governor_npu_fallback,
+            (int) governor->gpu_fit(), (int) governor->profile_valid());
     }
     if (result == -2 && !governor->failed()) {
         // Flow-control -2s share one rc (rn-governor.h); the labels use only
@@ -840,11 +845,14 @@ void llama_rn_context::note_htp_runtime_fallback() {
     governor_npu_fallback = KALSA_HTP_RUNTIME_FALLBACK;
     // The engine governor is sticky-failed, so no in-place retry exists on
     // this context pair; the failed turn fails cleanly to the caller (the
-    // completion throws "Governor decode failed: ...") and the app's reload
-    // recreates the context - on the non-HTP route, because this setenv
-    // outranks a device that resolves in decide_governor_prefill_device.
-    // Java only writes the variable during loadNative, so it sticks for the
-    // rest of the process: HTP is never retried this session.
+    // completion throws "Governor decode failed: ..."). The app's retry
+    // reload runs CPU-only by design (governor off), so it never consults
+    // this env; the env governs every LATER load that re-arms the governor:
+    // decide_governor_prefill_device reads it fresh per load and keeps the
+    // lane off even when the device resolves. The degrade sticks for the
+    // process because Java only reaches its own KALSA_HTP_FALLBACK clear
+    // (RNLlama.java extractHtpLibrariesFromAssets) inside loadNative, which
+    // short-circuits on libsLoaded once set - nothing re-runs that clear.
     if (setenv("KALSA_HTP_FALLBACK", KALSA_HTP_RUNTIME_FALLBACK, /*overwrite=*/1) != 0) {
         // Plain message on purpose: the FALLBACK marker is a load-retry
         // signal for the app's log scan, and a failed setenv is not one.

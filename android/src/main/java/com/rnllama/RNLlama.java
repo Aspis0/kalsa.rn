@@ -182,6 +182,14 @@ public class RNLlama {
       // Success clears a reason an EARLIER failed attempt recorded (Fast
       // Refresh / Activity recreate): a stale KALSA_HTP_FALLBACK would keep
       // the loader on a false GPU degrade while HTP works.
+      //
+      // This empty-clear is only safe because extractHtpLibrariesFromAssets
+      // runs solely inside loadNative, which short-circuits on libsLoaded
+      // (see loadNative below): the native side may setenv KALSA_HTP_FALLBACK
+      // when a runtime HTP failure kills the lane, and after that this clear
+      // must never run again in the process — any future path that re-extracts
+      // the HTP libs OUTSIDE the libsLoaded guard would erase the runtime
+      // fallback here and re-arm HTP exactly to re-hit the hang it recorded.
       android.system.Os.setenv("KALSA_HTP_FALLBACK", "", true);
       Log.d(NAME, "Set ADSP_LIBRARY_PATH=" + htpLibPath);
     } catch (Exception e) {

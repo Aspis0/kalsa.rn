@@ -28,8 +28,8 @@ runs:
       shell: bash
 
     # `npm run bootstrap` downloads the Hexagon SDK into ~/.hexagon-sdk and
-    # generates the Metal embed assembly; without it build:android-libs exits 1
-    # in build-hexagon-htp.sh, and every iOS link fails on undefined
+    # generates the Metal embed assembly; without it the Android host build
+    # can't link libcdsprpc.so, and every iOS link fails on undefined
     # _ggml_metallib_* symbols. It was dropped from this step back when
     # bootstrap.sh also rewrote the engine tree with the lm_ symbol prefix, and
     # running it here would have corrupted the checkout. That rewrite is gone,

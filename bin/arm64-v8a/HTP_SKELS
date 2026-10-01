@@ -7,26 +7,28 @@
 # (the 2026-09 dspqueue hang: in-app HTP prefill waited forever on a response
 # the old skel never wrote). scripts/assert-htp-skels.sh fails on any drift.
 #
-# Built from the vendored tree at the commit below by the recipe recorded in
-# the provenance block (container-archive method); verify with:
+# Built from the vendored tree at the commit below by the committed recipe
+# (scripts/build-htp-skels.sh, container-archive method); verify with:
 #   shasum -a 256 bin/arm64-v8a/libggml-htp-*.so
 
 ENGINE_COMMIT=61c9094811cb200fd475491f18f594fbde77634b
 
-libggml-htp-v73.so=505d3bfcd05324e5462ef11d0efe0397fc67d35d80f3272e77d96a922249d246
-libggml-htp-v75.so=eca5b552fac8d542d050e2a1dd31d22ef88206c5b249002037214f428081c70d
-libggml-htp-v79.so=e6a8fc6d773bdf9f6750e449674f664e8dfecbd38baefbcfb95fa96aa29ead27
-libggml-htp-v81.so=25a0882d7f479eb354644132ff1e0a00198647eb53691b7cbfff466d11627279
+libggml-htp-v73.so=2369e1f76fbd234b888b469f4b0e150067cb38620c94e2589ecd49380116b4b3
+libggml-htp-v75.so=ecf14ed106749af8634112f7453ec65d67089089819a568b5a2b3bf592727331
+libggml-htp-v79.so=daa166a66517eb4e4faf1fde592238fc355a438128e65a1e47fbc112796146f6
+libggml-htp-v81.so=df92e54aeced1d1788381036f8764bdadae4a88f1343a787cb6e8a25ce249a01
 
-# Build provenance (informational; the gate checks the two blocks above).
-# Container image ghcr.io/snapdragon-toolchain/arm64-android:v0.7
-# (linux/amd64, source via git archive on stdin, never bind-mounted);
-# Hexagon SDK 6.6.0.0, Hexagon Tools 19.0.07 (hexagon-clang);
-# standalone htp project (ggml/src/ggml-hexagon/htp), per-DSP
+# Build provenance (informational; the gate checks the two blocks above and,
+# inside each .so, the identity string). The bytes come from the committed
+# recipe scripts/build-htp-skels.sh + scripts/htp-skels-container.sh: container
+# image ghcr.io/snapdragon-toolchain/arm64-android:v0.7 (linux/amd64, source =
+# git archive of HEAD extracted at the recipe's fixed path /tmp/kalsa-htp/src,
+# never bind-mounted); Hexagon SDK 6.6.0.0, Hexagon Tools 19.0.07
+# (hexagon-clang); standalone htp project (ggml/src/ggml-hexagon/htp), per-DSP
 # -DDSP_VERSION=<v> -DPREBUILT_LIB_DIR=toolv19_<v>, HEXAGON_HTP_DEBUG=OFF,
-# Release; Ninja. Host-side stub (QAIC output compiled into the Android
-# host backend) refreshed from the same run: htp/v73/htp_iface{,_stub}.
-# Build logs: ~/Projects/llama.rn-kalsa-htp-skels/0d49c6a7/.
+# Release; Ninja; per-DSP build retry x3. Host-side stub (QAIC output compiled
+# into the Android host backend) refreshed from the same run:
+# htp/v73/htp_iface{,_stub} (tracked; byte-identical across runs).
 TOOLCHAIN_SDK=6.6.0.0
 TOOLCHAIN_CLANG=19.0.07
 TOOLCHAIN_IMAGE=ghcr.io/snapdragon-toolchain/arm64-android:v0.7

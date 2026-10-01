@@ -23,13 +23,9 @@ if (rnllamaBuildFromSource) {
         }
     }
 
-    def htpScript = new File(repoRootDir, "scripts/build-hexagon-htp.sh")
+    def htpScript = new File(repoRootDir, "scripts/build-htp-skels.sh")
+    def htpManifest = new File(repoRootDir, "bin/arm64-v8a/HTP_SKELS")
     def htpSourceDir = new File(repoRootDir, "vendor/llama.cpp/ggml/src/ggml-hexagon/htp")
-    def htpInputs = files(
-        htpScript,
-        new File(htpSourceDir, "CMakeLists.txt"),
-        new File(htpSourceDir, "htp_iface.idl"),
-    )
     def htpArtifacts = files(
         new File(repoRootDir, "bin/arm64-v8a/libggml-htp-v73.so"),
         new File(repoRootDir, "bin/arm64-v8a/libggml-htp-v75.so"),
@@ -39,21 +35,20 @@ if (rnllamaBuildFromSource) {
         new File(htpSourceDir, "v73/htp_iface_stub.c"),
     )
 
-    // A fresh CI runner has no Gradle task history, so prepareHTP would rebuild the
-    // DSP libraries even when a cache already restored artifacts built from these
-    // exact inputs. CI sets this after a cache hit, where the cache key is the hash
-    // of htpInputs; local builds keep the normal up-to-date checks.
-    def htpArtifactsUpToDate = project.findProperty("rnllamaHtpArtifactsUpToDate")?.toString()?.toBoolean() ?: false
-
-    tasks.register("prepareHTP", Exec) {
+    // The skels are committed and gated (scripts/assert-htp-skels.sh); the
+    // build must never regenerate them with a different toolchain, so this
+    // task only verifies the inputs exist and says how to restore them.
+    tasks.register("prepareHTP") {
         group = "build"
-        description = "Builds and refreshes the generated Hexagon HTP artifacts."
-        workingDir(repoRootDir)
-        commandLine(htpScript.absolutePath)
-        inputs.files(htpInputs)
-        outputs.files(htpArtifacts)
-        onlyIf {
-            !(htpArtifactsUpToDate && htpArtifacts.files.every { it.exists() })
+        description = "Verifies the committed Hexagon HTP artifacts are present."
+        doFirst {
+            def missing = htpArtifacts.filter { !it.exists() }
+            if (!missing.isEmpty()) {
+                throw new GradleException(
+                    "Missing Hexagon HTP artifacts: ${missing.collect { it.name }.join(', ')}. " +
+                    "They are committed inputs; restore them with ${htpScript.absolutePath} " +
+                    "from a checkout at the pinned engine commit (see ${htpManifest.name}).")
+            }
         }
     }
 

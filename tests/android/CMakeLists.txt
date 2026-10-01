@@ -83,7 +83,7 @@ endif()
 
 # --- Hexagon (HTP / NPU) backend, mirroring android/src/main/rnllama ----------
 # Host-side sources + QAIC v73 stub; DSP libs (libggml-htp-v*.so) come from
-# scripts/build-hexagon-htp.sh and are pushed to the device alongside the binary.
+# scripts/build-htp-skels.sh and are pushed to the device alongside the binary.
 if(ENABLE_HEXAGON)
     set(HEXAGON_SDK_ROOT "$ENV{HEXAGON_SDK_ROOT}")
     if(NOT HEXAGON_SDK_ROOT)
@@ -92,7 +92,7 @@ if(ENABLE_HEXAGON)
     set(CDSPRPC_LIB "${HEXAGON_SDK_ROOT}/ipc/fastrpc/remote/ship/android_aarch64/libcdsprpc.so")
     set(HTP_STUB_DIR "${RNLLAMA_GGML_HEXAGON_DIR}/htp/v73")
     if(NOT EXISTS ${CDSPRPC_LIB} OR NOT EXISTS ${HTP_STUB_DIR}/htp_iface_stub.c)
-        message(FATAL_ERROR "Hexagon requested but SDK / QAIC stubs missing (run scripts/build-hexagon-htp.sh)")
+        message(FATAL_ERROR "Hexagon requested but SDK / QAIC stubs missing (run scripts/build-htp-skels.sh)")
     endif()
     target_sources(kv_cache_reuse_test PRIVATE
         ${RNLLAMA_GGML_HEXAGON_DIR}/ggml-hexagon.cpp

@@ -52,7 +52,7 @@
     "example": "npm --prefix example",
     "build:ios-frameworks": "./scripts/build-ios.sh",
     "build:ios": "cd example && yarn build:ios",
-    "build:android-libs": "./scripts/build-hexagon-htp.sh && ./scripts/build-opencl.sh && ./scripts/build-android.sh",
+    "build:android-libs": "./scripts/build-opencl.sh && ./scripts/build-android.sh",
     "build:android": "cd example && yarn build:android",
     "clean": "del-cli example/ios/build"
   },

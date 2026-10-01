@@ -31,11 +31,11 @@ if command -v docker &> /dev/null && docker info &> /dev/null 2>&1; then
   echo ""
   echo "Build commands:"
   echo "  ./scripts/build-android-docker.sh    - Build everything with Docker"
-  echo "  ./scripts/build-hexagon-htp.sh       - Build HTP libraries (auto-detects Docker)"
+  echo "  ./scripts/build-htp-skels.sh         - Rebuild the committed HTP DSP skels (pinned container)"
   echo ""
 
   # Pull Docker image in background
-  DOCKER_IMAGE="ghcr.io/snapdragon-toolchain/arm64-android:v0.3"
+  DOCKER_IMAGE="ghcr.io/snapdragon-toolchain/arm64-android:v0.7"
   if ! docker image inspect "$DOCKER_IMAGE" &> /dev/null; then
     echo "Pulling Docker image in background..."
     echo "  Image: $DOCKER_IMAGE"
@@ -90,8 +90,8 @@ if [ ! -d "$HEXAGON_INSTALL_DIR/$HEXAGON_SDK_VERSION" ]; then
   echo "  ./scripts/build-android-docker.sh"
   echo ""
   if [ "$OS" != "Darwin" ]; then
-    echo "Or build natively on Linux:"
-    echo "  USE_DOCKER=no ./scripts/build-hexagon-htp.sh"
+    echo "Then build the libraries:"
+    echo "  ./scripts/build-htp-skels.sh"
     echo "  npm run build:android-libs"
     echo ""
   fi

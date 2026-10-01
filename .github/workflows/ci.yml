@@ -177,16 +177,6 @@ jobs:
         with:
           gradle-version: wrapper
 
-      - name: Cache Hexagon HTP & OpenCL artifacts
-        id: htp-cache
-        uses: actions/cache@v4
-        continue-on-error: true
-        with:
-          path: |
-            bin
-            vendor/llama.cpp/ggml/src/ggml-hexagon/htp/v73
-          key: ${{ runner.os }}-htp-${{ hashFiles('scripts/build-hexagon-htp.sh', 'scripts/build-opencl.sh', 'scripts/docker-build-wrapper.sh', 'vendor/llama.cpp/ggml/src/ggml-hexagon/htp/**', 'vendor/OpenCL-Headers/**', 'vendor/OpenCL-ICD-Loader/**') }}
-
       - name: Cache ccache
         uses: actions/cache@v4
         continue-on-error: true
@@ -208,12 +198,18 @@ jobs:
           # dotprod+i8mm+hexagon+opencl, and x86_64. The remaining arm64 variants
           # differ only in -march; build-android-libs still builds all of them.
           ORG_GRADLE_PROJECT_rnllamaVariants: rnllama,rnllama_v8_2_dotprod_i8mm_hexagon_opencl,rnllama_x86_64
-          ORG_GRADLE_PROJECT_rnllamaHtpArtifactsUpToDate: ${{ steps.htp-cache.outputs.cache-hit == 'true' }}
         run: |
           export HEXAGON_SDK_ROOT="$HOME/.hexagon-sdk/$HEXAGON_SDK_VERSION"
           export HEXAGON_TOOLS_ROOT="$HEXAGON_SDK_ROOT/tools/HEXAGON_Tools/$HEXAGON_TOOLS_VERSION"
           npm run build:android
           ccache --show-stats
+
+      # Nothing in this workflow builds or restores the HTP skels: the
+      # committed bin/arm64-v8a bytes are what the APK ships (prepareHTP only
+      # verifies presence). Run the gate after the build so a red build is the
+      # outcome of ANY step that ever starts writing into bin/ again.
+      - name: Assert the shipped HTP skels
+        run: ./scripts/assert-htp-skels.sh
 
   build-android-libs:
     runs-on: ubuntu-latest

@@ -49,6 +49,11 @@ jobs:
       - name: Build Android libraries
         run: npm run build:android-libs
 
+      # The release uploads bin/, and the skels in it are committed bytes —
+      # no step here builds them. Assert that nothing started writing bin/.
+      - name: Assert the shipped HTP skels
+        run: ./scripts/assert-htp-skels.sh
+
       - name: Package Android JNI libraries
         run: tar -czf llama-rn-android-jni-libs.tar.gz android/src/main/jniLibs
 

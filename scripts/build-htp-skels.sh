@@ -1,14 +1,14 @@
 #!/bin/bash -e
 # Rebuild the four shipped HTP DSP skels from the vendored engine tree.
 #
-# This is the ONLY supported way to produce bin/arm64-v8a/libggml-htp-*.so
-# and the QAIC host stub (vendor/llama.cpp/ggml/src/ggml-hexagon/htp/v73/).
-# The skels are committed and shipped as-is; nothing in CI builds them. A
-# build from any other tree or toolchain speaks a different DSP protocol
-# than the host (the 2026-09 dspqueue hang), so provenance is not optional:
-# the engine sha comes from vendor/VERSIONS, the source is a git archive of
-# HEAD (the worktree is never bind-mounted), and the toolchain is the pinned
-# container image (Hexagon SDK 6.6.0.0, tools 19.0.07).
+# The supported way to produce bin/arm64-v8a/libggml-htp-*.so and the QAIC
+# host stub (vendor/llama.cpp/ggml/src/ggml-hexagon/htp/v73/). The skels are
+# committed and shipped as-is; nothing in CI builds them. The skew gate binds
+# the shipped bytes to this recipe's inputs -- each skel is stamped with the
+# engine sha and a fingerprint of the exact committed sources, both
+# recomputed from the checkout -- so a build from any other tree or toolchain
+# fails the gate instead of shipping (the 2026-09 dspqueue hang). Forging the
+# stamp symbols themselves is deliberate ELF surgery and out of scope.
 #
 # Usage: scripts/build-htp-skels.sh            (requires Docker; on Apple
 #                                               silicon the amd64 image runs

@@ -28,6 +28,9 @@ jobs:
         run: |
           ./scripts/assert-kalsa-vendor.sh
           ./scripts/assert-rnllama-sources.sh
+          # Shipped DSP skels vs vendored engine: a stale skel hangs the
+          # in-app HTP lane at the first batch (see the script header).
+          ./scripts/assert-htp-skels.sh
 
   lint:
     runs-on: ubuntu-latest

@@ -43,6 +43,15 @@ struct governor_prefill_device_plan {
     const char * npu_fallback = nullptr;
 };
 
+/** The reason recorded when the HTP prefill context fails a decode
+ *  mid-session (the engine returns an error instead of hanging on a DSP
+ *  timeout/skew). The recorder stores it in owner.governor_npu_fallback (so
+ *  getGovernorStats publishes it and the app's KALSA_GOVERNOR line carries
+ *  it) and in the KALSA_HTP_FALLBACK env (so the reload the app's retry
+ *  performs decides the load with the same machinery an init failure uses:
+ *  use_device=false, prefill on the non-HTP path). */
+constexpr char KALSA_HTP_RUNTIME_FALLBACK[] = "htp-runtime-error";
+
 /** Resolve-to-device decision, pure. `htp_init_reason` is the Java-side
  *  KALSA_HTP_FALLBACK env (RNLlama.java noteHtpFallback) and outranks a
  *  device that resolves: no ADSP dir/libs/env means HTP0 is unusable even

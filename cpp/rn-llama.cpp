@@ -115,7 +115,15 @@ bool load_governor_models(llama_rn_context & owner,
         const auto device_plan = decide_governor_prefill_device(
             resolved.device != nullptr, resolved.npu_fallback, htp_init_reason);
         owner.governor_npu_device = device_plan.npu_device;
-        owner.governor_npu_fallback = device_plan.npu_fallback;
+        if (device_plan.npu_fallback != nullptr) {
+            // The plan reason can be the getenv pointer itself; the runtime
+            // fallback's setenv (note_htp_runtime_fallback) may reallocate
+            // environ, so the published const char * must not point into it.
+            owner.governor_npu_fallback_storage = device_plan.npu_fallback;
+            owner.governor_npu_fallback = owner.governor_npu_fallback_storage.c_str();
+        } else {
+            owner.governor_npu_fallback = nullptr;
+        }
         if (device_plan.use_device) {
             prefill_params.devices = { resolved.device, nullptr };
             // KV buffers follow the layer device (llama-kv-cache.cpp) unless
@@ -743,6 +751,7 @@ int32_t llama_rn_context::decode(llama_batch batch) {
     const bool was_failed = governor->failed();
     const int32_t result = governor->decode(batch);
     if (governor_decode_failed(result, governor->engine_failed()) && !was_failed) {
+        note_htp_runtime_fallback();
         const std::string & reason = governor->failure_reason();
         const bool route_rejected = reason.find("route Reject") != std::string::npos;
         LOG_ERROR(
@@ -811,6 +820,30 @@ bool llama_rn_context::setThermoProfile(const llama_governor_thermo_profile & pr
 
 bool llama_rn_context::setPrefillOverride(int mode) {
     return governor != nullptr && governor->set_prefill_override(mode);
+}
+
+void llama_rn_context::note_htp_runtime_fallback() {
+    // Only a real HTP-lane failure degrades: no lane resolved (prefill
+    // already runs on the non-HTP path), or a fallback reason is already
+    // recorded. HTP errors before the lane opened ride the env instead
+    // (Java noteHtpFallback / the resolver's own reason).
+    if (governor_npu_device == nullptr || governor_npu_fallback != nullptr) {
+        return;
+    }
+    governor_npu_fallback = KALSA_HTP_RUNTIME_FALLBACK;
+    // The engine governor is sticky-failed, so no in-place retry exists on
+    // this context pair; the failed turn fails cleanly to the caller (the
+    // completion throws "Governor decode failed: ...") and the app's reload
+    // recreates the context - on the non-HTP route, because this setenv
+    // outranks a device that resolves in decide_governor_prefill_device.
+    // Java only writes the variable during loadNative, so it sticks for the
+    // rest of the process: HTP is never retried this session.
+    if (setenv("KALSA_HTP_FALLBACK", KALSA_HTP_RUNTIME_FALLBACK, /*overwrite=*/1) != 0) {
+        // Plain message on purpose: the FALLBACK marker is a load-retry
+        // signal for the app's log scan, and a failed setenv is not one.
+        // The recorded field still degrades the stats surface.
+        LOG_ERROR("kalsa: setenv KALSA_HTP_FALLBACK failed; the next load of this process would keep HTP");
+    }
 }
 
 llama_governor_stats llama_rn_context::governorStats() const {

@@ -157,10 +157,28 @@ static bool test_npu_lane_enabled_forwards() {
     return params.npu_lane_enabled;
 }
 
+// The runtime fallback records KALSA_HTP_RUNTIME_FALLBACK into the
+// KALSA_HTP_FALLBACK env (cpp/rn-llama.cpp note_htp_runtime_fallback); the
+// NEXT load of the process must then degrade exactly like an init-time
+// failure: prefill off HTP, plan naming the reason the app logs on
+// KALSA_GOVERNOR.
+static bool test_htp_runtime_reason_degrades_next_load() {
+    if (std::string(KALSA_HTP_RUNTIME_FALLBACK) != "htp-runtime-error") {
+        std::cerr << "runtime fallback reason drifted: " << KALSA_HTP_RUNTIME_FALLBACK << std::endl;
+        return false;
+    }
+    const auto plan = decide_governor_prefill_device(true, nullptr, KALSA_HTP_RUNTIME_FALLBACK);
+    if (plan.use_device || std::string(plan.npu_device) != "GPU" ||
+        plan.npu_fallback == nullptr || std::string(plan.npu_fallback) != "htp-runtime-error") {
+        std::cerr << "runtime reason did not degrade a resolved HTP0 lane" << std::endl;
+        return false;
+    }
+    return true;
+}
+
 // decide() is pure booleans/strings (the resolver's HTP0 name check is the
 // engine's devices test): no ggml linkage, per this target's design.
-static bool test_prefill_device_plan() {
-    // Java-side HTP failure outranks a device that resolves.
+static bool test_prefill_device_plan() {    // Java-side HTP failure outranks a device that resolves.
     const auto degraded = decide_governor_prefill_device(true, nullptr, "htp-libs-missing");
     if (degraded.use_device || std::string(degraded.npu_device) != "GPU" ||
         degraded.npu_fallback == nullptr || std::string(degraded.npu_fallback) != "htp-libs-missing") {
@@ -337,6 +355,7 @@ int main() {
     results.run_test("governor decode_repack parses both directions", test_decode_repack_both_directions());
     results.run_test("npu_lane_enabled forwards without throwing", test_npu_lane_enabled_forwards());
     results.run_test("prefill device plan degrades / opens HTP0", test_prefill_device_plan());
+    results.run_test("runtime htp reason degrades the next load", test_htp_runtime_reason_degrades_next_load());
     results.run_test("registry exclusion keeps non-HTP order", test_devices_excluding_registry());
     results.run_test("platform_thermal_status optional, engine owns range", test_platform_thermal_status_parses());
     results.print_summary();

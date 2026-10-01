@@ -185,6 +185,10 @@ struct llama_rn_context {
     // getGovernorStats JSI map). Both stay null with the lane off.
     const char * governor_npu_device = nullptr;
     const char * governor_npu_fallback = nullptr;
+    // Owns the bytes governor_npu_fallback may point at: the plan reason can
+    // be the getenv(3) pointer, and the runtime fallback's setenv(3) is
+    // allowed to reallocate environ and dangle it.
+    std::string governor_npu_fallback_storage;
 
     bool hasGovernor() const;
     bool governorFailed() const;
@@ -194,6 +198,10 @@ struct llama_rn_context {
     // Bench route dev hook: "cpu" | "gpu" | "auto" parsed by the JSI layer.
     bool setPrefillOverride(int mode);
     llama_governor_stats governorStats() const;
+    // Record the session degrade after a real governor decode failure with
+    // the HTP lane engaged: governor_npu_fallback (stats/KALSA_GOVERNOR) and
+    // the KALSA_HTP_FALLBACK env (every later load of this process degrades).
+    void note_htp_runtime_fallback();
     bool hasDraftModel() const;
     llama_model * getMTPDraftModel() const;
     llama_context * createMTPDraftContext(const common_params &params_for_context) const;

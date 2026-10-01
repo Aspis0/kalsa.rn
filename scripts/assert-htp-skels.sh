@@ -50,16 +50,6 @@ BIN_DIR="$ROOT_DIR/bin/arm64-v8a"
 
 fail() { echo "assert-htp-skels: $*" >&2; exit 1; }
 
-# sha256sum on Linux (the CI runner), shasum on macOS (local runs); both
-# print the hex digest as the first field of line one.
-sha256_of() {
-  if command -v sha256sum > /dev/null 2>&1; then
-    sha256sum "$1" | awk '{print $1}'
-  else
-    shasum -a 256 "$1" | awk '{print $1}'
-  fi
-}
-
 [ -f "$MANIFEST" ] || fail "missing $MANIFEST -- the skel manifest is not optional"
 [ -f "$VERSIONS" ] || fail "missing $VERSIONS -- run npm run sync:vendor first"
 
@@ -130,7 +120,7 @@ phantom="$(comm -13 <(printf '%s\n' "$shipped") <(printf '%s\n' "$manifest_list"
 mismatches=0
 while IFS= read -r name; do
   want="$(sed -n "s/^${name}=//p" "$MANIFEST")"
-  got="$(sha256_of "$BIN_DIR/$name")"
+  got="$(htp_sha256_of "$BIN_DIR/$name")"
   if [ "$got" != "$want" ]; then
     echo "assert-htp-skels: $name sha256 $got != manifest $want" >&2
     mismatches=$((mismatches + 1))

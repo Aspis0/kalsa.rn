@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Print the string a defined symbol binds to in an ELF32 little-endian file.
+"""Print an identity field of an ELF32 little-endian file: the string a
+defined symbol binds to, or --eflags for the header's e_flags word.
 
 The QDSP6 HTP skels are ELF32 LE; scripts/assert-htp-skels.sh reads their
 identity stamps through this resolver instead of grepping raw bytes, so an
 appended look-alike string cannot vouch for anything -- only the bytes the
-symbol actually points at count.
+symbol actually points at count. e_flags carries the compiled DSP version
+(the Hexagon toolchain encodes -mcpu=hexagonvNN as the version digits in
+the low byte), which binds the bytes to the filename they ship under.
 
 nm/objdump are not portable here: macOS ships neither in an ELF-capable form
 and the slim ubuntu runner image has no binutils, so this parses the section
@@ -40,8 +43,8 @@ def cstr(data, off, end, what):
 
 def main():
     if len(sys.argv) != 3:
-        fail("usage: htp_elf_symbol.py <elf32-file> <symbol>")
-    path, want = sys.argv[1], sys.argv[2]
+        fail("usage: htp_elf_symbol.py <elf32-file> <symbol>|--eflags")
+    path = sys.argv[1]
     try:
         with open(path, "rb") as f:
             data = f.read()
@@ -52,6 +55,10 @@ def main():
         fail(f"{path}: not an ELF file")
     if data[4] != 1 or data[5] != 1:
         fail(f"{path}: not a 32-bit little-endian ELF (QDSP6 skels are)")
+    if sys.argv[2] == "--eflags":
+        print(f"0x{struct.unpack_from('<I', data, 0x24)[0]:08x}")
+        return
+    want = sys.argv[2]
     e_shoff = struct.unpack_from("<I", data, 0x20)[0]
     e_shentsize = struct.unpack_from("<H", data, 0x2E)[0]
     e_shnum = struct.unpack_from("<H", data, 0x30)[0]

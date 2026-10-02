@@ -32,7 +32,9 @@
 #      the expected values -- each stamp is read from its ELF symbol
 #      (scripts/htp_elf_symbol.py resolves it through .symtab), so a string
 #      appended to old bytes cannot vouch for them; forging the symbol table
-#      is deliberate forgery, which this gate does not chase
+#      is deliberate forgery, which this gate does not chase -- or its ELF
+#      header's e_flags does not name the DSP version in its filename, so a
+#      byte swap between two versions (manifest digests updated) still fails
 #
 # The manifest also carries the build provenance (SDK/tools/image versions);
 # those lines are informational and unchecked -- a gate on them could not be
@@ -162,6 +164,25 @@ check_stamp() {
     return 1
   fi
 }
+
+# check_dsp_version <name> <file> <version>: the ELF header must name the
+# same DSP version the filename does. The Hexagon toolchain encodes
+# -mcpu=hexagonvNN as the version digits in e_flags' low byte (v73 ->
+# 0x00000073 ... v81 -> 0x00000081, verified on the four committed skels),
+# so the bytes carry their own ISA even when the manifest digests were
+# rewritten around a swapped file.
+check_dsp_version() {
+  local got want
+  want="$(printf '0x%08x' "$((16#${3#v}))")"
+  if ! got="$(python3 "$SCRIPTS_DIR/htp_elf_symbol.py" "$2" --eflags 2>&1)"; then
+    echo "assert-htp-skels: $1: $got" >&2
+    return 1
+  fi
+  if [ "$got" != "$want" ]; then
+    echo "assert-htp-skels: $1 e_flags $got != $want -- not built for DSP $3; a swapped or misnamed skel, rebuild through scripts/build-htp-skels.sh" >&2
+    return 1
+  fi
+}
 bad_identity=0
 while IFS= read -r name; do
   file="$BIN_DIR/$name"
@@ -177,6 +198,9 @@ while IFS= read -r name; do
     bad_identity=$((bad_identity + 1))
     continue
   fi
+  ver="${name#libggml-htp-}"
+  check_dsp_version "$name" "$file" "${ver%.so}" \
+    || { bad_identity=$((bad_identity + 1)); continue; }
   check_stamp "$name" "$file" kalsa_htp_engine_stamp 'KALSA_HTP_ENGINE=' "$pin_engine" engine \
     || { bad_identity=$((bad_identity + 1)); continue; }
   check_stamp "$name" "$file" kalsa_htp_src_stamp 'KALSA_HTP_SRC=' "$src_fp" source \

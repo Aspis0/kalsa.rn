@@ -1,3 +1,12 @@
+# Kalsa binding overlay, not upstream content (no commit in Aspis0/kalsallama
+# carries this loop): halve the flash-attn simdgroup count until the tile's
+# shared-memory footprint fits the device limit, for GPUs whose max threadgroup
+# memory cannot hold the default 8-simdgroup tile. Written against a pre-
+# cdc06426e llama.cpp, it first shipped calling the macro that commit renamed:
+# FATTN_SMEM is undeclared at every pin this tree has carried, and the iOS
+# build failed on it (ggml-metal-ops.cpp:3518, kalsa-moe-experiments
+# scratchpad agents/ios-readiness/BINDING-PATCHES.md Patch 1). The loop calls
+# the fa_smem lambda the engine defines at the insertion site.
 --- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
 @@ -3514,6 +3514,10 @@
@@ -5,7 +14,7 @@
          // simdgroups per threadgroup (a.k.a. warps)
          int32_t nsg = ne00 >= 512 ? 8 : 4;
 +
-+        while (nsg > 1 && FATTN_SMEM(nsg) > props_dev->max_theadgroup_memory_size) {
++        while (nsg > 1 && fa_smem(nsg) > props_dev->max_theadgroup_memory_size) {
 +            nsg /= 2;
 +        }
  

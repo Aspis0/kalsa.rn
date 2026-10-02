@@ -1,3 +1,9 @@
+// Upstream compiles this file only for ARM targets; the podspec globs every
+// ggml-cpu arch dir for every slice. Compiled for x86, the non-NEON fallbacks
+// below call *_generic helpers that arch-fallback.h renames away inside the
+// top-level quants.c TU, leaving dangling references (x86_64 simulator link
+// failure, AUDIT-first-compile S2-6).
+#if defined(__aarch64__) || defined(__ARM_NEON)
 #define GGML_COMMON_IMPL_C
 #include "ggml-common.h"
 #include "ggml-quants.h"
@@ -4317,3 +4323,4 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 #endif
 }
 
+#endif

@@ -50,17 +50,26 @@ Pod::Spec.new do |s|
       "#{llama_cpp}/tools/mtmd/**/*.{h,cpp}",
       "#{llama_cpp}/vendor/**/*.{h,hpp,c,cpp}",
       "#{codec_cpp}/{include,src,common}/**/*.{h,cpp}"
-    # Exclude what no llama.rn build compiles (same set as the filters in
+    # Exclude what no llama.rn build compiles (the non-arch filters match
     # cmake/rnllama-sources.cmake): the parts of vendor/llama.cpp that are
     # only there for upstream's CMake project (see vendor/README.md), the
     # mtmd debug CLI, and codec's reference runners which conflict with
     # rn-tts. common/jinja/string.h must stay out of the pod's header map, or
     # every <string.h> in the target resolves to it; jinja itself finds it
     # next to value.h and via the common/ search path.
+    #
+    # Arch kernels: cmake's callers add one ggml-cpu/arch/<arch> dir per
+    # target, which a podspec cannot pick per slice, so the pod compiles the
+    # arm and x86 kernels on every Apple slice and excludes every other arch
+    # dir: wasm is vendored but no Apple slice runs it, and powerpc,
+    # loongarch, riscv, s390 and spacemit are pruned by sync-vendor.sh today
+    # -- named here so a wider sync manifest cannot silently add them back.
+    # The arm kernels carry an ARM-only guard for the x86 slices
+    # (scripts/patches/llama.cpp/ggml-cpu-arm-guard.patch).
     s.exclude_files = "#{llama_cpp}/src/llama-quant.cpp", "#{llama_cpp}/ggml/src/ggml.cpp",
       "#{llama_cpp}/common/{arg,console,debug,download,hf-cache,imatrix-loader,llguidance,preset,subproc}.cpp",
       "#{llama_cpp}/ggml/src/ggml-cpu/hbm.cpp",
-      "#{llama_cpp}/ggml/src/ggml-cpu/{kleidiai,llamafile,arch/wasm}/*",
+      "#{llama_cpp}/ggml/src/ggml-cpu/{kleidiai,llamafile,arch/wasm,arch/powerpc,arch/loongarch,arch/riscv,arch/s390,arch/spacemit}/*",
       "#{llama_cpp}/vendor/{cpp-httplib,hash/sha1,hash/xxhash}/*",
       "#{llama_cpp}/tools/mtmd/debug/*.cpp", "#{codec_cpp}/common/tts_runner*.cpp",
       "#{llama_cpp}/common/jinja/string.h"

@@ -1,3 +1,7 @@
+// Same trap as arch/arm/quants.c: compiled for x86, the non-NEON fallbacks
+// below call *_generic repack helpers that only exist renamed in the
+// top-level repack.cpp TU.
+#if defined(__aarch64__) || defined(__ARM_NEON)
 #define GGML_COMMON_IMPL_CPP
 #define GGML_COMMON_DECL_CPP
 #include "ggml-common.h"
@@ -5799,3 +5803,4 @@ void ggml_gemm_q1_0_4x8_q8_0(int                        n,
 
     ggml_gemm_q1_0_4x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
 }
+#endif

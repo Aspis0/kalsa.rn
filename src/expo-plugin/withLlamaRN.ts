@@ -66,20 +66,6 @@ const withLlamaRn: ConfigPlugin<PluginOptions> = (config, options = {}) => {
 
         cfg.buildSettings['CLANG_CXX_LANGUAGE_STANDARD'] = '"gnu++20"'
         cfg.buildSettings['CLANG_CXX_LIBRARY'] = '"libc++"'
-
-        const current = String(
-          cfg.buildSettings['OTHER_CPLUSPLUSFLAGS'] || '$(inherited)',
-        )
-
-        if (!current.includes('-std=gnu++20')) {
-          cfg.buildSettings['OTHER_CPLUSPLUSFLAGS'] =
-            '"$(inherited) -std=gnu++20"'
-          return
-        }
-
-        if (!current.startsWith('"')) {
-          cfg.buildSettings['OTHER_CPLUSPLUSFLAGS'] = `"${current}"`
-        }
       })
 
       return c
@@ -104,7 +90,7 @@ const withLlamaRn: ConfigPlugin<PluginOptions> = (config, options = {}) => {
         const endIdx = contents.indexOf('\n  end', postInstallIdx)
         if (endIdx === -1) return c
 
-        const insert = `\n    # LLAMA_RN_CXX20: Force C++20 on all Pods\n    installer.pods_project.targets.each do |target|\n      target.build_configurations.each do |config|\n        config.build_settings['CLANG_CXX_LANGUAGE_STANDARD'] = 'gnu++20'\n        config.build_settings['CLANG_CXX_LIBRARY'] = 'libc++'\n        config.build_settings['OTHER_CPLUSPLUSFLAGS'] = '$(inherited) -std=gnu++20'\n      end\n    end\n`
+        const insert = `\n    # LLAMA_RN_CXX20: Force C++20 on all Pods\n    installer.pods_project.targets.each do |target|\n      target.build_configurations.each do |config|\n        config.build_settings['CLANG_CXX_LANGUAGE_STANDARD'] = 'gnu++20'\n        config.build_settings['CLANG_CXX_LIBRARY'] = 'libc++'\n      end\n    end\n`
 
         const updated =
           contents.slice(0, endIdx) + insert + contents.slice(endIdx)

@@ -10,7 +10,8 @@
 # forever or aborts (the 2026-09 dspqueue hang, scratchpad
 # inapp-htp-dspqueue-hang/DIAGNOSIS.md H2). This gate turns that drift into a
 # red build in CI: the vendor job (pushes to main/kalsa, PRs to main, manual
-# dispatch) plus a pre-build step in every Android build workflow. Nothing
+# dispatch) plus a step in every Android build workflow, before the artifact
+# is assembled. Nothing
 # runs it at commit time -- after touching the skels or vendored sources, run
 # it by hand.
 #
@@ -209,4 +210,4 @@ done <<< "$shipped"
 [ "$bad_identity" -eq 0 ] \
   || fail "$bad_identity skel file(s) fail the binary identity check"
 
-echo "assert-htp-skels: ok (engine ${manifest_engine:0:7}, src ${src_fp:0:7}, $(printf '%s\n' "$shipped" | wc -l | tr -d ' ') skels match the manifest, each names its engine and sources)"
+echo "assert-htp-skels: ok (engine ${manifest_engine:0:7}, src ${src_fp:0:7}, $(printf '%s\n' "$shipped" | wc -l | tr -d ' ') skels match the manifest, each claims its engine, source fingerprint, and DSP version)"

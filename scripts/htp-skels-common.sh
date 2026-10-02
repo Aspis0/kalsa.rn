@@ -48,7 +48,10 @@ htp_sha256_stdin() {
 # an edit under any path -- or a change to the path list itself -- moves the
 # fingerprint. Computed from HEAD, the committed tree the recipe archives;
 # uncommitted worktree edits under the same paths are a separate explicit
-# check in the gate, never a silent fingerprint change.
+# check in the gate, never a silent fingerprint change. The `|| return 1`
+# is reachable only under set -o pipefail, which both callers must run:
+# without it the loop's failure is lost inside the pipeline and a partial
+# fingerprint would be hashed silently.
 htp_src_fingerprint() {
   local p hash
   for p in "${HTP_SRC_PATHS[@]}"; do

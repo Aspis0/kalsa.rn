@@ -9,20 +9,24 @@ HTP_DSP_VERSIONS="v73 v75 v79 v81"
 # The vendored source both sides of the host/DSP protocol are built from:
 # the HTP DSP project compiles against the public ggml headers, the ggml root
 # headers the htp sources include, and the whole ggml-hexagon tree (the
-# recipe's archive list), and the Android host hexagon backend compiles
-# ggml-hexagon.cpp + htp-drv.cpp + the tracked QAIC stub (htp/v73/) from the
-# same tree (android/src/main/rnllama/CMakeLists.txt). One list, two
-# consumers: the recipe archives exactly these paths, and htp_src_fingerprint
-# hashes them.
+# recipe's archive list) -- QAIC IDL, toolchain file, and tracked host stub
+# included. The Android build never compiles that tree through the engine's
+# own CMakeLists, so the two files that define how the host hexagon backend
+# is compiled (android/src/main/rnllama/CMakeLists.txt: the hand-written
+# target_sources / target_include_directories; cmake/rnllama-sources.cmake:
+# RNLLAMA_GGML_HEXAGON_DIR) are fingerprinted too -- a committed edit that
+# makes the host backend resolve the protocol from different sources moves
+# the fingerprint exactly like a vendored edit. One list, two consumers: the
+# recipe archives exactly these paths, and htp_src_fingerprint hashes them.
 HTP_SRC_PATHS=(
   vendor/llama.cpp/ggml/include
   vendor/llama.cpp/ggml/src/ggml-backend-impl.h
   vendor/llama.cpp/ggml/src/ggml-common.h
-  vendor/llama.cpp/ggml/src/ggml-feats.h
   vendor/llama.cpp/ggml/src/ggml-impl.h
   vendor/llama.cpp/ggml/src/ggml-quants.h
-  vendor/llama.cpp/ggml/src/ggml-threading.h
   vendor/llama.cpp/ggml/src/ggml-hexagon
+  cmake/rnllama-sources.cmake
+  android/src/main/rnllama/CMakeLists.txt
 )
 
 # sha256sum on Linux (the CI runner), shasum on macOS (local runs); both

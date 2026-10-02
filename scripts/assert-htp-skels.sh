@@ -79,7 +79,7 @@ fi
 # paths fail the dirt check, so a working-tree change can never pass
 # unnoticed either way.
 if [ -n "$(git -C "$ROOT_DIR" status --porcelain -- "${HTP_SRC_PATHS[@]}")" ]; then
-  fail "uncommitted changes under the fingerprinted sources (ggml headers / ggml-hexagon) -- commit or stash; rebuild the skels if the sources moved (scripts/build-htp-skels.sh)"
+  fail "uncommitted changes under the fingerprinted sources (vendored ggml sources / the host hexagon build definition) -- commit or stash; rebuild the skels if the sources moved (scripts/build-htp-skels.sh)"
 fi
 src_fp="$(htp_src_fingerprint)" \
   || fail "cannot fingerprint the committed sources (git rev-parse failed)"

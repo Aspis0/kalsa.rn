@@ -103,6 +103,31 @@ bool htp_kv_type_supported(ggml_type type) {
     return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_Q8_0;
 }
 
+// The lane's one KV decision, applied to both contexts. With flash
+// attention explicitly disabled it keeps the pre-lane-KV behaviour: the
+// engine refuses a quantized V cache without FA (llama-context.cpp
+// "quantized V cache requires flash_attn to be enabled") and stores the V
+// rows transposed (llama-model.cpp attn_v_trans = !cparams.flash_attn) —
+// a layout the HTP path was never validated for.
+struct governor_lane_kv_plan {
+    bool kv_on_device;
+    ggml_type type_k;
+    ggml_type type_v;
+};
+
+governor_lane_kv_plan decide_governor_lane_kv(
+    ggml_type requested_k, ggml_type requested_v,
+    enum llama_flash_attn_type flash_attn) {
+    if (flash_attn == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+        return { false, requested_k, requested_v };
+    }
+    return {
+        true,
+        htp_kv_type_supported(requested_k) ? requested_k : GGML_TYPE_Q8_0,
+        htp_kv_type_supported(requested_v) ? requested_v : GGML_TYPE_Q8_0,
+    };
+}
+
 bool load_governor_models(llama_rn_context & owner,
                           const llama_governor_params & governor_params,
                           const llama_governor_thermo_profile & governor_thermo,
@@ -136,29 +161,36 @@ bool load_governor_models(llama_rn_context & owner,
             // commit a host memcpy (MirrorAndCopy, llama-kv-commit.cpp).
             // The commit copies rows byte-for-byte and
             // llama_kv_commit_access::compatible refuses mismatched cache
-            // types, so BOTH contexts must carry the same type: an
-            // HTP-unwritable caller type (the catalog ships V q4_0) is
-            // upgraded to q8_0 in both params. The catalog stays the
-            // authority elsewhere; this override belongs to this lane and
-            // is announced once per load on KALSA_KV_TYPE_OVERRIDE.
+            // types, so BOTH contexts must carry the same type; the catalog
+            // stays the authority elsewhere and the override is announced
+            // once per load on KALSA_KV_TYPE_OVERRIDE.
             const ggml_type requested_k = prefill_params.cache_type_k;
             const ggml_type requested_v = prefill_params.cache_type_v;
-            if (!htp_kv_type_supported(prefill_params.cache_type_k)) {
-                prefill_params.cache_type_k = GGML_TYPE_Q8_0;
-                decode_params.cache_type_k = GGML_TYPE_Q8_0;
-            }
-            if (!htp_kv_type_supported(prefill_params.cache_type_v)) {
-                prefill_params.cache_type_v = GGML_TYPE_Q8_0;
-                decode_params.cache_type_v = GGML_TYPE_Q8_0;
-            }
-            if (prefill_params.cache_type_k != requested_k ||
-                prefill_params.cache_type_v != requested_v) {
+            const auto lane_kv = decide_governor_lane_kv(
+                requested_k, requested_v, prefill_params.flash_attn_type);
+            if (lane_kv.kv_on_device) {
+                prefill_params.cache_type_k = lane_kv.type_k;
+                decode_params.cache_type_k = lane_kv.type_k;
+                prefill_params.cache_type_v = lane_kv.type_v;
+                decode_params.cache_type_v = lane_kv.type_v;
+                if (prefill_params.cache_type_k != requested_k ||
+                    prefill_params.cache_type_v != requested_v) {
+                    LOG_INFO(
+                        "KALSA_KV_TYPE_OVERRIDE {requested_k:\"%s\", requested_v:\"%s\", "
+                        "effective_k:\"%s\", effective_v:\"%s\", reason:\"htp-prefill-kv\"}",
+                        ggml_type_name(requested_k), ggml_type_name(requested_v),
+                        ggml_type_name(prefill_params.cache_type_k),
+                        ggml_type_name(prefill_params.cache_type_v));
+                }
+            } else {
+                // Flash attention explicitly off: device KV is off the
+                // table (decide_governor_lane_kv), so the load reverts to
+                // host-pinned KV with the caller's types.
+                prefill_params.no_kv_offload = true;
                 LOG_INFO(
-                    "KALSA_KV_TYPE_OVERRIDE {requested_k:\"%s\", requested_v:\"%s\", "
-                    "effective_k:\"%s\", effective_v:\"%s\", reason:\"htp-prefill-kv\"}",
-                    ggml_type_name(requested_k), ggml_type_name(requested_v),
-                    ggml_type_name(prefill_params.cache_type_k),
-                    ggml_type_name(prefill_params.cache_type_v));
+                    "KALSA_KV_HOST_PIN {requested_k:\"%s\", requested_v:\"%s\", "
+                    "reason:\"flash-attn-off\"}",
+                    ggml_type_name(requested_k), ggml_type_name(requested_v));
             }
         }
 #if defined(__ANDROID__)
@@ -181,8 +213,9 @@ bool load_governor_models(llama_rn_context & owner,
     // What this governor load built, for the getGovernorStats surface: the
     // cache types BOTH contexts run with (they only diverge from the
     // caller's params through the lane upgrade above) and where the prefill
-    // KV buffers live — host when no_kv_offload was requested, the layer
-    // device (HTP0 with the lane resolved) otherwise.
+    // KV buffers live — host when no_kv_offload is set (caller-requested,
+    // or the flash-attn-off pin above), the layer device (HTP0 with the
+    // lane resolved) otherwise.
     owner.setGovernorKvCache(
         ggml_type_name(prefill_params.cache_type_k),
         ggml_type_name(prefill_params.cache_type_v),

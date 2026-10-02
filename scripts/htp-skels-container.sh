@@ -31,11 +31,9 @@ cd "$HTP_SRC" || exit 1
 
 # The identity, linked into every skel: the engine sha AND a fingerprint of
 # the exact committed sources the build used (both exported by the driver,
-# both recomputed by scripts/assert-htp-skels.sh from its checkout). A
-# rebuild is the only way to make the binary name a new engine or source
-# state - editing any text file cannot satisfy the gate. The TU is generated
-# into the archive copy; the engine tree itself (repo or vendored) is never
-# edited.
+# both recomputed by scripts/assert-htp-skels.sh from its checkout). The TU
+# is generated into the archive copy; the engine tree itself (repo or
+# vendored) is never edited.
 : "${KALSA_HTP_ENGINE_SHA:?driver must export KALSA_HTP_ENGINE_SHA}"
 : "${KALSA_HTP_SRC_FP:?"driver must export KALSA_HTP_SRC_FP (htp_src_fingerprint)"}"
 if ! printf '%s' "$KALSA_HTP_ENGINE_SHA" | grep -qE '^[0-9a-f]{40}$'; then
@@ -82,10 +80,11 @@ for v in $HTP_DSP_VERSIONS; do
     fi
 
     # The observed transient is the embed_kernel build step (a license-slot
-    # miss under emulation); a clean re-run of the same build dir has always
-    # succeeded. Three real attempts under errexit -- each guarded so the
-    # failure reaches this loop instead of killing the shell -- then give up
-    # so the driver fails loudly.
+    # miss under emulation); re-running the same build dir unchanged has
+    # succeeded, so the loop retries as-is -- it does not clean. Three real
+    # attempts under errexit -- each guarded so the failure reaches this
+    # loop instead of killing the shell -- then give up so the driver fails
+    # loudly.
     build_rc=1
     for attempt in 1 2 3; do
         build_rc=0

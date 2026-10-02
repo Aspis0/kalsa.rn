@@ -106,12 +106,16 @@ for v in $HTP_DSP_VERSIONS; do
     fi
 done
 
-# The Android host build compiles the v73 QAIC stub; ship the pair beside the
+# The Android host build compiles the QAIC stub; ship the pair beside the
 # skels so the driver can refresh the tracked copy in htp/v73/. Copy from the
 # build dir only: the committed stubs also live in the archive, and shipping
-# those would mask a stub that no longer matches the IDL.
+# those would mask a stub that no longer matches the IDL. The QAIC output is
+# DSP-version-independent, so every build dir carries the same pair -- take
+# the first version of the driver's list (v73 today) instead of a hardcoded
+# one that breaks when the supported set changes.
+qaic_from="${HTP_DSP_VERSIONS%% *}"
 for f in htp_iface.h htp_iface_stub.c; do
-    cp "/tmp/kalsa-htp/build-v73/$f" "$ART/" || { echo "missing QAIC output /tmp/kalsa-htp/build-v73/$f" >&2; overall_rc=1; }
+    cp "/tmp/kalsa-htp/build-$qaic_from/$f" "$ART/" || { echo "missing QAIC output /tmp/kalsa-htp/build-$qaic_from/$f" >&2; overall_rc=1; }
 done
 
 echo "=== sha256 ==="

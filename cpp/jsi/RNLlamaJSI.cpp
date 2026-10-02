@@ -179,6 +179,7 @@ namespace rnllama_jsi {
     static std::weak_ptr<react::CallInvoker> g_log_invoker;
     static std::shared_ptr<jsi::Function> g_log_handler;
     static std::shared_ptr<jsi::Runtime> g_log_runtime;
+    static bool g_log_last_forwarded = false;
 
     struct ProgressCallbackData {
         std::shared_ptr<jsi::Function> callback;
@@ -251,20 +252,36 @@ namespace rnllama_jsi {
         });
     }
 
+    // Kalsa: DEBUG lines carry user/model text (e.g. llama-grammar.cpp logs each
+    // sampled token's detokenized piece while tools are on) and the app uploads
+    // its log tail, so only ERROR/WARN/INFO reach JS. GGML_LOG_LEVEL_CONT
+    // continues the previous line, so it is forwarded only when that line was.
+    // The callback runs on engine threads; the tracker is only read and written
+    // under g_log_mutex.
     static void logToJsCallback(enum ggml_log_level level, const char* text, void* /*data*/) {
         llama_log_callback_default(level, text, nullptr);
 
         std::shared_ptr<react::CallInvoker> invoker;
         std::shared_ptr<jsi::Function> handler;
         std::shared_ptr<jsi::Runtime> runtime;
+        bool forward;
         {
             std::lock_guard<std::mutex> lock(g_log_mutex);
             invoker = g_log_invoker.lock();
             handler = g_log_handler;
             runtime = g_log_runtime;
+
+            if (level == GGML_LOG_LEVEL_CONT) {
+                forward = g_log_last_forwarded;
+            } else {
+                forward = level == GGML_LOG_LEVEL_ERROR
+                    || level == GGML_LOG_LEVEL_WARN
+                    || level == GGML_LOG_LEVEL_INFO;
+                g_log_last_forwarded = forward && invoker && handler && runtime;
+            }
         }
 
-        if (!invoker || !handler || !runtime) {
+        if (!forward || !invoker || !handler || !runtime) {
             return;
         }
 
@@ -272,7 +289,8 @@ namespace rnllama_jsi {
         switch (level) {
             case GGML_LOG_LEVEL_ERROR: levelStr = "error"; break;
             case GGML_LOG_LEVEL_WARN: levelStr = "warn"; break;
-            case GGML_LOG_LEVEL_INFO: levelStr = "info"; break;
+            case GGML_LOG_LEVEL_INFO:
+            case GGML_LOG_LEVEL_CONT: levelStr = "info"; break;
             default: break;
         }
 

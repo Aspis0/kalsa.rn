@@ -1,3 +1,6 @@
+// Same trap as arch/x86/quants.c: compiled for ARM, the non-SSE #else bodies
+// below define the plain-named repack symbols the arm kernels also define.
+#if defined(__x86_64__) || defined(__i386__)
 #define GGML_COMMON_IMPL_CPP
 #define GGML_COMMON_DECL_CPP
 #include "ggml-common.h"
@@ -6405,3 +6408,4 @@ void ggml_gemm_q2_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
 #endif
 }
+#endif

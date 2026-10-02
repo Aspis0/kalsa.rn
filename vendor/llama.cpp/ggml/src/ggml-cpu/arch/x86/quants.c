@@ -1,3 +1,8 @@
+// Upstream compiles this file only for x86 targets; the podspec globs every
+// ggml-cpu arch dir for every slice. Compiled for ARM, every AVX test below
+// is false, so the non-SSE #else bodies define the same plain-named symbols
+// the arm kernels define, and the link survives only on archive member order.
+#if defined(__x86_64__) || defined(__i386__)
 #define GGML_COMMON_IMPL_C
 #include "ggml-common.h"
 #include "ggml-quants.h"
@@ -4106,3 +4111,4 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
     ggml_vec_dot_iq4_xs_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
 }
+#endif

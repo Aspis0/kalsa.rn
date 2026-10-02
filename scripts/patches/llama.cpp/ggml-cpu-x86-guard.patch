@@ -1,0 +1,39 @@
+# Kalsa binding overlay, not upstream content: compile the arch/x86 kernels
+# only for x86. Upstream CMake builds ggml-cpu/arch/<target-arch> per target,
+# but the podspec globs every arch dir for every slice, so on an arm64 slice
+# these files take their non-SSE #else bodies, which define the same
+# plain-named symbols (ggml_vec_dot_q4_0_q8_0, ...) the arm kernels define:
+# the duplicate TU only stayed unpulled because the arm member sorts first in
+# the archive. Guard shape per AUDIT S2-6: positive, so the body compiles for
+# every x86 target and is skipped everywhere else. arch/x86/cpu-feats.cpp is
+# already whole-file guarded upstream; quants.c and repack.cpp were not.
+--- a/ggml/src/ggml-cpu/arch/x86/quants.c
++++ b/ggml/src/ggml-cpu/arch/x86/quants.c
+@@ -1,3 +1,8 @@
++// Upstream compiles this file only for x86 targets; the podspec globs every
++// ggml-cpu arch dir for every slice. Compiled for ARM, every AVX test below
++// is false, so the non-SSE #else bodies define the same plain-named symbols
++// the arm kernels define, and the link survives only on archive member order.
++#if defined(__x86_64__) || defined(__i386__)
+ #define GGML_COMMON_IMPL_C
+ #include "ggml-common.h"
+ #include "ggml-quants.h"
+@@ -4106,3 +4111,4 @@
+     ggml_vec_dot_iq4_xs_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
+ #endif
+ }
++#endif
+--- a/ggml/src/ggml-cpu/arch/x86/repack.cpp
++++ b/ggml/src/ggml-cpu/arch/x86/repack.cpp
+@@ -1,3 +1,6 @@
++// Same trap as arch/x86/quants.c: compiled for ARM, the non-SSE #else bodies
++// below define the plain-named repack symbols the arm kernels also define.
++#if defined(__x86_64__) || defined(__i386__)
+ #define GGML_COMMON_IMPL_CPP
+ #define GGML_COMMON_DECL_CPP
+ #include "ggml-common.h"
+@@ -6405,3 +6408,4 @@
+ 
+ #endif
+ }
++#endif

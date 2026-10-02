@@ -84,6 +84,8 @@ def main():
 
     defs = []
     for symtab in symtabs:
+        if symtab[6] >= len(sections):
+            fail(f"{path}: .symtab sh_link {symtab[6]} names no section")
         strtab = sections[symtab[6]]  # sh_link names the string table
         entsize = symtab[9] or ELF32_SYM
         for i in range(symtab[5] // entsize):

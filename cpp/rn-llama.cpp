@@ -94,6 +94,15 @@ std::vector<ggml_backend_dev_t> lane_off_devices(const std::vector<ggml_backend_
 }
 #endif
 
+// The cache types the HTP prefill device can write: SET_ROWS takes only
+// F32/F16/Q8_0 destinations (ggml_hexagon_supported_set_rows,
+// ggml-hexagon.cpp) and FLASH_ATTN_EXT reads K/V as F16/Q8_0. A caller type
+// outside this set aborts the lane's load with a pre-allocated KV
+// destination no backend can write (S23, ggml-backend.cpp).
+bool htp_kv_type_supported(ggml_type type) {
+    return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_Q8_0;
+}
+
 bool load_governor_models(llama_rn_context & owner,
                           const llama_governor_params & governor_params,
                           const llama_governor_thermo_profile & governor_thermo,
@@ -121,15 +130,36 @@ bool load_governor_models(llama_rn_context & owner,
         owner.setGovernorNpuFallback(device_plan.npu_fallback);
         if (device_plan.use_device) {
             prefill_params.devices = { resolved.device, nullptr };
-            // KV buffers follow the layer device (llama-kv-cache.cpp) unless
-            // no_kv_offload: on HTP0 the V-cache write has no backend — HTP
-            // SET_ROWS takes only F32/F16/Q8_0 dst, the app ships a q4_0 V,
-            // and the scheduler cannot reroute a pre-allocated dst, so the
-            // load aborts (S23, ggml-backend.cpp:941). With host-memory KV
-            // the prefill->decode commit is a host memcpy (MirrorAndCopy,
-            // llama-kv-commit.cpp) instead of a read back out of the DSP
-            // buffer.
-            prefill_params.no_kv_offload = true;
+            // The KV buffers follow the layer device (llama-kv-cache.cpp),
+            // so with the lane resolved the prefill KV is HTP-resident —
+            // host-addressable rpcmem, which keeps the prefill->decode
+            // commit a host memcpy (MirrorAndCopy, llama-kv-commit.cpp).
+            // The commit copies rows byte-for-byte and
+            // llama_kv_commit_access::compatible refuses mismatched cache
+            // types, so BOTH contexts must carry the same type: an
+            // HTP-unwritable caller type (the catalog ships V q4_0) is
+            // upgraded to q8_0 in both params. The catalog stays the
+            // authority elsewhere; this override belongs to this lane and
+            // is announced once per load on KALSA_KV_TYPE_OVERRIDE.
+            const ggml_type requested_k = prefill_params.cache_type_k;
+            const ggml_type requested_v = prefill_params.cache_type_v;
+            if (!htp_kv_type_supported(prefill_params.cache_type_k)) {
+                prefill_params.cache_type_k = GGML_TYPE_Q8_0;
+                decode_params.cache_type_k = GGML_TYPE_Q8_0;
+            }
+            if (!htp_kv_type_supported(prefill_params.cache_type_v)) {
+                prefill_params.cache_type_v = GGML_TYPE_Q8_0;
+                decode_params.cache_type_v = GGML_TYPE_Q8_0;
+            }
+            if (prefill_params.cache_type_k != requested_k ||
+                prefill_params.cache_type_v != requested_v) {
+                LOG_INFO(
+                    "KALSA_KV_TYPE_OVERRIDE {requested_k:\"%s\", requested_v:\"%s\", "
+                    "effective_k:\"%s\", effective_v:\"%s\", reason:\"htp-prefill-kv\"}",
+                    ggml_type_name(requested_k), ggml_type_name(requested_v),
+                    ggml_type_name(prefill_params.cache_type_k),
+                    ggml_type_name(prefill_params.cache_type_v));
+            }
         }
 #if defined(__ANDROID__)
     } else {
@@ -148,6 +178,15 @@ bool load_governor_models(llama_rn_context & owner,
         decode_params.devices.push_back(nullptr);
 #endif
     }
+    // What this governor load built, for the getGovernorStats surface: the
+    // cache types BOTH contexts run with (they only diverge from the
+    // caller's params through the lane upgrade above) and where the prefill
+    // KV buffers live — host when no_kv_offload was requested, the layer
+    // device (HTP0 with the lane resolved) otherwise.
+    owner.setGovernorKvCache(
+        ggml_type_name(prefill_params.cache_type_k),
+        ggml_type_name(prefill_params.cache_type_v),
+        prefill_params.no_kv_offload ? "host" : "device");
     prefill_params.n_gpu_layers = 99;
     decode_params.n_gpu_layers = 0;
     prefill_params.n_parallel = 1;
@@ -848,6 +887,29 @@ void llama_rn_context::setGovernorNpuFallback(const char * reason) {
 std::string llama_rn_context::governorNpuFallback() const {
     std::lock_guard<std::mutex> lock(npu_fallback_mutex_);
     return governor_npu_fallback_;
+}
+
+void llama_rn_context::setGovernorKvCache(
+        const char * type_k, const char * type_v, const char * prefill_placement) {
+    std::lock_guard<std::mutex> lock(governor_kv_mutex_);
+    governor_kv_type_k_ = type_k == nullptr ? "" : type_k;
+    governor_kv_type_v_ = type_v == nullptr ? "" : type_v;
+    governor_kv_placement_ = prefill_placement == nullptr ? "" : prefill_placement;
+}
+
+std::string llama_rn_context::governorKvTypeK() const {
+    std::lock_guard<std::mutex> lock(governor_kv_mutex_);
+    return governor_kv_type_k_;
+}
+
+std::string llama_rn_context::governorKvTypeV() const {
+    std::lock_guard<std::mutex> lock(governor_kv_mutex_);
+    return governor_kv_type_v_;
+}
+
+std::string llama_rn_context::governorKvPlacement() const {
+    std::lock_guard<std::mutex> lock(governor_kv_mutex_);
+    return governor_kv_placement_;
 }
 
 void llama_rn_context::note_htp_runtime_fallback() {

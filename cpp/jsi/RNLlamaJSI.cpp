@@ -903,8 +903,16 @@ namespace rnllama_jsi {
                         const bool hasNpuDevice = !npuDevice.empty();
                         const std::string npuFallback = ctx->governorNpuFallback();
                         const bool hasNpuFallback = !npuFallback.empty();
+                        // Effective KV facts of the load: the cache types
+                        // both contexts share and where the prefill KV
+                        // lives. Null when no governor load has published
+                        // them (fresh context, non-governor load).
+                        const std::string kvTypeK = ctx->governorKvTypeK();
+                        const std::string kvTypeV = ctx->governorKvTypeV();
+                        const std::string kvPlacement = ctx->governorKvPlacement();
                         return [stats, failure, active, hasNpuDevice, npuDevice,
-                                hasNpuFallback, npuFallback](jsi::Runtime& rt) {
+                                hasNpuFallback, npuFallback, kvTypeK, kvTypeV,
+                                kvPlacement](jsi::Runtime& rt) {
                             jsi::Object result(rt);
                             result.setProperty(rt, "active", active);
                             result.setProperty(rt, "engine_prefill", governorEngineName(stats.prefill_engine));
@@ -927,6 +935,15 @@ namespace rnllama_jsi {
                             result.setProperty(rt, "npu_fallback",
                                 hasNpuFallback ? jsi::String::createFromUtf8(rt, npuFallback)
                                                : jsi::Value::null());
+                            result.setProperty(rt, "cache_type_k",
+                                !kvTypeK.empty() ? jsi::String::createFromUtf8(rt, kvTypeK)
+                                                 : jsi::Value::null());
+                            result.setProperty(rt, "cache_type_v",
+                                !kvTypeV.empty() ? jsi::String::createFromUtf8(rt, kvTypeV)
+                                                 : jsi::Value::null());
+                            result.setProperty(rt, "prefill_kv",
+                                !kvPlacement.empty() ? jsi::String::createFromUtf8(rt, kvPlacement)
+                                                     : jsi::Value::null());
                             return result;
                         };
                     }, contextId);

@@ -195,6 +195,21 @@ struct llama_rn_context {
     mutable std::mutex npu_fallback_mutex_;
     std::string governor_npu_device_;
     std::string governor_npu_fallback_;
+    // What the governor load built, published once per load by
+    // load_governor_models: the cache ggml type names BOTH contexts run
+    // with (the HTP lane upgrades HTP-unwritable caller types, so they can
+    // differ from params) and where the prefill KV buffers live ("device"
+    // | "host"). Same load-writer / JSI-reader split as the npu fields
+    // above — mutex-guarded accessors, readers hold copies.
+    void setGovernorKvCache(
+        const char * type_k, const char * type_v, const char * prefill_placement);
+    std::string governorKvTypeK() const;
+    std::string governorKvTypeV() const;
+    std::string governorKvPlacement() const;
+    mutable std::mutex governor_kv_mutex_;
+    std::string governor_kv_type_k_;
+    std::string governor_kv_type_v_;
+    std::string governor_kv_placement_;
 
     bool hasGovernor() const;
     bool governorFailed() const;

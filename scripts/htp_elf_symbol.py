@@ -12,7 +12,7 @@ headers and .symtab directly. It is enough to resolve one symbol: file offset
 = sh_offset + (st_value - sh_addr) of the section st_shndx names.
 
 Fails (exit 1, message on stderr) when the file is not ELF32 LE, has no
-.symtab, or the symbol has zero or multiple definitions.
+.symtab, is truncated, or the symbol has zero or multiple definitions.
 """
 import struct
 import sys
@@ -57,12 +57,17 @@ def main():
     e_shnum = struct.unpack_from("<H", data, 0x30)[0]
     if e_shoff == 0 or e_shnum == 0:
         fail(f"{path}: no section headers")
+    if e_shentsize != ELF32_SHDR:
+        fail(f"{path}: e_shentsize is {e_shentsize}, want {ELF32_SHDR}")
 
     sections = []
     for i in range(e_shnum):
         base = e_shoff + i * e_shentsize
         # name, type, flags, addr, offset, size, link, info, align, entsize
-        sections.append(struct.unpack_from("<IIIIIIIIII", data, base))
+        try:
+            sections.append(struct.unpack_from("<IIIIIIIIII", data, base))
+        except struct.error:
+            fail(f"{path}: truncated section header table")
 
     symtabs = [s for s in sections if s[1] == SHT_SYMTAB]
     if not symtabs:
@@ -74,8 +79,11 @@ def main():
         entsize = symtab[9] or ELF32_SYM
         for i in range(symtab[5] // entsize):
             base = symtab[4] + i * entsize
-            st_name, st_value, _size, _info, _other, st_shndx = struct.unpack_from(
-                "<IIIBBH", data, base)
+            try:
+                st_name, st_value, _size, _info, _other, st_shndx = struct.unpack_from(
+                    "<IIIBBH", data, base)
+            except struct.error:
+                fail(f"{path}: truncated symbol table")
             if st_shndx == SHN_UNDEF or st_shndx >= SHN_LORESERVE:
                 continue
             str_off, str_size = strtab[4], strtab[5]

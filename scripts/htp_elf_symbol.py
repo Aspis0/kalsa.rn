@@ -7,7 +7,9 @@ identity stamps through this resolver instead of grepping raw bytes, so an
 appended look-alike string cannot vouch for anything -- only the bytes the
 symbol actually points at count. e_flags carries the compiled DSP version
 (the Hexagon toolchain encodes -mcpu=hexagonvNN as the version digits in
-the low byte), which binds the bytes to the filename they ship under.
+the low byte), which binds the bytes to the filename they ship under;
+e_flags is the toolchain's target label, and rewriting it is deliberate
+header surgery, out of scope like forging the stamps.
 
 nm/objdump are not portable here: macOS ships neither in an ELF-capable form
 and the slim ubuntu runner image has no binutils, so this parses the section

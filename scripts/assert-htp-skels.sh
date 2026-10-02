@@ -171,7 +171,9 @@ check_stamp() {
 # -mcpu=hexagonvNN as the version digits in e_flags' low byte (v73 ->
 # 0x00000073 ... v81 -> 0x00000081, verified on the four committed skels),
 # so the bytes carry their own ISA even when the manifest digests were
-# rewritten around a swapped file.
+# rewritten around a swapped file. e_flags is the toolchain's target label;
+# rewriting it is deliberate header surgery, out of scope like forging the
+# stamps.
 check_dsp_version() {
   local got want
   want="$(printf '0x%08x' "$((16#${3#v}))")"

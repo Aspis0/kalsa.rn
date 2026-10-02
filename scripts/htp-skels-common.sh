@@ -11,13 +11,19 @@ HTP_DSP_VERSIONS="v73 v75 v79 v81"
 # headers the htp sources include, and the whole ggml-hexagon tree (the
 # recipe's archive list) -- QAIC IDL, toolchain file, and tracked host stub
 # included. The Android build never compiles that tree through the engine's
-# own CMakeLists, so the two files that define how the host hexagon backend
-# is compiled (android/src/main/rnllama/CMakeLists.txt: the hand-written
-# target_sources / target_include_directories; cmake/rnllama-sources.cmake:
-# RNLLAMA_GGML_HEXAGON_DIR) are fingerprinted too -- a committed edit that
-# makes the host backend resolve the protocol from different sources moves
-# the fingerprint exactly like a vendored edit. One list, two consumers: the
-# recipe archives exactly these paths, and htp_src_fingerprint hashes them.
+# own CMakeLists, so the committed CMake build definition of the host hexagon
+# backend is fingerprinted too: android/src/main/rnllama/CMakeLists.txt (the
+# hand-written target_sources / target_include_directories),
+# cmake/rnllama-sources.cmake (RNLLAMA_GGML_HEXAGON_DIR) and
+# android/src/main/cmake/rnllama-build-options.cmake, which the rnllama
+# CMakeLists includes. Covered is exactly that: the vendored hexagon sources
+# plus the CMake build definition. NOT covered: the CMake arguments and
+# include-path overrides Gradle passes in from android/build.gradle -- that
+# file changes for unrelated reasons, and fingerprinting it would force a
+# ~20-minute skel rebuild on every Gradle edit. The fingerprint is a review
+# control against accidental skew, not a proof against deliberate tampering.
+# One list, two consumers: the recipe archives exactly these paths, and
+# htp_src_fingerprint hashes them.
 HTP_SRC_PATHS=(
   vendor/llama.cpp/ggml/include
   vendor/llama.cpp/ggml/src/ggml-backend-impl.h
@@ -27,6 +33,7 @@ HTP_SRC_PATHS=(
   vendor/llama.cpp/ggml/src/ggml-hexagon
   cmake/rnllama-sources.cmake
   android/src/main/rnllama/CMakeLists.txt
+  android/src/main/cmake/rnllama-build-options.cmake
 )
 
 # sha256sum on Linux (the CI runner), shasum on macOS (local runs); both

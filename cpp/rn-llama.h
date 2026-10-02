@@ -183,16 +183,17 @@ struct llama_rn_context {
     // Plan fields for the app's KALSA_GOVERNOR_PLAN: which prefill device
     // the governor lane resolved to, and why it degraded to GPU (set by
     // load_governor_models only when npu_lane_enabled, read by the
-    // getGovernorStats JSI map). Both stay null with the lane off.
-    const char * governor_npu_device = nullptr;
-    // The HTP degrade reason, empty when the lane is on: the plan reason from
-    // the load step, or the runtime fallback recorded on the decode thread.
-    // The stats task copies it from a JSI worker thread while a decode may be
-    // recording it — a data race on the old bare pointer — so every access
-    // goes through the mutex-guarded accessors, and readers hold copies.
+    // getGovernorStats JSI map). Both stay empty with the lane off. The
+    // stats task copies them from a JSI worker thread while the load or
+    // decode thread writes them — a data race on the old bare fields — so
+    // every access goes through the mutex-guarded accessors, and readers
+    // hold copies.
+    void setGovernorNpuDevice(const char * device);
     void setGovernorNpuFallback(const char * reason);
+    std::string governorNpuDevice() const;
     std::string governorNpuFallback() const;
     mutable std::mutex npu_fallback_mutex_;
+    std::string governor_npu_device_;
     std::string governor_npu_fallback_;
 
     bool hasGovernor() const;

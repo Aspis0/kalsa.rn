@@ -108,13 +108,13 @@ bool load_governor_models(llama_rn_context & owner,
     if (governor_params.npu_lane_enabled) {
         // Lane asked for: resolve the device and fill the plan fields. With
         // the lane off (today's default) the resolver is skipped and both
-        // fields stay null — a default plan must not claim htp-device-missing
+        // fields stay empty — a default plan must not claim htp-device-missing
         // for a lane nobody asked for.
         const char * htp_init_reason = std::getenv("KALSA_HTP_FALLBACK");
         const auto resolved = llama_governor_resolve_prefill_device();
         const auto device_plan = decide_governor_prefill_device(
             resolved.device != nullptr, resolved.npu_fallback, htp_init_reason);
-        owner.governor_npu_device = device_plan.npu_device;
+        owner.setGovernorNpuDevice(device_plan.npu_device);
         // The accessor copies the reason bytes out of environ; the runtime
         // fallback's setenv (note_htp_runtime_fallback) is allowed to
         // reallocate it.
@@ -830,6 +830,16 @@ bool llama_rn_context::setPrefillOverride(int mode) {
     return governor != nullptr && governor->set_prefill_override(mode);
 }
 
+void llama_rn_context::setGovernorNpuDevice(const char * device) {
+    std::lock_guard<std::mutex> lock(npu_fallback_mutex_);
+    governor_npu_device_ = device == nullptr ? "" : device;
+}
+
+std::string llama_rn_context::governorNpuDevice() const {
+    std::lock_guard<std::mutex> lock(npu_fallback_mutex_);
+    return governor_npu_device_;
+}
+
 void llama_rn_context::setGovernorNpuFallback(const char * reason) {
     std::lock_guard<std::mutex> lock(npu_fallback_mutex_);
     governor_npu_fallback_ = reason == nullptr ? "" : reason;
@@ -843,12 +853,14 @@ std::string llama_rn_context::governorNpuFallback() const {
 void llama_rn_context::note_htp_runtime_fallback() {
     // The decode wrapper has already attributed this failure to the HTP
     // prefill compute (htp_prefill_runtime_failure); the recorder enforces
-    // what it owns: the lane resolved (governor_npu_device — without one,
-    // prefill already runs on the non-HTP path) and no reason is recorded
-    // yet — first writer wins, under the mutex the stats task also takes.
+    // what it owns: the lane resolved (governorNpuDevice() — without one,
+    // prefill already runs on the non-HTP path) and no reason recorded yet —
+    // the first reason written in this context's life wins, and this
+    // recorder never displaces the plan reason the load step published
+    // (every load is a fresh context, so that publish is its first write).
     // HTP errors before the lane opened ride the env instead (Java
     // noteHtpFallback / the resolver's own reason).
-    if (governor_npu_device == nullptr) {
+    if (governorNpuDevice().empty()) {
         return;
     }
     {

@@ -10,6 +10,7 @@ import path from 'path'
 
 const rnLlama = fs.readFileSync(path.join(__dirname, '../../cpp/rn-llama.cpp'), 'utf8')
 const rnLlamaHeader = fs.readFileSync(path.join(__dirname, '../../cpp/rn-llama.h'), 'utf8')
+const rnLlamaJsi = fs.readFileSync(path.join(__dirname, '../../cpp/jsi/RNLlamaJSI.cpp'), 'utf8')
 
 const recorder = () =>
   rnLlama.match(/void llama_rn_context::note_htp_runtime_fallback\(\) {[\S\s]*?\n}/)
@@ -28,9 +29,9 @@ test('a real governor decode failure records the runtime fallback', () => {
 test('the recorder degrades only an engaged, not-yet-degraded lane', () => {
   const fn = recorder()
   expect(fn).not.toBeNull()
-  // governor_npu_device is set only when the lane resolved to HTP0; a
+  // governorNpuDevice() is non-empty only when the lane resolved to HTP0; a
   // recorded reason means an earlier degrade (init or runtime) already won.
-  expect(fn![0]).toContain('governor_npu_device == nullptr')
+  expect(fn![0]).toContain('governorNpuDevice().empty()')
   // First writer wins under the mutex: the stats task reads the reason from
   // a JSI worker thread while a decode may be recording it.
   expect(fn![0]).toContain('!governor_npu_fallback_.empty()')
@@ -48,16 +49,25 @@ test('the recorder sets the env with overwrite, never a parallel route path', ()
   expect(fn![0]).not.toContain('set_prefill_override')
 })
 
-test('each load reads the env fresh; the published reason is mutex-guarded', () => {
+test('each load reads the env fresh; the plan fields are mutex-guarded', () => {
   // No caching of the reason across loads: the runtime setenv must be seen
   // by the next load_governor_models.
   expect(rnLlama).toContain('std::getenv("KALSA_HTP_FALLBACK")')
   // setenv(3) may reallocate environ, so nothing holds a getenv pointer: the
   // load copies the reason bytes through the synchronized accessor, and the
   // stats task reads a copy through the same mutex.
+  expect(rnLlama).toContain('owner.setGovernorNpuDevice(device_plan.npu_device);')
   expect(rnLlama).toContain('owner.setGovernorNpuFallback(device_plan.npu_fallback);')
   expect(rnLlamaHeader).toContain('std::mutex npu_fallback_mutex_')
-  expect(rnLlamaHeader).toContain("std::string governorNpuFallback() const;")
+  expect(rnLlamaHeader).toContain('std::string governorNpuDevice() const;')
+  expect(rnLlamaHeader).toContain('std::string governorNpuFallback() const;')
+})
+
+test('the stats task reads the device through the same guarded accessor', () => {
+  // The bare ctx->governor_npu_device read was the sibling of the fallback
+  // race: bytes copied through an unsynchronized pointer on a JSI worker.
+  expect(rnLlamaJsi).toContain('ctx->governorNpuDevice()')
+  expect(rnLlamaJsi).not.toContain('ctx->governor_npu_device')
 })
 
 test('the recorded reason rides the log line the lab parses, at failure time', () => {

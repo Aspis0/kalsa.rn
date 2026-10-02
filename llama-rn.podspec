@@ -62,10 +62,12 @@ Pod::Spec.new do |s|
     # target, which a podspec cannot pick per slice, so the pod compiles the
     # arm and x86 kernels on every Apple slice and excludes every other arch
     # dir: wasm is vendored but no Apple slice runs it, and powerpc,
-    # loongarch, riscv, s390 and spacemit are pruned by sync-vendor.sh today
-    # -- named here so a wider sync manifest cannot silently add them back.
-    # The arm kernels carry an ARM-only guard for the x86 slices
-    # (scripts/patches/llama.cpp/ggml-cpu-arm-guard.patch).
+    # loongarch, riscv, s390 and spacemit are simply absent from
+    # sync-vendor.sh's LLAMA_CPP_PATHS export list (LLAMA_CPP_PRUNE is
+    # empty) -- named here so a wider sync manifest cannot silently add them
+    # back. The arm and x86 kernels each carry a positive guard for foreign
+    # slices (scripts/patches/llama.cpp/ggml-cpu-arm-guard.patch,
+    # ggml-cpu-x86-guard.patch), so a stray kernel TU compiles empty.
     s.exclude_files = "#{llama_cpp}/src/llama-quant.cpp", "#{llama_cpp}/ggml/src/ggml.cpp",
       "#{llama_cpp}/common/{arg,console,debug,download,hf-cache,imatrix-loader,llguidance,preset,subproc}.cpp",
       "#{llama_cpp}/ggml/src/ggml-cpu/hbm.cpp",

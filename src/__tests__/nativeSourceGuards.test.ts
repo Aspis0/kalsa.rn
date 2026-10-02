@@ -1,8 +1,9 @@
 /**
  * Source-text guards for binding-native invariants jest cannot execute: the
  * governor failure error prefix is a stable API (the JSI throw is the delivery
- * channel to JS), and the eval-failure log must not carry prompt text into
- * logcat.
+ * channel to JS), the eval-failure log must not carry prompt text into
+ * logcat, and logToJsCallback must not forward DEBUG lines, which carry the
+ * same prompt text.
  */
 import fs from 'fs'
 import path from 'path'
@@ -70,4 +71,17 @@ test('eval-failure log carries no token text', () => {
   )
   expect(logStatement).not.toBeNull()
   expect(logStatement![0]).not.toContain('tokens_to_str')
+})
+
+test('logToJsCallback never forwards DEBUG', () => {
+  // The forwardable set inside logToJsCallback is the only gate between DEBUG
+  // lines and stderr + JS (CONT follows the tracker), so the level name must
+  // appear nowhere in the function; the INFO needle keeps a deleted set from
+  // passing silently.
+  const fn = cpp('jsi/RNLlamaJSI.cpp').match(
+    /static void logToJsCallback\([\S\s]*?^ {4}}\n/m,
+  )
+  expect(fn).not.toBeNull()
+  expect(fn![0]).toContain('GGML_LOG_LEVEL_INFO')
+  expect(fn![0]).not.toContain('GGML_LOG_LEVEL_DEBUG')
 })

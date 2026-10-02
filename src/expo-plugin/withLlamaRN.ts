@@ -82,7 +82,17 @@ const withLlamaRn: ConfigPlugin<PluginOptions> = (config, options = {}) => {
         if (!fs.existsSync(podfilePath)) return c
         const contents = fs.readFileSync(podfilePath, 'utf8')
 
-        if (contents.includes('LLAMA_RN_CXX20')) return c
+        if (contents.includes('LLAMA_RN_CXX20')) {
+          // Before 4f884d74 (2c) the stamp also set OTHER_CPLUSPLUSFLAGS, which
+          // clobbers the flags react_native_post_install composed, so a Podfile
+          // from that revision must lose the line on every prebuild.
+          const cleaned = contents.replace(
+            "\n        config.build_settings['OTHER_CPLUSPLUSFLAGS'] = '$(inherited) -std=gnu++20'",
+            '',
+          )
+          if (cleaned !== contents) fs.writeFileSync(podfilePath, cleaned)
+          return c
+        }
 
         const postInstallIdx = contents.indexOf('post_install do |installer|')
         if (postInstallIdx === -1) return c

@@ -74,14 +74,16 @@ test('eval-failure log carries no token text', () => {
 })
 
 test('logToJsCallback never forwards DEBUG', () => {
-  // The forwardable set inside logToJsCallback is the only gate between DEBUG
-  // lines and stderr + JS (CONT follows the tracker), so the level name must
-  // appear nowhere in the function; the INFO needle keeps a deleted set from
-  // passing silently.
+  // Pins two shapes, not the logic: DEBUG is never named in the forwardable
+  // set, and the early return on a non-forwardable line comes before the
+  // stderr write. The INFO needle keeps a deleted set from passing silently.
   const fn = cpp('jsi/RNLlamaJSI.cpp').match(
     /static void logToJsCallback\([\S\s]*?^ {4}}\n/m,
   )
   expect(fn).not.toBeNull()
   expect(fn![0]).toContain('GGML_LOG_LEVEL_INFO')
   expect(fn![0]).not.toContain('GGML_LOG_LEVEL_DEBUG')
+  const gate = fn![0].indexOf('if (!forwardable)')
+  expect(gate).toBeGreaterThan(-1)
+  expect(gate).toBeLessThan(fn![0].indexOf('llama_log_callback_default'))
 })

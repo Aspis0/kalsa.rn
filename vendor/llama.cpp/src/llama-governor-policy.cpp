@@ -262,8 +262,9 @@ llama_governor_engine llama_governor_policy::prefill_engine(
     // hot, CPU never while an accelerator qualifies - and the NPU is the
     // coolest prefill backend measured (S23 heat arms, lab
     // s23-heat-arms-engine commit 147b0351: 6.45 / 24.17 / 44.59 C*s per
-    // 1k tokens NPU / GPU / CPU), so the lane stays eligible in FAST and in
-    // COOLMODE; the arms are measured, the old "hop thresholds pending the
+    // 1k tokens NPU / GPU / CPU), so the lane stays eligible in FAST, WARM
+    // and COOLMODE (owner 2026-10-03: a warm phone must not move prefill to
+    // the GPU, ~3.7x the NPU's heat integral per 1k tokens); the arms are measured, the old "hop thresholds pending the
     // NPU heat arm" clause is closed. "GPU when the NPU is hot" needs an
     // NPU temperature input that does not exist yet: a later step, not
     // invented here. OFF unless npu_lane_enabled: npu_fit Fit, readable
@@ -274,6 +275,7 @@ llama_governor_engine llama_governor_policy::prefill_engine(
         params_.htp_trunk_readable &&
         (params_.model_kind != llama_governor_model_kind::MoE || params_.htp_experts_readable) &&
         (state_ == llama_governor_thermal_state::FAST ||
+         state_ == llama_governor_thermal_state::WARM ||
          state_ == llama_governor_thermal_state::COOLMODE)) {
         return llama_governor_engine::NPU;
     }

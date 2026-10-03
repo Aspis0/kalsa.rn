@@ -136,6 +136,32 @@ bool test_decode_repack_both_directions() {
     return !parses(governor, &ignored);
 }
 
+// The engine's llama_governor_generation gained V81 (an S8 Gen 4 class DSP,
+// unqualified for GPU prefill in the engine); the binding parser must map the
+// capability string through and keep refusing an arch it does not know.
+static bool test_generation_parses_v81() {
+    auto governor = base_governor();
+    governor["generation"] = "V81";
+    llama_governor_params params{};
+    llama_governor_thermo_profile thermo{};
+    governor_load_options options{};
+    try {
+        if (!parse_governor_params(governor, params, thermo, options)) {
+            std::cerr << "parse_governor_params returned false" << std::endl;
+            return false;
+        }
+    } catch (const std::exception & e) {
+        std::cerr << "unexpected throw: " << e.what() << std::endl;
+        return false;
+    }
+    if (params.generation != llama_governor_generation::V81) {
+        std::cerr << "\"V81\" did not map to llama_governor_generation::V81" << std::endl;
+        return false;
+    }
+    governor["generation"] = "V85";
+    return !parses(governor);
+}
+
 // npu_lane_enabled used to throw "Governor NPU lane is not supported" at
 // parse time; the engine now owns the lane (prefill_engine NPU branch), so
 // the binding must forward the flag untouched.
@@ -402,6 +428,7 @@ int main() {
     results.run_test("decode rc failure discriminates on engine state", test_governor_decode_failed_discriminator());
     results.run_test("governor decode_repack parses both directions", test_decode_repack_both_directions());
     results.run_test("npu_lane_enabled forwards without throwing", test_npu_lane_enabled_forwards());
+    results.run_test("generation V81 parses, unknown arch refuses", test_generation_parses_v81());
     results.run_test("prefill device plan degrades / opens HTP0", test_prefill_device_plan());
     results.run_test("runtime htp reason degrades the next load", test_htp_runtime_reason_degrades_next_load());
     results.run_test("only the HTP prefill compute failure kills the lane", test_htp_prefill_runtime_failure_attribution());

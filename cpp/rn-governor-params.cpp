@@ -50,6 +50,7 @@ llama_governor_generation generation_from(const std::string & value) {
     if (value == "V73") return llama_governor_generation::V73;
     if (value == "V75") return llama_governor_generation::V75;
     if (value == "V79") return llama_governor_generation::V79;
+    if (value == "V81") return llama_governor_generation::V81;
     throw std::invalid_argument("Unsupported governor.generation: " + value);
 }
 

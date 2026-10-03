@@ -201,7 +201,7 @@ export type NativeContextParams = {
     embd_normalize?: number;
     governor?: {
         enabled: true;
-        generation?: 'V73' | 'V75' | 'V79' | 'NoHTP' | 'Unknown';
+        generation?: 'V73' | 'V75' | 'V79' | 'V81' | 'NoHTP' | 'Unknown';
         model_kind?: 'Dense' | 'Hybrid' | 'MoE' | 'Unknown';
         gpu_fit?: 'Fit' | 'NoFit' | 'NotFit' | 'Unknown';
         bench_force_gpu_prefill?: boolean;

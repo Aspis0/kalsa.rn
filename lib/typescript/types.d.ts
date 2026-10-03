@@ -208,6 +208,11 @@ export type NativeContextParams = {
         npu_lane_enabled?: boolean;
         reload_budget_available?: boolean;
         decode_repack?: boolean;
+        /**
+         * Decode-hop prototype: alternate CPU / live NPU lane every N generated
+         * tokens, no reload. 0 (default) keeps CPU-only decode.
+         */
+        decode_hop_tokens?: number;
         thermo: GovernorThermoProfile;
     };
 };
@@ -217,6 +222,15 @@ export type GovernorStats = {
     engine_decode: string;
     commit_bytes: number;
     commit_ms: number;
+    /** Decode-hop observability: decode-to-decode context switches executed,
+     *  tokens decoded on each context, and the switch cost (already included
+     *  in commit_bytes / commit_ms). Zero everywhere when decode_hop_tokens
+     *  is off. */
+    decode_hops: number;
+    decode_tokens_cpu: number;
+    decode_tokens_npu: number;
+    decode_hop_commit_bytes: number;
+    decode_hop_commit_ms: number;
     prefill_ms: number;
     prefill_chunks: string;
     prefill_ctx_ngl: number;

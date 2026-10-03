@@ -165,6 +165,23 @@ bool parse_governor_params(
         governor, "expert_cycle_bytes", params.expert_cycle_bytes);
     params.expert_substitution_lambda = value_or(
         governor, "expert_substitution_lambda", params.expert_substitution_lambda);
+    // decode_hop_tokens is the decode-hop cadence: 0 (or absent) keeps
+    // CPU-only decode, > 0 alternates CPU / live NPU lane every N generated
+    // tokens. JSI numbers arrive as doubles, so integrality is a value
+    // check; the ordered bounds also reject NaN and Infinity, and the
+    // uint32 ceiling matches the engine field.
+    if (governor.contains("decode_hop_tokens")) {
+        const auto & hop = governor.at("decode_hop_tokens");
+        if (!hop.is_number()) {
+            throw std::invalid_argument("governor.decode_hop_tokens must be a number");
+        }
+        const double raw = hop.get<double>();
+        if (!(raw >= 0.0 && raw <= 4294967295.0 && raw == std::trunc(raw))) {
+            throw std::invalid_argument(
+                "governor.decode_hop_tokens must be a non-negative integer");
+        }
+        params.decode_hop_tokens = static_cast<uint32_t>(raw);
+    }
     // npu_lane_enabled is forwarded: the engine's prefill_engine owns the
     // lane (owner rule 2026-09-28) and load_governor_models decides the
     // device with llama_governor_resolve_prefill_device + degrade.

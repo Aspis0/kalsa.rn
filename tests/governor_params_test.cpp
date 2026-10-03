@@ -136,7 +136,7 @@ bool test_decode_repack_both_directions() {
     return !parses(governor, &ignored);
 }
 
-// The engine's llama_governor_generation gained V81 (an S8 Gen 4 class DSP,
+// The engine's llama_governor_generation gained V81 (Snapdragon 8 Elite Gen 5, Hexagon v81,
 // unqualified for GPU prefill in the engine); the binding parser must map the
 // capability string through and keep refusing an arch it does not know.
 static bool test_generation_parses_v81() {

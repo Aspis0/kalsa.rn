@@ -231,6 +231,15 @@ export type GovernorStats = {
     npu_device: string | null;
     /** Why the lane degraded to GPU; null when HTP0 resolved. */
     npu_fallback: string | null;
+    /** Effective KV cache ggml type both governor contexts run with. The HTP
+     *  lane upgrades HTP-unwritable caller types (anything but f32/f16/q8_0)
+     *  to q8_0, so this can differ from the init params; null when no
+     *  governor load has published them. */
+    cache_type_k: string | null;
+    cache_type_v: string | null;
+    /** Where the prefill KV buffers live: "device" (the layer device —
+     *  HTP0 when the lane resolved) or "host"; null when no governor load. */
+    prefill_kv: string | null;
 };
 export type NativeCompletionParams = {
     prompt: string;

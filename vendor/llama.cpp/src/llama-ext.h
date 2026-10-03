@@ -200,6 +200,7 @@ enum class llama_governor_generation {
     V73,
     V75,
     V79,
+    V81,           // Unqualified for GPU prefill: prefill_engine() admits only V73/V75/V79.
 };
 
 enum class llama_governor_model_kind {

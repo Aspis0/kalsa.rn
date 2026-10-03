@@ -7648,7 +7648,10 @@ static const char * ggml_backend_hexagon_device_get_name(ggml_backend_dev_t dev)
 }
 
 static const char * ggml_backend_hexagon_device_get_description(ggml_backend_dev_t dev) {
-    return "Hexagon";
+    // Clients parse the trailing "v<NN>" token to read the runtime HTP arch.
+    static const std::string desc = "Hexagon v" + std::to_string(opt_arch);
+    return desc.c_str();
+
     GGML_UNUSED(dev);
 }
 
@@ -8045,7 +8048,9 @@ ggml_hexagon_registry::ggml_hexagon_registry(ggml_backend_reg_t reg) {
     GGML_LOG_INFO("ggml-hex: batch response timeout %u ms\n", opt_rsp_timeout_ms);
     GGML_LOG_INFO("ggml-hex: Hexagon backend (experimental) : allocating new registry : ndev %zu\n", opt_ndev);
 
-    GGML_LOG_INFO("ggml-hex: Hexagon Arch version v%d, DMA64 %s\n", opt_arch, opt_dma64 ? "enabled" : "disabled");
+    if (opt_arch > 0) {
+        GGML_LOG_INFO("ggml-hex: Hexagon Arch version v%d, DMA64 %s\n", opt_arch, opt_dma64 ? "enabled" : "disabled");
+    }
 
     // Create devices
     for (size_t i = 0; i < opt_ndev; i++) {
@@ -8434,26 +8439,29 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_hostbuf  = getenv("GGML_HEXAGON_HOSTBUF");
     const char * str_dma64    = getenv("GGML_HEXAGON_DMA64");
 
-    // Init Arch first since it affects other defaults
+    // Archs this build ships an HTP skel for; keep in sync with the
+    // build_htp_skel() calls in ggml/src/ggml-hexagon/CMakeLists.txt.
+    static constexpr int skel_archs[] = {73, 75, 79, 81};
+
+    // Init Arch first since it affects other defaults. An arch without a built
+    // skel (query failure, v69, a future v83, or a bad GGML_HEXAGON_ARCH) must
+    // not load a foreign skel: no HTP device is registered, so the app falls back.
+    bool arch_read = true;
     if (!str_arch) {
         int err = htpdrv_get_arch(CDSP_DOMAIN_ID, &opt_arch);
         if (err != 0) {
-            GGML_LOG_ERROR("ggml-hex: failed to query HTP version (err %d) defaulting to v73\n", err);
-            opt_arch = 73;
-        } else {
-            if (opt_arch < 73) {
-                GGML_LOG_WARN("ggml-hex: Hexagon arch v%d is under supported range, capping at v73\n", opt_arch);
-                opt_arch = 73;
-            } else if (opt_arch > 81) {
-                GGML_LOG_WARN("ggml-hex: Hexagon arch v%d is over supported range, capping at v81\n", opt_arch);
-                opt_arch = 81;
-            }
+            GGML_LOG_WARN("ggml-hex: HTP arch query failed (err %d); registering no HTP device\n", err);
+            arch_read = false;
         }
     } else {
         if (str_arch[0] == 'v' || str_arch[0] == 'V') {
             str_arch++;
         }
         opt_arch = strtoul(str_arch, NULL, 0);
+    }
+    const bool arch_ok = arch_read && std::find(std::begin(skel_archs), std::end(skel_archs), opt_arch) != std::end(skel_archs);
+    if (arch_read && !arch_ok) {
+        GGML_LOG_WARN("ggml-hex: Hexagon arch v%d has no HTP skel in this build; registering no HTP device\n", opt_arch);
     }
 
     size_t MiB = 1024 * 1024;
@@ -8684,15 +8692,21 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
         opt_device_configs[0].mdev_group.clear();
     }
 
+    if (!arch_ok) {
+        opt_ndev = 0;
+    }
+
 #if defined(__ANDROID__)
-    if (opt_arch < 75) {
+    if (arch_ok && opt_arch < 75) {
         opt_ndev = 1;
         GGML_LOG_WARN("ggml-hex: forcing ndev to 1 for SoCs archs lower than v75.\n");
     }
 #endif
 
     // Resolve domain info for all configured devices
-    ggml_hexagon_discover_devices();
+    if (opt_ndev > 0) {
+        ggml_hexagon_discover_devices();
+    }
 
     if (str_profile) {
         opt_pmu_evt = [&]() -> std::vector<uint32_t> {

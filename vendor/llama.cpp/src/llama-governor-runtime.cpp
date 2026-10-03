@@ -178,7 +178,9 @@ int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {
 }
 
 int32_t llama_governor::select_decode() {
-    const auto selection = policy_.select_decode(ggml_time_us() / 1000);
+    const auto selection = policy_.select_decode(ggml_time_us() / 1000, decode_tokens_since_prefill_);
+    // The engine routes this batch: NPU decode runs on ctx_prefill (decode_impl).
+    decode_engine_ = selection.engine;
     stats_.decode_engine = selection.engine;
     stats_.decode_requires_reload = selection.requires_reload;
     stats_.last_router_rule = selection.rule;
@@ -222,6 +224,7 @@ void llama_governor::clear_cache(bool clear_data) {
     last_ctx = nullptr;
     last_phase = phase::None;
     prefill_route_ = prefill_route::Undecided;
+    decode_tokens_since_prefill_ = 0;
 
     stats_.commit_bytes = 0;
     stats_.commit_us = 0;
@@ -231,10 +234,20 @@ void llama_governor::clear_cache(bool clear_data) {
     stats_.commit_transfers_k = 0;
     stats_.commit_transfers_naive = 0;
     stats_.commit_transfers_staged = 0;
+    stats_.decode_hops = 0;
+    stats_.decode_tokens_cpu = 0;
+    stats_.decode_tokens_npu = 0;
+    stats_.decode_hop_commit_bytes = 0;
+    stats_.decode_hop_commit_us = 0;
 }
 
 void llama_governor::reset_prefill_stats() {
     prefill_route_ = prefill_route::Undecided;
+    // The hop clock is per-turn routing state like the latch: the binding
+    // calls this at every completion start, so a turn whose prompt was fully
+    // cached (its 1-token batch never enters the prefill branch) still opens
+    // at hop window 0 on CPU.
+    decode_tokens_since_prefill_ = 0;
     stats_.prefill_us = 0;
     stats_.prefill_n = 0;
     stats_.prefill_chunks[0] = '\0';

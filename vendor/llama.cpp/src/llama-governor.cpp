@@ -279,9 +279,14 @@ int32_t llama_governor::decode_impl(llama_batch batch, bool allow_chunking) {
 
     const bool is_prefill = batch.n_tokens > 1;
     // The route latch re-arms only on prefill entry from another phase (or
-    // via clear_cache/reset): within one prefill phase the engine stays put.
+    // via clear_cache/reset_prefill_stats): within one prefill phase the
+    // engine stays put. The hop clock restarts with the latch - here, and at
+    // the binding's per-completion reset_prefill_stats call - so every turn
+    // opens a fresh CPU window even when the prompt was fully cached and its
+    // 1-token batch never enters this prefill branch.
     if (is_prefill && allow_chunking && last_phase != phase::Prefill) {
         prefill_route_ = prefill_route::Undecided;
+        decode_tokens_since_prefill_ = 0;
     }
 
     if (policy_enabled_) {
@@ -292,9 +297,16 @@ int32_t llama_governor::decode_impl(llama_batch batch, bool allow_chunking) {
         }
     }
 
+    // The target context is chosen by (phase, prefill route, decode engine):
+    // decode on the NPU is decode on ctx_prefill, the HTP-pinned context when
+    // the lane is resolved - the binding forces matching q8_0 KV on both
+    // contexts, so a committed cache is directly readable on either side and
+    // a hop never needs a reload.
     const bool cpu_prefill = is_prefill && prefill_route_ == prefill_route::CPU;
-    llama_context * target = cpu_prefill ? ctx_decode : (is_prefill ? ctx_prefill : ctx_decode);
-    side_state * state = cpu_prefill ? &decode_state : (is_prefill ? &prefill_state : &decode_state);
+    const bool npu_decode = !is_prefill && decode_engine_ == llama_governor_engine::NPU;
+    llama_context * target = is_prefill ? (cpu_prefill ? ctx_decode : ctx_prefill)
+                                        : (npu_decode ? ctx_prefill : ctx_decode);
+    side_state * state = target == ctx_prefill ? &prefill_state : &decode_state;
     const phase next_phase = is_prefill ? phase::Prefill : phase::Decode;
 
     if (is_prefill && last_phase != phase::Prefill) {
@@ -304,36 +316,32 @@ int32_t llama_governor::decode_impl(llama_batch batch, bool allow_chunking) {
         record_tally();
     }
 
-    const bool cpu_route_handoff = prefill_route_ == prefill_route::CPU &&
-        (is_prefill || last_phase == phase::Prefill);
-    if (last_phase != phase::None && last_phase != next_phase && !cpu_route_handoff) {
-        const bool ok = is_prefill
-            ? commit_side(ctx_decode, ctx_prefill, decode_state, prefill_state, "decode-to-prefill")
-            : commit_side(ctx_prefill, ctx_decode, prefill_state, decode_state, "prefill-to-decode");
-        if (!ok) {
+    // One switch, one commit: whenever a batch moves to the other context the
+    // KV follows it - the prefill<->decode handoffs and the mid-turn decode
+    // hops are the same event on this one code path (this also covers the
+    // CPU-route prefill that follows a GPU prewarm: a prefill route switch
+    // commits like any other batch that moves contexts). A CPU-route prefill,
+    // a CPU decode and an NPU decode that follows its own NPU prefill all
+    // stay on their context and never commit.
+    const bool decode_hop = !is_prefill && last_phase == phase::Decode && target != last_ctx;
+    if (last_ctx != nullptr && target != last_ctx) {
+        const char * direction = is_prefill
+            ? (last_phase == phase::Decode ? "decode-to-prefill" : "prefill route switch")
+            : last_phase == phase::Decode
+                ? (npu_decode ? "decode hop cpu-to-npu" : "decode hop npu-to-cpu")
+                : "prefill-to-decode";
+        side_state & src = last_ctx == ctx_prefill ? prefill_state : decode_state;
+        const uint64_t commit_bytes_before = stats_.commit_bytes;
+        const uint64_t commit_us_before = stats_.commit_us;
+        if (!commit_side(last_ctx, target, src, *state, direction)) {
             // commit_side may already have latched a specific reason (the KV
             // commit catch); keep it instead of overwriting with the generic
             // route Reject.
-            return failed ? -1 : fail("route Reject during phase handoff");
+            return failed ? -1 : fail("route Reject during context switch");
         }
-    }
-
-    // Invariant: every batch runs on a context that holds the whole logical
-    // sequence up to its start position. The CPU route runs on ctx_decode,
-    // but its conversation prefix may live on ctx_prefill (a GPU prewarm or
-    // GPU turn left it there) - the phase-handoff commit above cannot see a
-    // Prefill->Prefill route switch, so catch up here with the same commit
-    // the normal Prefill->Decode handoff does. Only when the prefill side is
-    // ahead: in a pure-CPU chat (or after any sync) the decode side already
-    // holds everything and this is a no-op.
-    if (cpu_prefill) {
-        llama_pos p_end = 0;
-        llama_pos d_end = 0;
-        if (sequence_end(ctx_prefill, 0, p_end) && sequence_end(ctx_decode, 0, d_end) &&
-            p_end > d_end) {
-            if (!commit_side(ctx_prefill, ctx_decode, prefill_state, decode_state, "cpu-route catch-up")) {
-                return failed ? -1 : fail("route Reject during CPU-route catch-up");
-            }
+        if (decode_hop) {
+            stats_.decode_hop_commit_bytes += stats_.commit_bytes - commit_bytes_before;
+            stats_.decode_hop_commit_us += stats_.commit_us - commit_us_before;
         }
     }
 
@@ -382,6 +390,17 @@ int32_t llama_governor::decode_impl(llama_batch batch, bool allow_chunking) {
     }
 
     record_side(target, *state, is_prefill, batch.n_tokens);
+    if (decode_hop) {
+        ++stats_.decode_hops;
+    }
+    if (!is_prefill) {
+        ++decode_tokens_since_prefill_;
+        if (npu_decode) {
+            stats_.decode_tokens_npu += batch.n_tokens;
+        } else {
+            stats_.decode_tokens_cpu += batch.n_tokens;
+        }
+    }
     last_ctx = target;
     last_phase = next_phase;
     return 0;

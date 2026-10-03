@@ -11,15 +11,15 @@
 # (scripts/build-htp-skels.sh, container-archive method); verify with:
 #   shasum -a 256 bin/arm64-v8a/libggml-htp-*.so
 
-ENGINE_COMMIT=60b8371971e554df7937e03795ea1e829ef00f71
+ENGINE_COMMIT=32f6033c84445a2a2fae77bfb968c5cf48233507
 # Fingerprint of the committed sources the skels were built from (git tree
 # hashes of the paths in scripts/htp-skels-common.sh); recomputed by the gate.
 SRC_FINGERPRINT=8e9623b3f929a4f036b16e6bb997d95a30f252ce7da5a06b921f64d7b56ba99e
 
-libggml-htp-v73.so=adb131f88fa805201bff6297a12f32320a24d45f9ba8a7c49a61e44d47194760
-libggml-htp-v75.so=59761ba0858b586b3b8c79987ad42e3cac43ef450e19442e674c1b30c055e782
-libggml-htp-v79.so=258ff418ae9c0e2c96ab7ab786840a7dbb8abcdefccc5818251939f01d59b292
-libggml-htp-v81.so=5f3a325ae09ab0d9f9fea2977dda1374f24eef198d91107b175c56e3d924a98d
+libggml-htp-v73.so=88d91dc565e7ff9a2649cd827564d9b90757a6609a3ac66b184cda4abfdabef0
+libggml-htp-v75.so=734a9ef6422aa04bff3d41828139a2eb92f5b11f8c9579e20f139b4483c97875
+libggml-htp-v79.so=919b0929adb75e008f8f24c4e362bec546ca7e113db964f53db0e1add51a02f1
+libggml-htp-v81.so=1fb0bb4e206fdd0da41193b37e985e1e4632db9fe4a7bc5d83975c318216b7b4
 
 # Build provenance (informational; the gate checks the two blocks above and,
 # inside each .so, the identity string). The bytes come from the committed

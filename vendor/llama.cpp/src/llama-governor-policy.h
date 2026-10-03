@@ -58,7 +58,13 @@ public:
     llama_governor_prefill_admission admit_prefill(
             llama_governor_engine requested, uint32_t prompt_tokens, float now_c,
             uint32_t n_batch = UINT32_MAX) const;
-    llama_governor_decode_selection select_decode(int64_t now_ms);
+    // tokens_since_prefill is the caller's decode-hop clock: generated tokens
+    // since the last prefill, which the governor restarts at every prefill
+    // entry and at every reset_prefill_stats (the binding's per-completion
+    // call, so a fully cached turn still opens window 0). It decides the
+    // CPU/NPU alternation (see select_decode).
+    llama_governor_decode_selection select_decode(
+            int64_t now_ms, uint32_t tokens_since_prefill = 0);
 
     // The optional outputs stamp the causal route facts: mode_used is the
     // single mode load of this call (reported even when safety preempts) and
@@ -97,6 +103,12 @@ private:
     bool profile_is_valid(const llama_governor_thermo_profile & profile) const;
     bool dwell_elapsed(int64_t now_ms) const;
     bool can_leave(int64_t now_ms, float temperature, float exit_temperature) const;
+    // The two predicates the NPU routing rules share (prefill_engine's lane
+    // and the decode hop): the lane answers only when the binding opened it
+    // and HTP proved it can read every weight stream the model needs, and
+    // accelerators run only in the non-safety states.
+    bool npu_lane_live() const;
+    bool not_a_safety_state() const;
 
     llama_governor_params params_;
     llama_governor_thermo_profile profile_;

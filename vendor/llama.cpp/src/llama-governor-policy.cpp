@@ -222,6 +222,24 @@ bool llama_governor_policy::update_thermal(const llama_governor_thermo_profile &
     return true;
 }
 
+// The NPU lane answers only when the binding opened it (it clears the flag
+// when HTP0 did not resolve) and HTP proved it can read every weight stream
+// the model needs: trunk for dense and hybrid, experts too for MoE.
+bool llama_governor_policy::npu_lane_live() const {
+    return params_.npu_lane_enabled && params_.npu_fit == llama_governor_fit::Fit &&
+           params_.htp_trunk_readable &&
+           (params_.model_kind != llama_governor_model_kind::MoE || params_.htp_experts_readable);
+}
+
+// The states an accelerator may run in. The safety verdicts (CRITICAL, LOWBAT,
+// Invalid) always route to CPU; Unknown is kept out by the callers' profile
+// checks before any rule reads this.
+bool llama_governor_policy::not_a_safety_state() const {
+    return state_ == llama_governor_thermal_state::FAST ||
+           state_ == llama_governor_thermal_state::WARM ||
+           state_ == llama_governor_thermal_state::COOLMODE;
+}
+
 llama_governor_engine llama_governor_policy::prefill_engine(
         llama_governor_prefill_mode * mode_used, bool * override_decided) const {
     // One atomic load per call: the binding may push a new mode from another
@@ -267,16 +285,9 @@ llama_governor_engine llama_governor_policy::prefill_engine(
     // the GPU, ~3.7x the NPU's heat integral per 1k tokens); the arms are measured, the old "hop thresholds pending the
     // NPU heat arm" clause is closed. "GPU when the NPU is hot" needs an
     // NPU temperature input that does not exist yet: a later step, not
-    // invented here. OFF unless npu_lane_enabled: npu_fit Fit, readable
-    // HTP weights (MoE streams experts too). The bench/JS override above
-    // still outranks it, and every safety state returned above still keeps CPU.
-    if (params_.npu_lane_enabled &&
-        params_.npu_fit == llama_governor_fit::Fit &&
-        params_.htp_trunk_readable &&
-        (params_.model_kind != llama_governor_model_kind::MoE || params_.htp_experts_readable) &&
-        (state_ == llama_governor_thermal_state::FAST ||
-         state_ == llama_governor_thermal_state::WARM ||
-         state_ == llama_governor_thermal_state::COOLMODE)) {
+    // invented here. The bench/JS override above still outranks it, and
+    // every safety state returned above still keeps CPU.
+    if (npu_lane_live() && not_a_safety_state()) {
         return llama_governor_engine::NPU;
     }
     // measured: ALIVE #38: 8 Elite GPU prefill, G ttft 1434/1470 ms vs
@@ -399,12 +410,34 @@ llama_governor_prefill_admission llama_governor_policy::admit_prefill(
     return result;
 }
 
-llama_governor_decode_selection llama_governor_policy::select_decode(int64_t now_ms) {
+llama_governor_decode_selection llama_governor_policy::select_decode(
+        int64_t now_ms, uint32_t tokens_since_prefill) {
     llama_governor_decode_selection result{};
     result.rule = 3;
     if (!have_profile_ || !profile_valid_ || state_ == llama_governor_thermal_state::Unknown ||
         state_ == llama_governor_thermal_state::Invalid || state_ == llama_governor_thermal_state::CRITICAL) {
         result.wait = true;
+        return result;
+    }
+    // Decode hop (prototype): every decode_hop_tokens generated tokens the
+    // decode moves between CPU and the live NPU lane, odd windows on the NPU
+    // so window 0 and every turn start stay CPU. WHY: on the S23
+    // (LFM2.5-2.6B Q4_0) CPU decode at 5 host threads runs ~20-22 tok/s while
+    // soaking the CPU block at ~90 C (Android thermal status 3 sustained),
+    // and HTP decode at 1 host thread runs 22.9 tok/s with the CPU at ~61 C
+    // and the NSP at ~88 C - alternating the blocks spreads the heat instead
+    // of soaking one. The fixed N is a measurement knob, not a thermal rule;
+    // safety states keep CPU exactly as prefill does. The KV follows the work
+    // (the governor commits on the switch), so unlike the GPU_COOLMODE
+    // selection below no reload is ever involved; while the hop is active it
+    // owns decode outright - odd windows NPU, even windows CPU - and the
+    // GPU_COOLMODE rule below is never consulted, so an otherwise eligible
+    // battery COOLMODE cannot buy a reload mid-alternation.
+    const bool hop_active = params_.decode_hop_tokens > 0 && npu_lane_live() && not_a_safety_state();
+    if (hop_active && (tokens_since_prefill / params_.decode_hop_tokens) % 2 == 1) {
+        result.engine = llama_governor_engine::NPU;
+        result.rule = 4;
+        last_decode_engine_ = llama_governor_engine::NPU;
         return result;
     }
     const bool budget_ok = last_gpu_engagement_ms_ < 0 || now_ms < last_gpu_engagement_ms_ ||
@@ -413,7 +446,7 @@ llama_governor_decode_selection llama_governor_policy::select_decode(int64_t now
     // heat arms (NPU coolest, CPU between, GPU hottest), so a COOLMODE the
     // platform floor raised must not buy it: decode keeps today's engine.
     // Battery-derived COOLMODE eligibility is untouched.
-    const bool eligible = valid_schema(params_) && have_profile_ && profile_valid_ &&
+    const bool eligible = !hop_active && valid_schema(params_) && have_profile_ && profile_valid_ &&
         state_ == llama_governor_thermal_state::COOLMODE && !state_from_platform_ && !hot_plugged_ &&
         params_.generation == llama_governor_generation::V73 &&
         params_.gpu_fit == llama_governor_fit::Fit && params_.cool_delta_measured && params_.kexp_cool_scope &&

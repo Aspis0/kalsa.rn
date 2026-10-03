@@ -1,4 +1,4 @@
 #pragma once
 
 #define LLAMA_VERSION "0.5.0-dev"
-#define LLAMA_COMMIT  "60b8371"
+#define LLAMA_COMMIT  "32f6033"

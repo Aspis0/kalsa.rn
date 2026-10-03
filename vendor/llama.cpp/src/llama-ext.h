@@ -262,6 +262,10 @@ struct llama_governor_params {
     uint64_t cache_budget_bytes = 0;
     uint64_t expert_cycle_bytes = 0;
     float expert_substitution_lambda = 0.0f;
+    // Decode-hop prototype: when > 0, decode alternates CPU / live NPU lane
+    // every decode_hop_tokens generated tokens (policy select_decode); 0
+    // keeps CPU-only decode.
+    uint32_t decode_hop_tokens = 0;
 };
 
 /** One successful battery poll. Temperature is the dumpsys tenths-of-degrees-C
@@ -387,6 +391,14 @@ struct llama_governor_stats {
     bool decode_requires_reload = false;
     uint32_t last_router_rule = 0;
     uint64_t cpu_to_gpu_engagements = 0;
+    // Decode-hop observability: decode-to-decode context switches executed,
+    // tokens decoded on each context, and the commit cost those switches paid
+    // (already included in commit_bytes / commit_us above).
+    uint64_t decode_hops = 0;
+    uint64_t decode_tokens_cpu = 0;
+    uint64_t decode_tokens_npu = 0;
+    uint64_t decode_hop_commit_bytes = 0;
+    uint64_t decode_hop_commit_us = 0;
     uint64_t stall_union_us = 0;
     uint64_t prefill_cpu_us = 0;
     uint64_t prefill_read_bytes = 0;

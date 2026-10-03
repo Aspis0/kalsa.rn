@@ -109,6 +109,13 @@ private:
     llama_governor_stall_union stall_union_;
     phase last_phase = phase::None;
     prefill_route prefill_route_ = prefill_route::Undecided;
+    // Decode engine chosen for the batch being routed (select_decode); NPU
+    // sends the batch to ctx_prefill, the HTP-pinned context when the lane is
+    // resolved, instead of ctx_decode.
+    llama_governor_engine decode_engine_ = llama_governor_engine::CPU;
+    // Generated tokens since the last prefill entry - the decode hop's
+    // alternation clock, restarted where the route latch re-arms.
+    uint32_t decode_tokens_since_prefill_ = 0;
     // Snapshot of the /bench route override, taken with the route latch so
     // every route fact of one prefill latch reports the same mode and the
     // same causal decision, whatever a concurrent push does afterwards. The

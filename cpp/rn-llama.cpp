@@ -167,6 +167,14 @@ bool load_governor_models(llama_rn_context & owner,
             governor_params.npu_lane_enabled, device_plan);
         if (device_plan.use_device) {
             prefill_params.devices = { resolved.device, nullptr };
+            // One host thread for the HTP-pinned context: on the S23 an HTP
+            // pp1024 runs at the same speed on 1 and 5 host threads (892 vs
+            // 889 tok/s) with the CPU zones 5-10 C cooler (lab
+            // s23-prefill-host-threads). It caps only graph nodes that fall
+            // back to the CPU backend, not the DSP's own threads. The CPU
+            // decode context keeps the caller's counts.
+            prefill_params.cpuparams.n_threads = 1;
+            prefill_params.cpuparams_batch.n_threads = 1;
             // The KV buffers follow the layer device (llama-kv-cache.cpp),
             // so with the lane resolved the prefill KV is HTP-resident —
             // host-addressable rpcmem, which keeps the prefill->decode

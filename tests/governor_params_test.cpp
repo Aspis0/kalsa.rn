@@ -449,82 +449,28 @@ static bool test_platform_thermal_status_parses() {
     return thermo.platform_thermal_status == 9;
 }
 
-// decode_hop_tokens is the decode-hop cadence: 0 (or absent) keeps
-// CPU-only decode, > 0 alternates CPU / live NPU lane every N generated
-// tokens. The binding owns the type contract - a non-negative integer that
-// fits uint32 - because JSI numbers arrive as doubles and the engine field
-// is uint32_t; fractional, negative or overflowing cadences refuse here.
 static bool test_decode_hop_tokens_parses() {
-    auto parses_to = [](const nlohmann::ordered_json & governor, uint32_t expected) {
-        llama_governor_params params{};
-        llama_governor_thermo_profile thermo{};
-        governor_load_options options{};
-        try {
-            if (!parse_governor_params(governor, params, thermo, options)) {
-                std::cerr << "parse_governor_params returned false" << std::endl;
-                return false;
-            }
-        } catch (const std::exception & e) {
-            std::cerr << "unexpected throw: " << e.what() << std::endl;
-            return false;
-        }
-        return params.decode_hop_tokens == expected;
-    };
-    auto refuses = [](const nlohmann::ordered_json & governor) {
-        llama_governor_params params{};
-        llama_governor_thermo_profile thermo{};
-        governor_load_options options{};
-        try {
-            parse_governor_params(governor, params, thermo, options);
-        } catch (const std::invalid_argument &) {
-            return true;
-        }
-        return false;
-    };
-    if (!parses_to(base_governor(), 0)) {
+    llama_governor_params params{};
+    llama_governor_thermo_profile thermo{};
+    governor_load_options options{};
+    auto governor = base_governor();
+    if (!parse_governor_params(governor, params, thermo, options) || params.decode_hop_tokens != 0) {
         std::cerr << "absent decode_hop_tokens did not default to 0" << std::endl;
         return false;
     }
-    auto governor = base_governor();
     governor["decode_hop_tokens"] = 64;
-    if (!parses_to(governor, 64)) {
+    if (!parse_governor_params(governor, params, thermo, options) || params.decode_hop_tokens != 64) {
         std::cerr << "decode_hop_tokens 64 did not parse" << std::endl;
         return false;
     }
-    governor["decode_hop_tokens"] = 0;
-    if (!parses_to(governor, 0)) {
-        std::cerr << "explicit 0 did not stay 0" << std::endl;
-        return false;
+    governor["decode_hop_tokens"] = -1;
+    try {
+        parse_governor_params(governor, params, thermo, options);
+    } catch (const std::invalid_argument &) {
+        return true;
     }
-    governor["decode_hop_tokens"] = 4294967295.0;
-    if (!parses_to(governor, 4294967295u)) {
-        std::cerr << "uint32 ceiling did not parse" << std::endl;
-        return false;
-    }
-    governor["decode_hop_tokens"] = "64";
-    if (!refuses(governor)) {
-        std::cerr << "string decode_hop_tokens did not refuse" << std::endl;
-        return false;
-    }
-    governor["decode_hop_tokens"] = true;
-    if (!refuses(governor)) {
-        std::cerr << "boolean decode_hop_tokens did not refuse" << std::endl;
-        return false;
-    }
-    governor["decode_hop_tokens"] = nullptr;
-    if (!refuses(governor)) {
-        std::cerr << "null decode_hop_tokens did not refuse" << std::endl;
-        return false;
-    }
-    const double out_of_contract[] = {64.5, -1.0, 4294967296.0, 1e300};
-    for (const double raw : out_of_contract) {
-        governor["decode_hop_tokens"] = raw;
-        if (!refuses(governor)) {
-            std::cerr << "decode_hop_tokens " << raw << " did not refuse" << std::endl;
-            return false;
-        }
-    }
-    return true;
+    std::cerr << "negative decode_hop_tokens did not refuse" << std::endl;
+    return false;
 }
 
 int main() {

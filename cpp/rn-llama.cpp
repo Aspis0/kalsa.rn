@@ -839,10 +839,14 @@ int32_t llama_rn_context::decode(llama_batch batch) {
     const int32_t result = governor->decode(batch);
     if (governor_decode_failed(result, governor->engine_failed()) && !was_failed) {
         const std::string & reason = governor->failure_reason();
-        // Only a compute failure of the HTP-routed prefill kills the lane;
-        // a KV-commit (host/OpenCL) or CPU-routed failure must not.
-        if (htp_prefill_runtime_failure(
-                batch.n_tokens, governor->stats().prefill_engine, result, reason.c_str())) {
+        // Only a compute failure of a batch the HTP device ran kills the
+        // lane — the HTP-routed prefill, or an NPU decode hop (a 1-token
+        // batch on ctx_prefill); a KV-commit (host/OpenCL) or CPU-routed
+        // failure must not.
+        const llama_governor_stats failure_stats = governor->stats();
+        if (htp_runtime_failure(
+                batch.n_tokens, failure_stats.prefill_engine,
+                failure_stats.decode_engine, result, reason.c_str())) {
             note_htp_runtime_fallback();
         }
         const bool route_rejected = reason.find("route Reject") != std::string::npos;
@@ -966,8 +970,8 @@ std::string llama_rn_context::governorKvPlacement() const {
 }
 
 void llama_rn_context::note_htp_runtime_fallback() {
-    // The decode wrapper has already attributed this failure to the HTP
-    // prefill compute (htp_prefill_runtime_failure); the recorder enforces
+    // The decode wrapper has already attributed this failure to a batch the
+    // HTP device ran (htp_runtime_failure); the recorder enforces
     // what it owns: the lane resolved (governorNpuDevice() — without one,
     // prefill already runs on the non-HTP path) and no reason recorded yet —
     // the first reason written in this context's life wins, and this

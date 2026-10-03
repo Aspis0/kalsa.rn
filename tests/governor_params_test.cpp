@@ -202,47 +202,58 @@ static bool test_htp_runtime_reason_degrades_next_load() {
     return true;
 }
 
-// The lane-kill switch fires only on the HTP prefill compute. Signal
-// (engine sources): is_prefill is n_tokens > 1 (llama-governor.cpp
-// decode_impl); the route latch stamps stats_.prefill_engine per batch
-// (llama-governor-runtime.cpp); -3 is the compute-failure map
-// (llama-context.cpp "case GGML_STATUS_FAILED: return -3"); and the reason
-// prefix separates llama_decode's own failure from the host-side handoff
-// failures. Everything else must keep the lane on.
-static bool test_htp_prefill_runtime_failure_attribution() {
+// The lane-kill switch fires only on a compute failure of a batch the HTP
+// device ran: the HTP-routed prefill, or an NPU decode hop (a 1-token batch
+// on ctx_prefill, the HTP-pinned context — llama-governor.cpp decode_impl).
+// Signal (engine sources): a batch's engine is its phase's stamp — the
+// route latch for prefill (llama-governor-runtime.cpp
+// stats_.prefill_engine), select_decode for decode (stats_.decode_engine);
+// -3 is the compute-failure map on both paths (llama-context.cpp "case
+// GGML_STATUS_FAILED: return -3"); and the reason prefix separates
+// llama_decode's own failure from the host-side handoff failures.
+// Everything else must keep the lane on.
+static bool test_htp_runtime_failure_attribution() {
     const llama_governor_engine npu = llama_governor_engine::NPU;
     const llama_governor_engine cpu = llama_governor_engine::CPU;
     // The real thing: a prefill on the NPU route failing in compute.
-    if (!htp_prefill_runtime_failure(5, npu, -3, "llama_decode failed with rc=-3")) {
+    if (!htp_runtime_failure(5, npu, cpu, -3, "llama_decode failed with rc=-3")) {
         std::cerr << "HTP prefill compute failure was not attributed" << std::endl;
         return false;
     }
-    // Decode-phase batch (n_tokens == 1): the HTP device never ran it.
-    if (htp_prefill_runtime_failure(1, npu, -3, "llama_decode failed with rc=-3")) {
-        std::cerr << "decode-phase failure was attributed to HTP" << std::endl;
+    // NPU decode hop (n_tokens == 1): the batch ran on ctx_prefill, the
+    // HTP-pinned context, so the DSP did run it.
+    if (!htp_runtime_failure(1, npu, npu, -3, "llama_decode failed with rc=-3")) {
+        std::cerr << "NPU decode hop compute failure was not attributed" << std::endl;
+        return false;
+    }
+    // CPU decode after an NPU prefill: the decode stamp decides, not the
+    // stale prefill latch — the DSP did not run this batch.
+    if (htp_runtime_failure(1, npu, cpu, -3, "llama_decode failed with rc=-3")) {
+        std::cerr << "CPU decode failure was attributed to HTP" << std::endl;
         return false;
     }
     // CPU-latched prefill (LOWBAT/heat): the DSP did not run this batch.
-    if (htp_prefill_runtime_failure(5, cpu, -3, "llama_decode failed with rc=-3")) {
+    if (htp_runtime_failure(5, cpu, npu, -3, "llama_decode failed with rc=-3")) {
         std::cerr << "CPU-routed prefill failure was attributed to HTP" << std::endl;
         return false;
     }
-    // Alloc failure (-2) is memory pressure, not a compute error.
-    if (htp_prefill_runtime_failure(5, npu, -2, "llama_decode failed with rc=-2")) {
-        std::cerr << "alloc failure was attributed to HTP" << std::endl;
+    // Flow control (-2: admission wait, reload required, profile wait, plus
+    // the alloc-failure map) shares one rc and never ran the DSP.
+    if (htp_runtime_failure(5, npu, npu, -2, "llama_decode failed with rc=-2")) {
+        std::cerr << "flow-control rc was attributed to HTP" << std::endl;
         return false;
     }
     // Host-side handoff failures never touched the DSP.
-    if (htp_prefill_runtime_failure(5, npu, -1, "KV commit failed: clSetUserEventStatus out of memory")) {
+    if (htp_runtime_failure(5, npu, npu, -1, "KV commit failed: clSetUserEventStatus out of memory")) {
         std::cerr << "KV commit failure was attributed to HTP" << std::endl;
         return false;
     }
-    if (htp_prefill_runtime_failure(5, npu, -1, "route Reject during phase handoff")) {
+    if (htp_runtime_failure(5, npu, npu, -1, "route Reject during phase handoff")) {
         std::cerr << "route Reject was attributed to HTP" << std::endl;
         return false;
     }
     // No reason at all (rn_governor's null-reason path): keep the lane.
-    if (htp_prefill_runtime_failure(5, npu, -3, nullptr)) {
+    if (htp_runtime_failure(5, npu, npu, -3, nullptr)) {
         std::cerr << "missing reason was attributed to HTP" << std::endl;
         return false;
     }
@@ -486,7 +497,7 @@ int main() {
     results.run_test("prefill device plan degrades / opens HTP0", test_prefill_device_plan());
     results.run_test("lane policy flag follows resolution", test_lane_policy_flag_follows_resolution());
     results.run_test("runtime htp reason degrades the next load", test_htp_runtime_reason_degrades_next_load());
-    results.run_test("only the HTP prefill compute failure kills the lane", test_htp_prefill_runtime_failure_attribution());
+    results.run_test("only a batch the HTP device ran kills the lane", test_htp_runtime_failure_attribution());
     results.run_test("registry exclusion keeps non-HTP order", test_devices_excluding_registry());
     results.run_test("platform_thermal_status optional, engine owns range", test_platform_thermal_status_parses());
     results.run_test("decode_hop_tokens non-negative integer, 0 off", test_decode_hop_tokens_parses());

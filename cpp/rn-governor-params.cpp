@@ -206,10 +206,16 @@ bool governor_lane_policy_enabled(
     return lane_enabled && plan.use_device;
 }
 
-bool htp_prefill_runtime_failure(
-        int32_t n_tokens, llama_governor_engine prefill_engine, int32_t rc,
+bool htp_runtime_failure(
+        int32_t n_tokens, llama_governor_engine prefill_engine,
+        llama_governor_engine decode_engine, int32_t rc,
         const char * failure_reason) {
-    if (n_tokens <= 1 || prefill_engine != llama_governor_engine::NPU || rc != -3) {
+    // A batch's engine is its phase's stamp: the route latch for prefill,
+    // select_decode for the 1-token batches it routes (an NPU decode runs
+    // on ctx_prefill, the HTP-pinned context).
+    const llama_governor_engine engine =
+        n_tokens > 1 ? prefill_engine : decode_engine;
+    if (engine != llama_governor_engine::NPU || rc != -3) {
         return false;
     }
     return failure_reason != nullptr &&

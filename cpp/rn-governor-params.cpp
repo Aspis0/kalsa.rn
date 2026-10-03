@@ -193,6 +193,11 @@ governor_prefill_device_plan decide_governor_prefill_device(
     return plan;
 }
 
+bool governor_lane_policy_enabled(
+        bool lane_enabled, const governor_prefill_device_plan & plan) {
+    return lane_enabled && plan.use_device;
+}
+
 bool htp_prefill_runtime_failure(
         int32_t n_tokens, llama_governor_engine prefill_engine, int32_t rc,
         const char * failure_reason) {

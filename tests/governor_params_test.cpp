@@ -287,6 +287,36 @@ static bool test_prefill_device_plan() {
     return true;
 }
 
+// governor_lane_policy_enabled is the flag rn-llama.cpp builds
+// llama_governor_policy from: a lane asked for but not resolved must reach
+// prefill_engine() off, or the engine claims NPU for a load whose devices
+// are the default unqualified GPU (V81, Unknown). Only a resolved plan
+// keeps it on, and both degrade reasons — the engine's own and the
+// KALSA_HTP_FALLBACK env — clear it.
+static bool test_lane_policy_flag_follows_resolution() {
+    const auto resolved = decide_governor_prefill_device(true, nullptr, nullptr);
+    if (!governor_lane_policy_enabled(true, resolved)) {
+        std::cerr << "resolved lane did not stay on for the policy" << std::endl;
+        return false;
+    }
+    const auto unresolved = decide_governor_prefill_device(false, "htp-device-missing", nullptr);
+    if (governor_lane_policy_enabled(true, unresolved)) {
+        std::cerr << "unresolved lane stayed on for the policy" << std::endl;
+        return false;
+    }
+    const auto htp_env = decide_governor_prefill_device(true, nullptr, "htp-libs-missing");
+    if (governor_lane_policy_enabled(true, htp_env)) {
+        std::cerr << "KALSA_HTP_FALLBACK lane stayed on for the policy" << std::endl;
+        return false;
+    }
+    // A lane nobody asked for stays off for the policy too.
+    if (governor_lane_policy_enabled(false, resolved)) {
+        std::cerr << "lane-off input was flipped on for the policy" << std::endl;
+        return false;
+    }
+    return true;
+}
+
 // devices_excluding_registry backs the lane-off prefill pin (rn-llama.cpp):
 // once the Hexagon backend registers, reproducing today's device list means
 // dropping every HTP session and keeping the rest in registry order. The
@@ -430,6 +460,7 @@ int main() {
     results.run_test("npu_lane_enabled forwards without throwing", test_npu_lane_enabled_forwards());
     results.run_test("generation V81 parses, unknown arch refuses", test_generation_parses_v81());
     results.run_test("prefill device plan degrades / opens HTP0", test_prefill_device_plan());
+    results.run_test("lane policy flag follows resolution", test_lane_policy_flag_follows_resolution());
     results.run_test("runtime htp reason degrades the next load", test_htp_runtime_reason_degrades_next_load());
     results.run_test("only the HTP prefill compute failure kills the lane", test_htp_prefill_runtime_failure_attribution());
     results.run_test("registry exclusion keeps non-HTP order", test_devices_excluding_registry());

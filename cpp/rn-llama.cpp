@@ -139,6 +139,13 @@ bool load_governor_models(llama_rn_context & owner,
     // (RNLlama.java noteHtpFallback) and outrank a device that resolves.
     common_params prefill_params = owner.params;
     common_params decode_params = owner.params;
+    // The rn_governor policy is built from this copy, not from
+    // governor_params: a lane that was asked for but did not resolve has
+    // its flag cleared below, so prefill_engine() falls through to its own
+    // GPU/CPU branches instead of claiming NPU for a context whose devices
+    // are the default (unqualified) GPU. Reporting keeps reading
+    // governor_params.
+    llama_governor_params policy_params = governor_params;
     if (governor_params.npu_lane_enabled) {
         // Lane asked for: resolve the device and fill the plan fields. With
         // the lane off (today's default) the resolver is skipped and both
@@ -153,6 +160,11 @@ bool load_governor_models(llama_rn_context & owner,
         // fallback's setenv (note_htp_runtime_fallback) is allowed to
         // reallocate it.
         owner.setGovernorNpuFallback(device_plan.npu_fallback);
+        // A lane the resolver could not serve must not reach the engine
+        // policy as enabled: prefill_engine() would route prefill to NPU
+        // while this load's devices stayed the default GPU.
+        policy_params.npu_lane_enabled = governor_lane_policy_enabled(
+            governor_params.npu_lane_enabled, device_plan);
         if (device_plan.use_device) {
             prefill_params.devices = { resolved.device, nullptr };
             // The KV buffers follow the layer device (llama-kv-cache.cpp),
@@ -278,7 +290,7 @@ bool load_governor_models(llama_rn_context & owner,
         const auto decode_context_params = common_context_params_to_llama(decode_params);
         owner.governor = std::make_unique<rn_governor>(
             owner.governor_prefill_init->model(), owner.governor_decode_init->model(),
-            prefill_context_params, decode_context_params, governor_params);
+            prefill_context_params, decode_context_params, policy_params);
         if (!owner.governor->set_thermo_profile(governor_thermo)) {
             runtime_profile_valid = false;
             throw std::runtime_error("governor: thermo profile invalid");

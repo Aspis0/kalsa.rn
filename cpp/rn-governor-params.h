@@ -84,6 +84,17 @@ governor_prefill_device_plan decide_governor_prefill_device(
     const char * engine_fallback,
     const char * htp_init_reason);
 
+/** npu_lane_enabled as the engine policy must see it. The loader's device
+ *  decision and the engine's engine decision are separate layers: when the
+ *  lane is asked for but does not resolve, the load keeps the default
+ *  device list (on Android the unqualified OpenCL GPU) while
+ *  prefill_engine(), fed the raw flag, would still claim NPU. Only a plan
+ *  whose device actually resolved may leave the lane on for the policy —
+ *  the loader builds llama_governor_policy from this verdict and keeps
+ *  every report line on the original params. Pure. */
+bool governor_lane_policy_enabled(
+    bool lane_enabled, const governor_prefill_device_plan & plan);
+
 /** Registered devices minus every device of the `excluded` registry, order
  *  preserved. Inputs may carry the null terminator the engine's device loop
  *  expects (JSI lists append one); terminators pass through skipped — the

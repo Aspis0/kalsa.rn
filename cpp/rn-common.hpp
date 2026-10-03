@@ -67,6 +67,8 @@ inline static json backend_devices_info() {
 
         // Device name and description
         device_info["deviceName"] = props.name ? props.name : "Unknown Device";
+        // The Hexagon description is the runtime DSP arch ("Hexagon v<NN>").
+        device_info["description"] = props.description ? props.description : "";
 
         // Memory information
         size_t memory_total = props.memory_total;

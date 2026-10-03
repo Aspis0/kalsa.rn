@@ -787,6 +787,7 @@ export type NativeBackendDeviceInfo = {
   backend: string
   type: string
   deviceName: string
+  description?: string
   maxMemorySize: number
   metadata?: Record<string, any>
 }

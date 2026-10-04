@@ -129,8 +129,8 @@ bool test_jelly_like_empty_root() {
     return ok;
 }
 
-// A zone whose temp stops answering after construction drops out of its leg
-// at sample() time; the other leg keeps its reading.
+// Zones whose temps stop answering after construction make their leg
+// unknown at sample() time; the other leg keeps its reading.
 bool test_zone_going_dark_at_sample() {
     const auto root = make_s23_tree();
     const rn_thermal_legs legs(root.string());
@@ -144,6 +144,54 @@ bool test_zone_going_dark_at_sample() {
     return ok;
 }
 
+// One dark zone out of two in a leg darkens the WHOLE leg: the min over the
+// survivors would report exactly the zone that went dark - usually the
+// hottest - as absent, flattering the leg.
+bool test_one_dark_zone_darkens_the_leg() {
+    const auto root = make_s23_tree();
+    const rn_thermal_legs legs(root.string());
+    std::error_code ec;
+    std::filesystem::remove(root / "thermal_zone0" / "temp", ec);
+    if (ec) { return false; }
+    const auto reading = legs.sample();
+    const bool ok = is_unknown(reading.cpu_headroom_c) && close_to(reading.npu_headroom_c, 7.0f);
+    std::filesystem::remove_all(root);
+    return ok;
+}
+
+// Linux frees zone ids on unregister, so the class dir holds gaps: with only
+// thermal_zone0 and thermal_zone2 on disk, the readdir scan still finds both
+// (an index walk would stop at the missing zone1).
+bool test_zone_numbering_gap() {
+    const auto root = make_temp_root("kalsa_thermal_legs_gap");
+    make_zone(root, 0, "cpu-1-0", {{"temp", "50000"},
+                                   {"trip_point_0_type", "passive"}, {"trip_point_0_temp", "108000"}});
+    make_zone(root, 2, "nspss-0", {{"temp", "88000"},
+                                   {"trip_point_0_type", "passive"}, {"trip_point_0_temp", "95000"}});
+    const rn_thermal_legs legs(root.string());
+    const auto reading = legs.sample();
+    const bool ok = legs.cpu_zone_count() == 1 && legs.npu_zone_count() == 1 &&
+        close_to(reading.cpu_headroom_c, 58.0f) && close_to(reading.npu_headroom_c, 7.0f);
+    std::filesystem::remove_all(root);
+    return ok;
+}
+
+// A passive trip at Linux's THERMAL_TEMP_INVALID (-274000) is not a trip: a
+// zone whose only passive line is invalid joins no leg instead of reporting
+// a negative headroom.
+bool test_invalid_passive_trip_ignored() {
+    const auto root = make_temp_root("kalsa_thermal_legs_invalid_trip");
+    make_zone(root, 0, "cpu-1-0", {{"temp", "50000"},
+                                   {"trip_point_0_type", "passive"}, {"trip_point_0_temp", "-274000"}});
+    make_zone(root, 1, "cpuss-0", {{"temp", "60000"},
+                                   {"trip_point_0_type", "passive"}, {"trip_point_0_temp", "115000"}});
+    const rn_thermal_legs legs(root.string());
+    const auto reading = legs.sample();
+    const bool ok = legs.cpu_zone_count() == 1 && close_to(reading.cpu_headroom_c, 55.0f);
+    std::filesystem::remove_all(root);
+    return ok;
+}
+
 } // namespace
 
 int main() {
@@ -151,6 +199,9 @@ int main() {
     results.run_test("S23 tree: counts and passive-only headroom", test_s23_tree_topology_and_headroom());
     results.run_test("empty root reads as unknown legs", test_jelly_like_empty_root());
     results.run_test("zone going dark at sample drops out", test_zone_going_dark_at_sample());
+    results.run_test("one dark zone darkens its whole leg", test_one_dark_zone_darkens_the_leg());
+    results.run_test("numbering gap: zone2 found past a missing zone1", test_zone_numbering_gap());
+    results.run_test("invalid passive trip (-274000) ignored", test_invalid_passive_trip_ignored());
     results.print_summary();
     return (results.passed_tests == results.total_tests) ? 0 : 1;
 }

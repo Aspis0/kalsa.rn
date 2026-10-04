@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <dirent.h>
 #include <fstream>
 
 namespace rnllama {
@@ -19,10 +20,22 @@ bool read_long(const std::string & path, long * out) {
     return true;
 }
 
+// thermal_zone<digits>, at least one digit - anything else in the class dir
+// (power, devices, ...) is not a zone.
+bool is_thermal_zone_dir(const std::string & name) {
+    const std::string prefix = "thermal_zone";
+    if (name.rfind(prefix, 0) != 0 || name.size() <= prefix.size()) {
+        return false;
+    }
+    return std::all_of(name.begin() + static_cast<std::string::difference_type>(prefix.size()),
+                       name.end(), [](char c) { return c >= '0' && c <= '9'; });
+}
+
 // Lowest trip_point_<i>_temp whose _type is "passive"; false when the zone
 // has none. Trips are contiguous from 0, so the first missing temp ends the
 // scan. Active and hot trips are ignored even when they sit lower: the
-// passive line is the throttle point the decode hop must respect.
+// passive line is the throttle point the decode hop must respect. A passive
+// entry at or under 0 is Linux's THERMAL_TEMP_INVALID (-274000), not a trip.
 bool lowest_passive_trip_mc(const std::string & dir, long * out) {
     bool found = false;
     for (int i = 0;; ++i) {
@@ -36,7 +49,7 @@ bool lowest_passive_trip_mc(const std::string & dir, long * out) {
         std::ifstream type_file(dir + name);
         std::string type;
         if (!type_file.is_open() || !std::getline(type_file, type) ||
-            type.rfind("passive", 0) != 0) {
+            type.rfind("passive", 0) != 0 || temp_mc <= 0) {
             continue;
         }
         if (!found || temp_mc < *out) {
@@ -50,16 +63,24 @@ bool lowest_passive_trip_mc(const std::string & dir, long * out) {
 } // namespace
 
 rn_thermal_legs::rn_thermal_legs(const std::string & sysfs_root) {
-    for (int index = 0;; ++index) {
-        char name[32];
-        std::snprintf(name, sizeof(name), "/thermal_zone%d", index);
-        const std::string dir = sysfs_root + name;
+    // readdir scan matched against thermal_zone<digits>: Linux frees zone ids
+    // on unregister, so the numbering has gaps and cannot be walked by index.
+    // A denied or missing root (Jelly/MTK) opens nothing and leaves both legs
+    // empty.
+    DIR * root = ::opendir(sysfs_root.c_str());
+    if (root == nullptr) {
+        return;
+    }
+    while (const dirent * entry = ::readdir(root)) {
+        const std::string name = entry->d_name;
+        if (!is_thermal_zone_dir(name)) {
+            continue;
+        }
+        const std::string dir = sysfs_root + "/" + name;
         std::ifstream type_file(dir + "/type");
         std::string type;
-        // Zones are numbered contiguously, so the first gap ends the scan;
-        // a denied root (Jelly) breaks here at index 0 with both legs empty.
         if (!type_file.is_open() || !std::getline(type_file, type)) {
-            break;
+            continue;
         }
         const bool is_cpu = type.rfind("cpu", 0) == 0;
         const bool is_npu = type.rfind("nsp", 0) == 0;
@@ -74,6 +95,7 @@ rn_thermal_legs::rn_thermal_legs(const std::string & sysfs_root) {
         auto & leg = is_cpu ? cpu_zones_ : npu_zones_;
         leg.push_back({dir + "/temp", trip_mc});
     }
+    ::closedir(root);
 }
 
 rn_thermal_legs::headroom rn_thermal_legs::sample() const {
@@ -82,7 +104,9 @@ rn_thermal_legs::headroom rn_thermal_legs::sample() const {
         for (const auto & zone : zones) {
             long temp_mc = 0;
             if (!read_long(zone.temp_path, &temp_mc)) {
-                continue;
+                // One dark zone makes the whole leg unknown: the min over the
+                // survivors would hide exactly the hottest block.
+                return std::numeric_limits<float>::quiet_NaN();
             }
             const float headroom_c = static_cast<float>(zone.passive_trip_mc - temp_mc) / 1000.0f;
             best = std::isfinite(best) ? std::min(best, headroom_c) : headroom_c;

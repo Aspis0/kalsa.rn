@@ -132,3 +132,12 @@ target_include_directories(governor_params_test PRIVATE ${RNLLAMA_INCLUDE_DIRS})
 if(UNIX AND NOT APPLE)
     target_link_libraries(governor_params_test PRIVATE m)
 endif()
+
+# Decode-hop thermal legs: links only the sysfs reader TU (host-only, no
+# ggml, no model) and drives it on fake sysfs trees in a temp dir — same
+# shape as governor_params_test above.
+add_executable(thermal_legs_test thermal_legs_test.cpp ${RNLLAMA_CPP_DIR}/rn-thermal-legs.cpp)
+target_include_directories(thermal_legs_test PRIVATE ${RNLLAMA_INCLUDE_DIRS})
+if(UNIX AND NOT APPLE)
+    target_link_libraries(thermal_legs_test PRIVATE m)
+endif()

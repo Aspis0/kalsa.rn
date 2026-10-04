@@ -1,5 +1,6 @@
 #include "rn-governor.h"
 #include "llama-governor.h"
+#include "rn-llama.h"
 
 #include "ggml.h"
 
@@ -21,6 +22,16 @@ rn_governor::rn_governor(llama_model * prefill_model, llama_model * decode_model
             ? "llama_governor_init_with_params returned null"
             : failure_reason;
         throw std::runtime_error(failure_reason_);
+    }
+    // The leg reader exists only when the hop is configured, so a hop-less
+    // governor does no sysfs work; the one-time counts say which legs the
+    // headroom rule can decide (both zero -> the engine's alternation
+    // fallback, e.g. Jelly/MTK denies the zones).
+    if (params.decode_hop_tokens > 0) {
+        decode_hop_tokens_ = params.decode_hop_tokens;
+        decode_legs_ = std::make_unique<rn_thermal_legs>("/sys/class/thermal");
+        LOG_INFO("governor: decode hop thermal legs cpu=%d npu=%d zones",
+                 decode_legs_->cpu_zone_count(), decode_legs_->npu_zone_count());
     }
 }
 
@@ -70,11 +81,45 @@ bool rn_governor::engine_failed() const {
 }
 
 void rn_governor::clear_cache(bool clear_data) {
+    // The engine restarts its hop clock here (llama-governor-runtime.cpp
+    // clear_cache); keep the mirror in step.
+    decode_tokens_since_prefill_ = 0;
     llama_governor_clear_cache(governor_, clear_data);
 }
 
 void rn_governor::reset_prefill_stats() {
+    // The engine restarts its hop clock here too (the completion's
+    // beginCompletion is one caller); keep the mirror in step.
+    decode_tokens_since_prefill_ = 0;
     llama_governor_reset_prefill_stats(governor_);
+}
+
+void rn_governor::before_decode_batch(int n_tokens) {
+    if (decode_legs_ == nullptr) {
+        return;
+    }
+    // The engine's decode_tokens_since_prefill_ counts exactly these
+    // standard-path batches (multi-token batches are prefills that restart
+    // it; 1-token batches increment it after the run), and select_decode
+    // decides window k on the pre-increment count k*N - so feeding when the
+    // mirror hits a multiple of N puts a fresh sample under every window
+    // decision, first window included.
+    if (n_tokens > 1) {
+        decode_tokens_since_prefill_ = 0;
+        return;
+    }
+    if (decode_tokens_since_prefill_ % decode_hop_tokens_ == 0) {
+        feed_decode_headroom();
+    }
+    ++decode_tokens_since_prefill_;
+}
+
+void rn_governor::feed_decode_headroom() {
+    if (decode_legs_ == nullptr) {
+        return;
+    }
+    const rn_thermal_legs::headroom legs = decode_legs_->sample();
+    llama_governor_set_decode_headroom(governor_, legs.cpu_headroom_c, legs.npu_headroom_c);
 }
 
 bool rn_governor::set_thermo_profile(const llama_governor_thermo_profile & profile) {

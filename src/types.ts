@@ -268,6 +268,9 @@ export type GovernorStats = {
   decode_tokens_npu: number
   decode_hop_commit_bytes: number
   decode_hop_commit_ms: number
+  /** Hop windows the headroom rule decided; zero while the alternation
+   *  fallback (no usable leg zones) decides every window. */
+  decode_hop_headroom_windows: number
   prefill_ms: number
   prefill_chunks: string
   prefill_ctx_ngl: number

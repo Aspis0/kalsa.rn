@@ -950,6 +950,7 @@ namespace rnllama_jsi {
                             result.setProperty(rt, "decode_tokens_npu", (double) stats.decode_tokens_npu);
                             result.setProperty(rt, "decode_hop_commit_bytes", (double) stats.decode_hop_commit_bytes);
                             result.setProperty(rt, "decode_hop_commit_ms", (double) stats.decode_hop_commit_us / 1000.0);
+                            result.setProperty(rt, "decode_hop_headroom_windows", (double) stats.decode_hop_headroom_windows);
                             result.setProperty(rt, "prefill_ms", (double) stats.prefill_us / 1000.0);
                             result.setProperty(rt, "prefill_chunks", jsi::String::createFromUtf8(rt, stats.prefill_chunks));
                             result.setProperty(rt, "prefill_ctx_ngl", (double) stats.prefill_ctx_ngl);

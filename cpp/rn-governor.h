@@ -2,9 +2,11 @@
 
 #include "llama-ext.h"
 #include "llama.h"
+#include "rn-thermal-legs.h"
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <string>
 
 namespace rnllama {
@@ -30,6 +32,12 @@ public:
     int32_t decode(llama_batch batch);
     void clear_cache(bool clear_data);
     void reset_prefill_stats();
+    // The completion's decode path calls this before every standard decode
+    // batch, on the decode thread: it keeps the binding mirror of the
+    // engine's decode_tokens_since_prefill_ in step and feeds the fresh leg
+    // sample each hop window opens on (see before_decode_batch in the .cpp).
+    // No-op when the hop is off (no reader, no sysfs work).
+    void before_decode_batch(int n_tokens);
     bool set_thermo_profile(const llama_governor_thermo_profile & profile);
     // Bench route dev hook: 0=auto, 1=cpu, 2=gpu (engine validates).
     bool set_prefill_override(int mode);
@@ -48,8 +56,19 @@ public:
     const std::string & failure_reason() const { return failure_reason_; }
 
 private:
+    // Samples both legs and hands the headroom to the engine; a no-op when
+    // there is no reader (decode_hop_tokens == 0).
+    void feed_decode_headroom();
+
     llama_governor * governor_ = nullptr;
+    uint32_t decode_hop_tokens_ = 0;
+    // Binding mirror of the engine's decode_tokens_since_prefill_: it counts
+    // the same 1-token batches and restarts at the same three sites, so
+    // window k always opens at a mirror value of k * decode_hop_tokens_.
+    uint32_t decode_tokens_since_prefill_ = 0;
     llama_governor_fit gpu_fit_ = llama_governor_fit::Unknown;
+    // Decode-hop leg reader, built only when decode_hop_tokens > 0.
+    std::unique_ptr<rn_thermal_legs> decode_legs_;
     // Atomic: decode() writes it on the decode thread while the override
     // setter (allowed to overlap decode) reads it from a pool worker.
     std::atomic<bool> failed_{false};

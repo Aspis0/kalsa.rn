@@ -1702,6 +1702,11 @@ completion_token_output llama_rn_context_completion::nextToken()
             }
             llama_batch_free(b);
         } else {
+            // Decode-hop: the governor samples the legs before each batch that
+            // can open a hop window (see rn_governor::before_decode_batch).
+            if (parent_ctx->governor) {
+                parent_ctx->governor->before_decode_batch(n_eval);
+            }
             const int32_t decode_rc =
                 parent_ctx->decode(llama_batch_get_one(&embd[n_past], n_eval));
             if (decode_rc)
@@ -2276,6 +2281,11 @@ json llama_rn_context_completion::bench(int pp, int tg, int pl, int nr) {
                 batch_ref.logits   + i,
             };
 
+            // The bench's tg phase also decodes 1-token batches under a
+            // governor; keep the hop mirror in step exactly as nextToken does.
+            if (parent_ctx->governor) {
+                parent_ctx->governor->before_decode_batch(n_tokens_step);
+            }
             const int ret = parent_ctx->decode(batch_view);
             if (ret != 0) {
                 LOG_ERROR("llama_decode() failed during benchmark, n_batch=%d ret=%d", n_batch_ref, ret);

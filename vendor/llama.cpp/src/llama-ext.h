@@ -392,13 +392,16 @@ struct llama_governor_stats {
     uint32_t last_router_rule = 0;
     uint64_t cpu_to_gpu_engagements = 0;
     // Decode-hop observability: decode-to-decode context switches executed,
-    // tokens decoded on each context, and the commit cost those switches paid
-    // (already included in commit_bytes / commit_us above).
+    // tokens decoded on each context, the commit cost those switches paid
+    // (already included in commit_bytes / commit_us above), and the windows
+    // whose leg the headroom rule decided (zero while the alternation
+    // fallback decides every window).
     uint64_t decode_hops = 0;
     uint64_t decode_tokens_cpu = 0;
     uint64_t decode_tokens_npu = 0;
     uint64_t decode_hop_commit_bytes = 0;
     uint64_t decode_hop_commit_us = 0;
+    uint64_t decode_hop_headroom_windows = 0;
     uint64_t stall_union_us = 0;
     uint64_t prefill_cpu_us = 0;
     uint64_t prefill_read_bytes = 0;
@@ -494,6 +497,18 @@ LLAMA_API bool llama_governor_set_thermo_profile(
         struct llama_governor * governor,
         struct llama_governor_thermo_profile profile,
         int64_t now_ms);
+
+/** Update the decode-hop thermal headroom: for each leg, the margin in C
+ *  between that leg's temperature and its first passive trip (the binding
+ *  samples its thermal zones). NaN = unknown leg; with either leg unknown
+ *  the hop falls back to the odd/even alternation, with both known it opens
+ *  every decode on the NPU and moves a window only when the other leg's
+ *  headroom outruns the current one by the policy hysteresis (see
+ *  select_decode). Same decode-thread contract as set_thermo_profile. */
+LLAMA_API bool llama_governor_set_decode_headroom(
+        struct llama_governor * governor,
+        float cpu_headroom_c,
+        float npu_headroom_c);
 
 /** Dev hook (/bench route): set the per-governor prefill override.
  *  mode: 0=auto (clears), 1=cpu, 2=gpu. Safe to call while another thread

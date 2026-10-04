@@ -4,6 +4,7 @@
 #include "llama-impl.h"
 
 #include <algorithm>
+#include <cstring>
 #include <string>
 #include <stdexcept>
 #include <vector>
@@ -181,10 +182,16 @@ int32_t llama_governor::select_decode() {
     const auto selection = policy_.select_decode(ggml_time_us() / 1000, decode_tokens_since_prefill_);
     // The engine routes this batch: NPU decode runs on ctx_prefill (decode_impl).
     decode_engine_ = selection.engine;
+    decode_hop_rule_ = selection.hop_rule;
     stats_.decode_engine = selection.engine;
     stats_.decode_requires_reload = selection.requires_reload;
     stats_.last_router_rule = selection.rule;
     stats_.cpu_to_gpu_engagements = policy_.cpu_to_gpu_engagements();
+    // hop_rule is set only on the token that decides a window, so this counts
+    // windows, in the same clear_cache interval as the other decode_hop_* stats.
+    if (selection.hop_rule != nullptr && std::strcmp(selection.hop_rule, "headroom") == 0) {
+        ++stats_.decode_hop_headroom_windows;
+    }
     if (selection.wait) {
         if (policy_.thermal_state() == llama_governor_thermal_state::Invalid ||
             policy_.thermal_state() == llama_governor_thermal_state::CRITICAL) {
@@ -225,6 +232,7 @@ void llama_governor::clear_cache(bool clear_data) {
     last_phase = phase::None;
     prefill_route_ = prefill_route::Undecided;
     decode_tokens_since_prefill_ = 0;
+    policy_.reset_decode_hop();
 
     stats_.commit_bytes = 0;
     stats_.commit_us = 0;
@@ -239,15 +247,17 @@ void llama_governor::clear_cache(bool clear_data) {
     stats_.decode_tokens_npu = 0;
     stats_.decode_hop_commit_bytes = 0;
     stats_.decode_hop_commit_us = 0;
+    stats_.decode_hop_headroom_windows = 0;
 }
 
 void llama_governor::reset_prefill_stats() {
     prefill_route_ = prefill_route::Undecided;
     // The hop clock is per-turn routing state like the latch: the binding
     // calls this at every completion start, so a turn whose prompt was fully
-    // cached (its 1-token batch never enters the prefill branch) still opens
-    // at hop window 0 on CPU.
+    // cached (its 1-token batch never enters the prefill branch) still
+    // decides hop window 0 fresh, whichever rule runs.
     decode_tokens_since_prefill_ = 0;
+    policy_.reset_decode_hop();
     stats_.prefill_us = 0;
     stats_.prefill_n = 0;
     stats_.prefill_chunks[0] = '\0';
@@ -270,6 +280,14 @@ bool llama_governor::set_thermo_profile(const llama_governor_thermo_profile & pr
         hot_plugged_announced_ = false;
     }
     return ok;
+}
+
+bool llama_governor::set_decode_headroom(float cpu_headroom_c, float npu_headroom_c) {
+    if (!policy_enabled_) {
+        return false;
+    }
+    policy_.set_decode_headroom(cpu_headroom_c, npu_headroom_c);
+    return true;
 }
 
 bool llama_governor::set_prefill_override(int mode) {
@@ -361,6 +379,11 @@ bool llama_governor_trim_sequence(llama_governor * governor, llama_pos p) {
 bool llama_governor_set_thermo_profile(llama_governor * governor,
                                        llama_governor_thermo_profile profile, int64_t now_ms) {
     return governor && governor->set_thermo_profile(profile, now_ms);
+}
+
+bool llama_governor_set_decode_headroom(llama_governor * governor,
+                                        float cpu_headroom_c, float npu_headroom_c) {
+    return governor && governor->set_decode_headroom(cpu_headroom_c, npu_headroom_c);
 }
 
 bool llama_governor_set_prefill_override(llama_governor * governor, int mode) {

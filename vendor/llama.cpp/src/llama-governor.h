@@ -12,9 +12,10 @@ struct llama_governor {
     explicit llama_governor(llama_governor_params governor_params);
     ~llama_governor();
 
-    // Threading contract: decode(), set_thermo_profile(), record_telemetry(),
-    // note_expert_route(), and stats() are decode-thread methods and must not
-    // overlap. set_prefill_override() is the one exception: it stores only the
+    // Threading contract: decode(), set_thermo_profile(),
+    // set_decode_headroom(), record_telemetry(), note_expert_route(), and
+    // stats() are decode-thread methods and must not overlap.
+    // set_prefill_override() is the one exception: it stores only the
     // atomic mode in the policy, so it may overlap decode(); the mode is
     // consumed at the next prefill latch (see admit_prefill).
     // stall_enter()/stall_exit() are the only worker-thread callbacks; they are mutex-protected.
@@ -38,6 +39,9 @@ struct llama_governor {
     void clear_cache(bool clear_data);
     void reset_prefill_stats();
     bool set_thermo_profile(const llama_governor_thermo_profile & profile, int64_t now_ms);
+    // Decode-hop leg headroom (llama_governor_set_decode_headroom); same
+    // decode-thread contract as set_thermo_profile.
+    bool set_decode_headroom(float cpu_headroom_c, float npu_headroom_c);
     // Bench route dev hook: validates mode (0..2) into the policy override.
     // Atomic store only - no stats refresh (threading contract above); it
     // takes effect at the next prefill latch.
@@ -114,8 +118,13 @@ private:
     // resolved, instead of ctx_decode.
     llama_governor_engine decode_engine_ = llama_governor_engine::CPU;
     // Generated tokens since the last prefill entry - the decode hop's
-    // alternation clock, restarted where the route latch re-arms.
+    // window clock, paced by both hop rules (headroom and alternation) and
+    // restarted where the route latch re-arms.
     uint32_t decode_tokens_since_prefill_ = 0;
+    // What decided the current hop window's leg ("headroom"/"alternation"),
+    // copied from the policy selection; null while the hop is inactive, so a
+    // safety exit that moves the work keeps the bare hop direction label.
+    const char * decode_hop_rule_ = nullptr;
     // Snapshot of the /bench route override, taken with the route latch so
     // every route fact of one prefill latch reports the same mode and the
     // same causal decision, whatever a concurrent push does afterwards. The

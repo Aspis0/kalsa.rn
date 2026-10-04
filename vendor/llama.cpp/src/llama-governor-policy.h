@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <limits>
 
 /** Copyable handle over an atomic prefill override: llama_governor_policy
  *  stays copy-assignable (the router tests reassign whole policies) while
@@ -48,6 +49,11 @@ struct llama_governor_decode_selection {
     bool requires_reload = false;
     bool wait = false;
     uint32_t rule = 0;
+    // While the hop owns decode: static string naming what decided the
+    // current window's leg ("headroom" / "alternation"); null on every
+    // non-hop path, so a safety exit that moves the work labels itself
+    // with no hop rule.
+    const char * hop_rule = nullptr;
 };
 
 class llama_governor_policy {
@@ -55,14 +61,24 @@ public:
     explicit llama_governor_policy(const llama_governor_params & params);
 
     bool update_thermal(const llama_governor_thermo_profile & profile, int64_t now_ms);
+    // Per-leg decode-hop headroom in C (NaN = unknown leg, no usable zone on
+    // this phone); read by the hop rule in select_decode.
+    void set_decode_headroom(float cpu_headroom_c, float npu_headroom_c);
+    // Arms a fresh hop leg decision for the next decode: the governor calls
+    // this wherever it zeroes its decode-hop clock, and the headroom samples
+    // go with the clock, so window 0 decides on this turn's reading (the
+    // binding samples before the first decode of every turn), never on the
+    // previous turn's.
+    void reset_decode_hop();
     llama_governor_prefill_admission admit_prefill(
             llama_governor_engine requested, uint32_t prompt_tokens, float now_c,
             uint32_t n_batch = UINT32_MAX) const;
     // tokens_since_prefill is the caller's decode-hop clock: generated tokens
     // since the last prefill, which the governor restarts at every prefill
     // entry and at every reset_prefill_stats (the binding's per-completion
-    // call, so a fully cached turn still opens window 0). It decides the
-    // CPU/NPU alternation (see select_decode).
+    // call, so a fully cached turn still opens window 0). It paces the hop
+    // windows that the headroom and alternation rules decide on (see
+    // select_decode).
     llama_governor_decode_selection select_decode(
             int64_t now_ms, uint32_t tokens_since_prefill = 0);
 
@@ -133,4 +149,15 @@ private:
     float t_idle_reference_c_ = 0.0f;
     bool have_t_idle_reference_ = false;
     llama_governor_engine last_decode_engine_ = llama_governor_engine::CPU;
+    // Decode-hop leg state (the rule lives in select_decode): per-leg
+    // headroom input (NaN = unknown), the window the current leg was decided
+    // for, and the leg itself. The window guard is what keeps decisions at
+    // window boundaries - a caller polls select_decode per token.
+    float decode_cpu_headroom_c_ = std::numeric_limits<float>::quiet_NaN();
+    float decode_npu_headroom_c_ = std::numeric_limits<float>::quiet_NaN();
+    // Window the current hop leg was decided for; the sentinel means no
+    // window is decided yet (fresh policy or reset_decode_hop), so window 0
+    // of a new decode always decides.
+    uint32_t decode_hop_window_ = UINT32_MAX;
+    llama_governor_engine decode_hop_leg_ = llama_governor_engine::CPU;
 };

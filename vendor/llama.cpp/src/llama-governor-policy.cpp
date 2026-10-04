@@ -1,4 +1,5 @@
 #include "llama-governor-policy.h"
+#include "llama-impl.h"
 
 #include <algorithm>
 #include <cmath>
@@ -18,6 +19,10 @@ constexpr float k_kill_c = 44.0f;
 constexpr float k_trend_c_per_min = 1.5f;
 constexpr uint32_t k_table_tokens[] = { 128, 512, 1024, 2048 };
 constexpr float k_cpu_delta_c[] = { 1.9f, 3.25f, 3.25f, 5.15f };
+// Decode-hop hysteresis: the other leg must beat the current one by this much
+// before a window boundary moves the work, so sample noise cannot buy a
+// flip-flopping KV commit. Starting value, to be tuned on the S23.
+constexpr float k_hop_hysteresis_c = 4.0f;
 
 bool valid_schema(const llama_governor_params & params) {
     return params.schema_version == 3 && params.capability_schema_version == 2 &&
@@ -419,27 +424,81 @@ llama_governor_decode_selection llama_governor_policy::select_decode(
         result.wait = true;
         return result;
     }
-    // Decode hop (prototype): every decode_hop_tokens generated tokens the
-    // decode moves between CPU and the live NPU lane, odd windows on the NPU
-    // so window 0 and every turn start stay CPU. WHY: on the S23
+    // Decode hop: every decode_hop_tokens generated tokens the decode moves
+    // between CPU and the live NPU lane, decided at window boundaries only so
+    // each KV commit stays amortized over a whole window. WHY: on the S23
     // (LFM2.5-2.6B Q4_0) CPU decode at 5 host threads runs ~20-22 tok/s while
     // soaking the CPU block at ~90 C (Android thermal status 3 sustained),
     // and HTP decode at 1 host thread runs 22.9 tok/s with the CPU at ~61 C
     // and the NSP at ~88 C - alternating the blocks spreads the heat instead
-    // of soaking one. The fixed N is a measurement knob, not a thermal rule;
-    // safety states keep CPU exactly as prefill does. The KV follows the work
+    // of soaking one. When the binding can read both legs' zones
+    // (llama_governor_set_decode_headroom, headroom to the first passive trip:
+    // NSP trips at 95 C, CPU-1 at 108 C, so NPU-only decode sits right at its
+    // trip) the rule is: open every decode on the NPU - measured half the
+    // CPU's heat per token (0.148 vs 0.302 battery C*s/token) - then move a
+    // window only when the other leg's headroom outruns the current one by
+    // k_hop_hysteresis_c. Without zones on the leg (e.g. Jelly/MTK denies
+    // them) the fallback is the prototype's fixed odd/even alternation.
+    // Safety states keep CPU exactly as prefill does. The KV follows the work
     // (the governor commits on the switch), so unlike the GPU_COOLMODE
     // selection below no reload is ever involved; while the hop is active it
-    // owns decode outright - odd windows NPU, even windows CPU - and the
-    // GPU_COOLMODE rule below is never consulted, so an otherwise eligible
-    // battery COOLMODE cannot buy a reload mid-alternation.
+    // owns decode outright and the GPU_COOLMODE rule below is never
+    // consulted, so an otherwise eligible battery COOLMODE cannot buy a
+    // reload mid-alternation.
     const bool hop_active = params_.decode_hop_tokens > 0 && npu_lane_live() && not_a_safety_state();
-    if (hop_active && (tokens_since_prefill / params_.decode_hop_tokens) % 2 == 1) {
-        result.engine = llama_governor_engine::NPU;
+    if (hop_active) {
+        const uint32_t window = tokens_since_prefill / params_.decode_hop_tokens;
+        if (window != decode_hop_window_) {
+            decode_hop_window_ = window;
+            const bool headroom_rule =
+                std::isfinite(decode_cpu_headroom_c_) && std::isfinite(decode_npu_headroom_c_);
+            const llama_governor_engine prev_leg = decode_hop_leg_;
+            if (headroom_rule) {
+                if (window == 0) {
+                    decode_hop_leg_ = llama_governor_engine::NPU;
+                } else {
+                    const bool on_npu = decode_hop_leg_ == llama_governor_engine::NPU;
+                    const float current = on_npu ? decode_npu_headroom_c_ : decode_cpu_headroom_c_;
+                    const float other = on_npu ? decode_cpu_headroom_c_ : decode_npu_headroom_c_;
+                    if (other - current >= k_hop_hysteresis_c) {
+                        decode_hop_leg_ = on_npu ? llama_governor_engine::CPU
+                                                 : llama_governor_engine::NPU;
+                    }
+                }
+                result.hop_rule = "headroom";
+            } else {
+                decode_hop_leg_ = window % 2 == 1 ? llama_governor_engine::NPU
+                                                  : llama_governor_engine::CPU;
+                result.hop_rule = "alternation";
+            }
+            // One line per leg change - when and why the work moved, never a
+            // per-window tick.
+            if (decode_hop_leg_ != prev_leg) {
+                const bool to_npu = decode_hop_leg_ == llama_governor_engine::NPU;
+                if (headroom_rule) {
+                    LLAMA_LOG_INFO("governor: decode hop %s->%s at token %u (headroom cpu %.1f C,"
+                                   " npu %.1f C, hysteresis %.0f C)\n",
+                                   to_npu ? "cpu" : "npu", to_npu ? "npu" : "cpu",
+                                   tokens_since_prefill, decode_cpu_headroom_c_,
+                                   decode_npu_headroom_c_, k_hop_hysteresis_c);
+                } else {
+                    LLAMA_LOG_INFO("governor: decode hop %s->%s at token %u (alternation,"
+                                   " zones unknown)\n",
+                                   to_npu ? "cpu" : "npu", to_npu ? "npu" : "cpu",
+                                   tokens_since_prefill);
+                }
+            }
+        }
+        result.engine = decode_hop_leg_;
         result.rule = 4;
-        last_decode_engine_ = llama_governor_engine::NPU;
+        last_decode_engine_ = result.engine;
         return result;
     }
+    // Hop inactive (safety state or lane down): the work sits on CPU, so the
+    // next active window must be decided fresh by the rule - never inherit
+    // the interrupted window's leg silently.
+    decode_hop_leg_ = llama_governor_engine::CPU;
+    decode_hop_window_ = UINT32_MAX;
     const bool budget_ok = last_gpu_engagement_ms_ < 0 || now_ms < last_gpu_engagement_ms_ ||
                            now_ms - last_gpu_engagement_ms_ >= k_flip_window_ms;
     // GPU_COOLMODE is the hottest decode backend per token on the owner's
@@ -464,6 +523,20 @@ llama_governor_decode_selection llama_governor_policy::select_decode(
     }
     last_decode_engine_ = result.engine;
     return result;
+}
+
+void llama_governor_policy::set_decode_headroom(float cpu_headroom_c, float npu_headroom_c) {
+    decode_cpu_headroom_c_ = cpu_headroom_c;
+    decode_npu_headroom_c_ = npu_headroom_c;
+}
+
+void llama_governor_policy::reset_decode_hop() {
+    decode_hop_window_ = UINT32_MAX;
+    // The headroom sample is per-turn state like the window: dropped with it,
+    // so window 0 of the next turn never decides on the previous turn's
+    // reading (the binding samples before the first decode of each turn).
+    decode_cpu_headroom_c_ = std::numeric_limits<float>::quiet_NaN();
+    decode_npu_headroom_c_ = std::numeric_limits<float>::quiet_NaN();
 }
 
 llama_governor_thermal_state llama_governor_policy::thermal_state() const { return state_; }

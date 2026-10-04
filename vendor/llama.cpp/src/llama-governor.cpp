@@ -282,11 +282,13 @@ int32_t llama_governor::decode_impl(llama_batch batch, bool allow_chunking) {
     // via clear_cache/reset_prefill_stats): within one prefill phase the
     // engine stays put. The hop clock restarts with the latch - here, and at
     // the binding's per-completion reset_prefill_stats call - so every turn
-    // opens a fresh CPU window even when the prompt was fully cached and its
-    // 1-token batch never enters this prefill branch.
+    // decides hop window 0 fresh, whichever rule runs (headroom opens it on
+    // the NPU), even when the prompt was fully cached and its 1-token batch
+    // never enters this prefill branch.
     if (is_prefill && allow_chunking && last_phase != phase::Prefill) {
         prefill_route_ = prefill_route::Undecided;
         decode_tokens_since_prefill_ = 0;
+        policy_.reset_decode_hop();
     }
 
     if (policy_enabled_) {
@@ -325,11 +327,19 @@ int32_t llama_governor::decode_impl(llama_batch batch, bool allow_chunking) {
     // stay on their context and never commit.
     const bool decode_hop = !is_prefill && last_phase == phase::Decode && target != last_ctx;
     if (last_ctx != nullptr && target != last_ctx) {
+        // Name the decider in the hop label ("... (headroom)"/"... (alternation)");
+        // a safety exit that moves the work keeps the bare direction.
+        char hop_direction[64];
         const char * direction = is_prefill
             ? (last_phase == phase::Decode ? "decode-to-prefill" : "prefill route switch")
             : last_phase == phase::Decode
                 ? (npu_decode ? "decode hop cpu-to-npu" : "decode hop npu-to-cpu")
                 : "prefill-to-decode";
+        if (decode_hop && decode_hop_rule_ != nullptr) {
+            std::snprintf(hop_direction, sizeof(hop_direction), "%s (%s)",
+                          direction, decode_hop_rule_);
+            direction = hop_direction;
+        }
         side_state & src = last_ctx == ctx_prefill ? prefill_state : decode_state;
         const uint64_t commit_bytes_before = stats_.commit_bytes;
         const uint64_t commit_us_before = stats_.commit_us;

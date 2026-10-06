@@ -9,17 +9,12 @@
 
 #include <cctype>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #if defined(__ANDROID__)
 #include <sys/auxv.h>
 #include <sys/system_properties.h>
-
-// Linux ARM64 elf_hwcaps bit 20: bionic ships no <sys/hwcap.h>, so the ABI
-// bit is spelled out (glibc defines the same value in its own header).
-#ifndef HWCAP_ASIMDDP
-#define HWCAP_ASIMDDP (1UL << 20)
-#endif
 
 #if defined(GGML_USE_OPENCL)
 #include <CL/cl.h>
@@ -46,31 +41,104 @@ bool has_model_token(const std::string & s, const char * model) {
     return false;
 }
 
-// One validated row: exact SoC and Hexagon arch, the Adreno model as a whole
-// token in the CL name/version strings, and the GPU driver compiler's
+// One validated row: exact SoC and Hexagon arch, the Adreno identity - vendor
+// token AND model token, each whole, in the CL name/version strings of the
+// device the GPUOpenCL backend selected - and the GPU driver compiler's
 // major.minor with the trailing dot (accepts the E031.41.x patch line,
-// rejects E031.45, and "E031.41." cannot match "E031.411"). A firmware
-// update off this compiler line must demote to two-copy, because J(1) makes
-// the NPU decode depend on the OpenCL HOST leg that gate validates.
+// rejects E031.45, and "E031.41." cannot match "E031.411"). A firmware update
+// off this compiler line must demote to two-copy, because J(1) makes the NPU
+// decode depend on the OpenCL HOST leg that gate validates.
 struct rn_legs_row {
     const char * soc_model;
     const char * hexagon_arch;
+    const char * gpu_vendor_token;
     const char * gpu_model_token;
     const char * gpu_compiler;
 };
 
 const rn_legs_row k_rows[] = {
-    { "SM8550", "Hexagon v73", "740", "E031.41." },
+    { "SM8550", "Hexagon v73", "Adreno", "740", "E031.41." },
 };
 
 bool row_matches(const rn_legs_row & row, const rn_hw_facts & facts) {
     return facts.soc_model == row.soc_model &&
            facts.hexagon_arch == row.hexagon_arch &&
+           (has_model_token(facts.gpu_name, row.gpu_vendor_token) ||
+            has_model_token(facts.gpu_version, row.gpu_vendor_token)) &&
            (has_model_token(facts.gpu_name, row.gpu_model_token) ||
             has_model_token(facts.gpu_version, row.gpu_model_token)) &&
            facts.gpu_driver.find(row.gpu_compiler) != std::string::npos &&
            facts.dotprod;
 }
+
+#if defined(__ANDROID__) && defined(GGML_USE_OPENCL)
+// The GPU facts of the cl_device the registered GPUOpenCL backend actually
+// runs on (audit F6): the backend's device description IS its selected
+// device's CL_DEVICE_NAME (ggml-opencl.cpp device get_description), so the
+// cl_device with that exact name is the one in use, and its
+// CL_DEVICE_VERSION / CL_DRIVER_VERSION feed the row. With
+// GGML_OPENCL_PLATFORM / GGML_OPENCL_DEVICE set the backend's selection
+// follows the env (ggml-opencl.cpp platform/device pick): a lab pin, not a
+// production phone - the reader refuses instead of second-guessing it, and
+// empty facts never match a row.
+void read_opencl_facts(rn_hw_facts & facts) {
+    const char * envs[] = { "GGML_OPENCL_PLATFORM", "GGML_OPENCL_DEVICE" };
+    for (const char * env : envs) {
+        const char * value = std::getenv(env);
+        if (value != nullptr && value[0] != '\0') {
+            return;
+        }
+    }
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("OpenCL");
+    if (reg == nullptr || ggml_backend_reg_dev_count(reg) == 0) {
+        return;
+    }
+    const char * description = ggml_backend_dev_description(ggml_backend_reg_dev_get(reg, 0));
+    if (description == nullptr || description[0] == '\0') {
+        return;
+    }
+    cl_uint n_platforms = 0;
+    if (clGetPlatformIDs(0, nullptr, &n_platforms) != CL_SUCCESS || n_platforms == 0) {
+        return;
+    }
+    std::vector<cl_platform_id> platforms(n_platforms);
+    if (clGetPlatformIDs(n_platforms, platforms.data(), nullptr) != CL_SUCCESS) {
+        return;
+    }
+    const auto read_str = [](cl_device_id device, cl_device_info what) {
+        size_t size = 0;
+        if (clGetDeviceInfo(device, what, 0, nullptr, &size) != CL_SUCCESS || size == 0) {
+            return std::string();
+        }
+        std::string value(size - 1, '\0');
+        if (clGetDeviceInfo(device, what, size, value.data(), nullptr) != CL_SUCCESS) {
+            return std::string();
+        }
+        return value;
+    };
+    for (cl_platform_id platform : platforms) {
+        cl_uint n_devices = 0;
+        if (clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 0, nullptr, &n_devices) != CL_SUCCESS ||
+            n_devices == 0) {
+            continue;
+        }
+        std::vector<cl_device_id> devices(n_devices);
+        if (clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, n_devices, devices.data(),
+                           nullptr) != CL_SUCCESS) {
+            continue;
+        }
+        for (cl_device_id device : devices) {
+            if (read_str(device, CL_DEVICE_NAME) != description) {
+                continue;
+            }
+            facts.gpu_name = description;
+            facts.gpu_version = read_str(device, CL_DEVICE_VERSION);
+            facts.gpu_driver = read_str(device, CL_DRIVER_VERSION);
+            return;
+        }
+    }
+}
+#endif // __ANDROID__ && GGML_USE_OPENCL
 
 } // namespace
 
@@ -110,45 +178,8 @@ rn_hw_facts rn_read_hw_facts() {
     }
 
 #if defined(GGML_USE_OPENCL)
-    // The OpenCL strings, straight from the ICD the backend itself loads.
-    // A build without the OpenCL backend cannot one-copy (the GPU leg IS an
-    // OpenCL leg), so its facts stay empty.
-    cl_uint n_platforms = 0;
-    if (clGetPlatformIDs(0, nullptr, &n_platforms) == CL_SUCCESS && n_platforms > 0) {
-        std::vector<cl_platform_id> platforms(n_platforms);
-        if (clGetPlatformIDs(n_platforms, platforms.data(), nullptr) == CL_SUCCESS) {
-            for (cl_platform_id platform : platforms) {
-                cl_uint n_devices = 0;
-                if (clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 0, nullptr,
-                                   &n_devices) != CL_SUCCESS || n_devices == 0) {
-                    continue;
-                }
-                cl_device_id device = nullptr;
-                if (clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device,
-                                   nullptr) != CL_SUCCESS) {
-                    continue;
-                }
-                const auto read_str = [&](cl_device_info what) {
-                    size_t size = 0;
-                    if (clGetDeviceInfo(device, what, 0, nullptr, &size) != CL_SUCCESS ||
-                        size == 0) {
-                        return std::string();
-                    }
-                    std::string value(size - 1, '\0');
-                    if (clGetDeviceInfo(device, what, size, value.data(), nullptr) !=
-                        CL_SUCCESS) {
-                        return std::string();
-                    }
-                    return value;
-                };
-                facts.gpu_name = read_str(CL_DEVICE_NAME);
-                facts.gpu_version = read_str(CL_DEVICE_VERSION);
-                facts.gpu_driver = read_str(CL_DRIVER_VERSION);
-                break;
-            }
-        }
-    }
-#endif // GGML_USE_OPENCL
+    read_opencl_facts(facts);
+#endif
 #endif // __ANDROID__
     return facts;
 }

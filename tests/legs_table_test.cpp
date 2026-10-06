@@ -81,6 +81,19 @@ bool test_driver_compiler_line() {
     return all_three(rn_legs_for(facts));                 // patch line is fine
 }
 
+// The row requires the Adreno identity, not just the model number (audit F6):
+// a non-Adreno GPU that happens to carry a whole "740" token must not match,
+// and Adreno alone without the model token does not either.
+bool test_non_adreno_740_refused() {
+    auto facts = s23_facts();
+    facts.gpu_name = "PowerVR-BX-740";
+    facts.gpu_version = "OpenCL 3.0 PowerVR B-Series 740";
+    if (all_three(rn_legs_for(facts))) { return false; }
+    facts = s23_facts();
+    facts.gpu_version = "OpenCL 3.0 Adreno(TM) 750";
+    return !all_three(rn_legs_for(facts));
+}
+
 bool test_j1_gpu_clause_demotes_everything() {
     // The J(1)/R2 consequence: with the GPU clause failed (driver update),
     // one_copy is false - never NPU+CPU one-copy without the OpenCL HOST leg.
@@ -122,6 +135,8 @@ int main() {
     results.run_test("S23 row matches", test_row_matches());
     results.run_test("model token boundaries", test_model_token_boundaries());
     results.run_test("driver compiler major.minor line", test_driver_compiler_line());
+    results.run_test("non-Adreno 740 refused (Adreno identity required)",
+                     test_non_adreno_740_refused());
     results.run_test("failed GPU clause demotes to two-copy (J1/R2)",
                      test_j1_gpu_clause_demotes_everything());
     results.run_test("unreadable fact is two-copy", test_unreadable_fact_is_two_copy());

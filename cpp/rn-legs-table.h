@@ -11,9 +11,9 @@ namespace rnllama {
 struct rn_hw_facts {
     std::string soc_model;     // ro.soc.model, e.g. "SM8550"
     std::string hexagon_arch;  // registered HTP device description, "Hexagon v73"
-    std::string gpu_name;      // OpenCL CL_DEVICE_NAME, e.g. "QUALCOMM Adreno(TM)"
-    std::string gpu_version;   // OpenCL CL_DEVICE_VERSION, e.g. "OpenCL 3.0 Adreno(TM) 740"
-    std::string gpu_driver;    // OpenCL CL_DRIVER_VERSION, ends in "... E031.41.03.62"
+    std::string gpu_name;      // CL_DEVICE_NAME of the GPUOpenCL backend's device
+    std::string gpu_version;   // its CL_DEVICE_VERSION, e.g. "OpenCL 3.0 Adreno(TM) 740"
+    std::string gpu_driver;    // its CL_DRIVER_VERSION, ends in "... E031.41.03.62"
     bool dotprod = false;      // AT_HWCAP ASIMDDP: the tile reader's sdot
 };
 
@@ -36,8 +36,10 @@ struct rn_leg_set {
 rn_leg_set rn_legs_for(const rn_hw_facts & facts);
 
 // The device-side fact readers: system properties, the registered HTP device
-// description, the OpenCL device strings and AT_HWCAP. Android only - a host
-// or non-Android build reads empty facts, which never match a row.
+// description, the OpenCL strings of the device the GPUOpenCL backend
+// selected (empty, so never a row match, when that selection is pinned by
+// GGML_OPENCL_PLATFORM / GGML_OPENCL_DEVICE) and AT_HWCAP. Android only - a
+// host or non-Android build reads empty facts, which never match a row.
 rn_hw_facts rn_read_hw_facts();
 
 } // namespace rnllama

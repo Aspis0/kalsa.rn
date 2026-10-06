@@ -141,3 +141,12 @@ target_include_directories(thermal_legs_test PRIVATE ${RNLLAMA_INCLUDE_DIRS})
 if(UNIX AND NOT APPLE)
     target_link_libraries(thermal_legs_test PRIVATE m)
 endif()
+
+# One-copy capability table: links only the table TU (the fact readers
+# compile empty off-Android) and drives the pure row match on synthetic
+# device facts.
+add_executable(legs_table_test legs_table_test.cpp ${RNLLAMA_CPP_DIR}/rn-legs-table.cpp)
+target_include_directories(legs_table_test PRIVATE ${RNLLAMA_INCLUDE_DIRS})
+if(UNIX AND NOT APPLE)
+    target_link_libraries(legs_table_test PRIVATE m)
+endif()

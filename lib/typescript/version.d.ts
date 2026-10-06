@@ -1,3 +1,3 @@
-export declare const BUILD_NUMBER = "11705";
-export declare const BUILD_COMMIT = "1c7f27f";
+export declare const BUILD_NUMBER = "11706";
+export declare const BUILD_COMMIT = "b60dbbf";
 //# sourceMappingURL=version.d.ts.map

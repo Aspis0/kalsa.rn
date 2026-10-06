@@ -5,13 +5,69 @@
 
 #include "llama-governor.h"
 
+#include "ggml-cpp.h"
 #include "ggml-hexagon.h"
 #include "llama-context.h"
 #include "llama-impl.h"
 #include "llama-model.h"
 
+#include <memory>
 #include <stdexcept>
 #include <string>
+
+namespace {
+
+// The J(1) fence (audit step-6 F5): a GPU context that exists is not proof the
+// output weight was admitted - the OpenCL HOST admission (R2 facts gate,
+// dma-buf import, per-tensor view, Q6_K self-check) runs when an op is placed,
+// and a refusal there leaves the leg alive while the scheduler silently moves
+// the lm_head to the CPU, which is not the one-copy configuration the load
+// promised. So the device is asked directly, on a MUL_MAT node built over the
+// REAL output tensor in its actual buffer: supports_op routes a HOST-weight
+// MUL_MAT through ggml_opencl_host_weight_ready, whose gate, import and
+// self-check are then exactly what decided (the node shape follows
+// ggml_opencl_host_op_ok: f32 mat-vec, weight in src0, graph-local src1).
+bool output_mul_mat_supported(ggml_backend_dev_t dev, const ggml_tensor * w) {
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * 4,
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx { ggml_init(params) };
+    if (!ctx) {
+        return false;
+    }
+    ggml_tensor * x = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, w->ne[0], 1);
+    ggml_tensor * op = x ? ggml_mul_mat(ctx.get(), const_cast<ggml_tensor *>(w), x) : nullptr;
+    return op != nullptr && ggml_backend_dev_supports_op(dev, op);
+}
+
+// Fail closed when an NPU-leg GPU device cannot read the model's output weight
+// (the tied token_embd in one-copy mode: the loader reuses it as the output).
+// The weight's own device is skipped on purpose: in the J(1) configuration the
+// HTP refuses exactly this op (the flat Q6_K host weight) and OpenCL serves it,
+// so asking the owner device would refuse every valid load. CPU-only hosts
+// never list a device here and never reach this.
+void require_npu_leg_gpu_admits_output(const llama_model * model, const ggml_backend_dev_t * devices) {
+    const ggml_tensor * w = model->output ? model->output : model->tok_embd;
+    if (!w || !w->buffer) {
+        return;
+    }
+    const ggml_backend_dev_t owner = ggml_backend_buft_get_device(
+        ggml_backend_buffer_get_type(w->buffer));
+    for (const ggml_backend_dev_t * d = devices; d && *d; ++d) {
+        if (*d == owner || ggml_backend_dev_type(*d) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        if (!output_mul_mat_supported(*d, w)) {
+            throw std::runtime_error(std::string("NPU leg device ") +
+                                     ggml_backend_dev_name(*d) + " does not admit the output weight '" +
+                                     w->name + "' (HOST leg import/self-check refused)");
+        }
+    }
+}
+
+} // namespace
 
 llama_governor::llama_governor(llama_model * model, const llama_governor_leg * leg_specs,
                                uint32_t n_legs, llama_governor_params governor_params)
@@ -53,6 +109,14 @@ llama_governor::llama_governor(llama_model * model, const llama_governor_leg * l
              leg_specs[i].params.rope_freq_scale   != leg_specs[0].params.rope_freq_scale ||
              leg_specs[i].params.yarn_orig_ctx     != leg_specs[0].params.yarn_orig_ctx)) {
             throw std::runtime_error("governor legs must share identical rope/YaRN params");
+        }
+    }
+    // Before any context exists: a GPU device the NPU leg relies on for what
+    // the HTP refuses must actually admit the output weight, or the whole
+    // one-copy contract (J(1)) is off and the caller falls back to two-copy.
+    for (uint32_t i = 0; i < n_legs; ++i) {
+        if (leg_specs[i].engine == llama_governor_engine::NPU && leg_specs[i].devices) {
+            require_npu_leg_gpu_admits_output(model, leg_specs[i].devices);
         }
     }
 

@@ -328,6 +328,10 @@ onecopy_load_result load_governor_one_model(
     owner.model = owner.governor_onecopy_init->model();
     owner.ctx = owner.governor->prefill_ctx();
     owner.params.n_gpu_layers = 99;
+    // The app's KALSA_GOVERNOR_PLAN surface: the lane is the table's
+    // resolution, HTP0 by the load contract, no fallback.
+    owner.setGovernorNpuDevice("HTP0");
+    owner.setGovernorNpuFallback(nullptr);
     owner.setGovernorKvCache(
         ggml_type_name(params.cache_type_k), ggml_type_name(params.cache_type_v),
         params.no_kv_offload ? "host" : "device");

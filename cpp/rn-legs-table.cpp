@@ -86,7 +86,7 @@ rn_hw_facts rn_read_hw_facts() {
     rn_hw_facts facts;
 #if defined(__ANDROID__)
     // SoC: unreadable stays empty, which never matches a row.
-    char prop[92] = { 0 };
+    char prop[PROP_VALUE_MAX] = { 0 };
     if (__system_property_get("ro.soc.model", prop) > 0) {
         facts.soc_model = prop;
     }

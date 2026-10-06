@@ -13,8 +13,13 @@
 
 #if defined(__ANDROID__)
 #include <sys/auxv.h>
-#include <sys/hwcap.h>
 #include <sys/system_properties.h>
+
+// Linux ARM64 elf_hwcaps bit 20: bionic ships no <sys/hwcap.h>, so the ABI
+// bit is spelled out (glibc defines the same value in its own header).
+#ifndef HWCAP_ASIMDDP
+#define HWCAP_ASIMDDP (1UL << 20)
+#endif
 
 #if defined(GGML_USE_OPENCL)
 #include <CL/cl.h>

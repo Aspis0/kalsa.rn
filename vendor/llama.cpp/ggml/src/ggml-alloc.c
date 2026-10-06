@@ -439,10 +439,20 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
     return buf;
 }
 
-static void ggml_vbuffer_tensor_alloc(struct vbuffer * buf, struct ggml_tensor * tensor, struct buffer_address buf_addr) {
+// False when the plan names a chunk this vbuffer does not have. A chunk the plan uses always
+// has a buffer after a successful reserve, so a miss here means the plan and the vbuffers
+// disagree (a no_alloc reserve, or a reserve that could not allocate a slot); the caller
+// refuses the allocation instead of dereferencing the missing chunk.
+static bool ggml_vbuffer_tensor_alloc(struct vbuffer * buf, struct ggml_tensor * tensor, struct buffer_address buf_addr) {
+    if (buf == NULL || buf_addr.chunk < 0 || buf_addr.chunk >= GGML_VBUFFER_MAX_CHUNKS ||
+        buf->chunks[buf_addr.chunk] == NULL) {
+        GGML_LOG_ERROR("%s: tensor %s has no buffer for chunk %d - refusing the allocation\n",
+            __func__, tensor->name, buf_addr.chunk);
+        return false;
+    }
     void * base = ggml_backend_buffer_get_base(buf->chunks[buf_addr.chunk]);
     void * addr = (char *)base + buf_addr.offset;
-    ggml_backend_tensor_alloc(buf->chunks[buf_addr.chunk], tensor, addr);
+    return ggml_backend_tensor_alloc(buf->chunks[buf_addr.chunk], tensor, addr) == GGML_STATUS_SUCCESS;
 }
 
 static void ggml_vbuffer_reset(struct vbuffer * buf) {
@@ -920,10 +930,17 @@ static bool ggml_gallocr_reserve_n_impl(
         bool realloc = galloc->buffers[i] == NULL;
         size_t new_size = 0;
         for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
-            size_t cur_chunk_size = galloc->buffers[i] ? ggml_vbuffer_chunk_size(galloc->buffers[i], c) : 0;
-            size_t new_chunk_size = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c);
+            // A chunk the vbuffer does not have yet must be allocated even when its planned
+            // size is 0 - a chunk whose tensors are all zero-sized. The size comparison
+            // cannot see it (both sides are 0), and the plan would then walk a NULL chunk in
+            // ggml_vbuffer_tensor_alloc. Measured on the S23 in the shared-weights GPU leg:
+            // a reserve that allocated nothing at all (no rpcmem line) was followed by that
+            // walk with GGML_ASSERT(buffer) at ggml-backend.cpp:155.
+            const bool have_chunk = galloc->buffers[i] != NULL && galloc->buffers[i]->chunks[c] != NULL;
+            const size_t cur_chunk_size = have_chunk ? ggml_vbuffer_chunk_size(galloc->buffers[i], c) : 0;
+            const size_t new_chunk_size = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c);
             new_size += new_chunk_size;
-            if (new_chunk_size > cur_chunk_size) {
+            if (!have_chunk || new_chunk_size > cur_chunk_size) {
                 realloc = true;
             }
         }
@@ -992,7 +1009,7 @@ bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {
     return ggml_gallocr_reserve_n(galloc, graph, NULL, NULL);
 }
 
-static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor * tensor, struct tensor_alloc * tensor_alloc) {
+static bool ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor * tensor, struct tensor_alloc * tensor_alloc) {
     int buffer_id = tensor_alloc->buffer_id;
     assert(tensor->data || tensor->view_src || ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor) <= tensor_alloc->size_max);
 
@@ -1001,22 +1018,31 @@ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor *
             assert(tensor_alloc->addr.offset == SIZE_MAX);
             if (tensor->view_src->buffer == NULL) {
                 // this tensor was allocated without ggml-backend
-                return;
+                return true;
             }
             ggml_backend_view_init(tensor);
         }
     } else {
-        if (tensor->data == NULL) {
+        // A zero-byte tensor on a zero-size chunk gets the dummy buffer of
+        // ggml_backend_buft_alloc_buffer, whose base - and with it the tensor's data - is NULL, so
+        // "data == NULL" cannot tell "not placed yet" from "placed in a zero-size chunk". Asking
+        // for the buffer too matches ggml_gallocr_is_allocated, which already counts a buffer as
+        // allocated, and keeps a second walk of the same graph from re-allocating the tensor past
+        // GGML_ASSERT(tensor->buffer == NULL) in ggml_backend_tensor_alloc.
+        if (tensor->data == NULL && tensor->buffer == NULL) {
             assert(tensor_alloc->addr.offset != SIZE_MAX);
             assert(ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor) <= tensor_alloc->size_max);
-            ggml_vbuffer_tensor_alloc(galloc->buffers[buffer_id], tensor, tensor_alloc->addr);
+            if (!ggml_vbuffer_tensor_alloc(galloc->buffers[buffer_id], tensor, tensor_alloc->addr)) {
+                return false;
+            }
         } else {
             if (tensor->buffer == NULL) {
                 // this tensor was allocated without ggml-backend
-                return;
+                return true;
             }
         }
     }
+    return true;
 }
 
 static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_tensor * node, struct tensor_alloc * talloc) {
@@ -1103,7 +1129,12 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
     for (int i = 0; i < graph->n_leafs; i++) {
         struct ggml_tensor * leaf = graph->leafs[i];
         struct leaf_alloc * leaf_alloc = &galloc->leaf_allocs[i];
-        ggml_gallocr_init_tensor(galloc, leaf, &leaf_alloc->leaf);
+        if (!ggml_gallocr_init_tensor(galloc, leaf, &leaf_alloc->leaf)) {
+            // a plan this buffer set cannot serve: poison it so the next call re-reserves
+            // instead of refusing again, and report a failed allocation to the caller
+            galloc->n_nodes = -1;
+            return false;
+        }
     }
     // nodes
     for (int i = 0; i < graph->n_nodes; i++) {
@@ -1114,9 +1145,15 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
             if (src == NULL) {
                 continue;
             }
-            ggml_gallocr_init_tensor(galloc, src, &node_alloc->src[j]);
+            if (!ggml_gallocr_init_tensor(galloc, src, &node_alloc->src[j])) {
+                galloc->n_nodes = -1;
+                return false;
+            }
         }
-        ggml_gallocr_init_tensor(galloc, node, &node_alloc->dst);
+        if (!ggml_gallocr_init_tensor(galloc, node, &node_alloc->dst)) {
+            galloc->n_nodes = -1;
+            return false;
+        }
     }
 
     return true;

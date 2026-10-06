@@ -2065,6 +2065,26 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     }
     moe_repack_trace_op(tensor, false);
 
+    // the extra path declined: no native kernel can read a non-NATIVE weight layout, and a refusal
+    // by supports_op is not enough - the scheduler answers it with a copy, and a graph computed
+    // without a scheduler never asks. Views resolve to the root: a view into a tiled weight
+    // points mid-tile with a native byte offset and must abort like the root. Only thread 0 runs
+    // the scan: thread 0 executes every node (same idiom as the tile32 proof line). The other threads
+    // may already be reading natively when it aborts, but the process dies before any result is used.
+    if (params->ith == 0) {
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            const struct ggml_tensor * src = tensor->src[i];
+            if (src && ggml_backend_tensor_weight_layout(src) != GGML_WEIGHT_LAYOUT_NATIVE) {
+                const struct ggml_tensor * root = src;
+                while (root->view_src) {
+                    root = root->view_src;
+                }
+                GGML_ABORT("ggml-cpu: %s cannot read %s (%s) as native bytes", ggml_op_desc(tensor), src->name,
+                        ggml_backend_buft_name(root->buffer->buft));
+            }
+        }
+    }
+
     switch (tensor->op) {
         case GGML_OP_DUP:
             {

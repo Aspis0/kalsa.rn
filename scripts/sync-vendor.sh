@@ -62,6 +62,9 @@ LLAMA_CPP_PATHS=(
   ggml/src/ggml-opt.cpp
   ggml/src/ggml-quants.c
   ggml/src/ggml-quants.h
+  # kalsa addition (kalsallama one-copy): the Q4_0 TILE32 tile geometry,
+  # included by ggml-hexagon.cpp and the CPU tile reader below.
+  ggml/src/ggml-q4_0-tile32.h
   ggml/src/ggml-threading.cpp
   ggml/src/ggml-threading.h
   ggml/src/ggml-version.h.in
@@ -83,6 +86,11 @@ LLAMA_CPP_PATHS=(
   # Upstream replaced the iqp panel-gemm files with the tiled kernels
   # (ggml-cpu.c includes "tiled/tiled.h").
   ggml/src/ggml-cpu/tiled
+  # kalsa addition (kalsallama one-copy): the CPU MUL_MAT reader for TILE32
+  # weights (ggml-cpu.cpp/traits.cpp route it; the gemv TU under arch/arm
+  # ships with the arch/arm pathspec below).
+  ggml/src/ggml-cpu/tile32.cpp
+  ggml/src/ggml-cpu/tile32.h
   ggml/src/ggml-cpu/ops.cpp
   ggml/src/ggml-cpu/ops.h
   ggml/src/ggml-cpu/quants.c

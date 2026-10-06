@@ -35,6 +35,8 @@
 #else
 #    include <semaphore.h>
 #    include <unistd.h>
+#    include <sys/ioctl.h>
+#    include <linux/dma-buf.h>
 #endif
 
 #pragma clang diagnostic ignored "-Wnested-anon-types"
@@ -51,7 +53,9 @@
 #include "ggml-common.h"
 #include "ggml-hexagon.h"
 #include "ggml-impl.h"
+#include "ggml-q4_0-tile32.h"
 #include "ggml-quants.h"
+#include "htp-admit.h"
 #include "htp-opnode.h"
 #include "htp-ops.h"
 #include "htp/matmul-ops.h"
@@ -98,6 +102,19 @@ static int    opt_etm     = 0;
 static int    opt_verbose = 0;
 static int    opt_profile = 0; // profiling mode (0-disabled, 1-basic, 2-pmu)
 static bool   opt_hostbuf = false;
+static bool   opt_hostbuf_uncached = false;
+static bool   opt_hostbuf_flush = false;
+static bool   opt_hostbuf_repack = false;
+// Live TILE32 + HOST buffers of this process: incremented once a successful alloc_buffer of either
+// buffer type returned, decremented when their free_buffer runs. The placement probe allocates
+// 0-byte buffers and ggml_backend_buft_alloc_buffer returns dummies for those without reaching the
+// backend, so probes never move the count. Nonzero means a shared load holds shared buffers:
+// set_shared_weights refuses to flip the mode then, and once the last buffer is freed - after a
+// refused or freed shared load - the count is back to 0 and the process can fall back to two-copy.
+static std::atomic<int> shared_bufs_live = 0;
+static int64_t opt_op_offload_min_batch = 32;
+static uint32_t opt_admit_ops  = GGML_HEXAGON_ADMIT_MUL_MAT; // GGML_HEXAGON_ADMIT_OPS: op kinds a host weight may offload
+static int64_t  opt_admit_gate = 0;                 // GGML_HEXAGON_ADMIT_GATE: min tokens for CPU-runnable ops, 0 = off
 static bool   opt_dma64   = false;
 
 static int    opt_mm_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
@@ -564,10 +581,26 @@ struct ggml_backend_hexagon_device_context {
     int                        dev_id;
     ggml_hexagon_device_config config;
     ggml_backend_dev_t         dev = nullptr;
+    // The admission, packed into one word, and how often it changed. supports_op/offload_op read it from
+    // any context's scheduler: the atomic keeps those reads consistent while a lane change rewrites it,
+    // and the generation lets every context notice that someone else moved it. The reads stay per call and
+    // relaxed: the scheduler offers no split-scoped hook to read it once per split, and the setter is
+    // documented to never run concurrently with a split (see ggml_backend_hexagon_set_admission_t).
+    std::atomic<uint64_t>      admission_packed;
+    std::atomic<uint64_t>      admission_gen = 0;
 
     ggml_backend_buffer_type buffer_type       = {};
+    // HOST is the device's host buffer type: llama hands it to the CPU for the compute and
+    // output buffers (llama-context.cpp "use the host buffer of the first device"). HOST-W is
+    // the second, distinct object of the same rpcmem kind, offered for weights only, so a
+    // backend (OpenCL, Amendment I) can claim the weights buft without claiming the CPU's.
     ggml_backend_buffer_type host_buffer_type  = {};
+    ggml_backend_buffer_type host_w_buffer_type = {};
+    ggml_backend_buffer_type tile32_buffer_type = {};
     ggml_backend_buffer_type fence_buffer_type = {};
+    // NULL-terminated list served by the ggml_backend_dev_get_extra_bufts proc address:
+    // {TILE32, HOST-W, NULL} in shared-weights mode
+    ggml_backend_buffer_type_t extra_bufts[3]  = {};
 
     std::unique_ptr<ggml_hexagon_session> sess;
 
@@ -598,11 +631,14 @@ struct ggml_hexagon_rpcmem_block {
     uint8_t * base = nullptr;
     int       fd   = -1;
     size_t    size = 0;
+    // The allocation's cache policy, from the rpcmem flags: RPCMEM_FLAG_UNCACHED is 0, so the
+    // RPCMEM_DEFAULT_FLAGS bit is the cached test. An importer has to match this policy.
+    bool      uncached = false;
 
     std::unordered_set<ggml_hexagon_session *> mapped_clones;
 
-    ggml_hexagon_rpcmem_block(size_t size) {
-        base = (uint8_t *) rpcmem_alloc2(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, size);
+    ggml_hexagon_rpcmem_block(size_t size, uint32_t flags = RPCMEM_DEFAULT_FLAGS) {
+        base = (uint8_t *) rpcmem_alloc2(RPCMEM_HEAP_ID_SYSTEM, flags, size);
         if (!base) {
             throw std::runtime_error("ggml-hex: rpcmem_alloc failed");
         }
@@ -611,7 +647,8 @@ struct ggml_hexagon_rpcmem_block {
             rpcmem_free(base);
             throw std::runtime_error("ggml-hex: rpcmem_to_fd failed");
         }
-        this->size = size;
+        this->size     = size;
+        this->uncached = (flags & RPCMEM_DEFAULT_FLAGS) == 0;
     }
 
     ~ggml_hexagon_rpcmem_block() {
@@ -633,6 +670,7 @@ struct ggml_hexagon_shared_buffer {
     uint8_t *    base()   const { return mem ? mem->base : nullptr; }
     size_t       size()   const { return mem ? mem->size : 0;  }
     int          fd()     const { return mem ? mem->fd   : -1; }
+    bool         uncached() const { return mem && mem->uncached; }
 
     void mmap(bool extended = false) {
         if (!this->mem)   return;
@@ -674,10 +712,10 @@ struct ggml_hexagon_shared_buffer {
         this->mapped = false;
     }
 
-    void alloc(size_t size) {
+    void alloc(size_t size, uint32_t flags = RPCMEM_DEFAULT_FLAGS) {
         if (this->mem) return;
 
-        this->mem = std::make_shared<ggml_hexagon_rpcmem_block>(size);
+        this->mem = std::make_shared<ggml_hexagon_rpcmem_block>(size, flags);
 
         HEX_VERBOSE("ggml-hex: %s allocated buffer: base %p size %zu fd %d pinned %d\n", sess->c_name(),
                     (void *) base(), this->size(), fd(), (int) pinned);
@@ -694,7 +732,8 @@ struct ggml_hexagon_shared_buffer {
         this->mem  = nullptr;
     }
 
-    ggml_hexagon_shared_buffer(ggml_hexagon_session * sess, size_t size, bool pinned = false) {
+    ggml_hexagon_shared_buffer(ggml_hexagon_session * sess, size_t size, bool pinned = false,
+                               uint32_t rpcmem_flags = RPCMEM_DEFAULT_FLAGS) {
         this->sess     = sess;
         this->mapped   = false;
         this->pinned   = pinned;
@@ -708,7 +747,7 @@ struct ggml_hexagon_shared_buffer {
             total_size = (total_size + extended_align - 1) & ~(extended_align - 1);
         }
 
-        alloc(total_size);
+        alloc(total_size, rpcmem_flags);
     }
 
     // Clone constructor for cross-session mapping
@@ -786,6 +825,11 @@ static void ggml_backend_hexagon_buffer_free_buffer(ggml_backend_buffer_t buffer
     auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(buffer->context);
     sbuf->sess->unclone_buffer(sbuf);
     delete sbuf;
+    // the device buft shares this free_buffer; of the four bufts only the two host ones (is_host:
+    // HOST and HOST-W) and TILE32 (get_weight_layout) are counted as shared (see shared_bufs_live)
+    if (buffer->buft->iface.is_host(buffer->buft) || buffer->buft->iface.get_weight_layout != NULL) {
+        shared_bufs_live.fetch_sub(1, std::memory_order_release);
+    }
 }
 
 static void * ggml_backend_hexagon_buffer_get_base(ggml_backend_buffer_t buffer) {
@@ -815,27 +859,6 @@ static enum ggml_status ggml_backend_hexagon_buffer_init_tensor(ggml_backend_buf
 }
 
 // ** Repack helpers for tiled quantized weights
-
-static void unpack_q4_0_quants(uint8_t * qs, const block_q4_0 * x, unsigned int bi) {
-    static const int qk = QK4_0;
-
-    for (unsigned int i = 0; i < qk / 2; ++i) {
-        const int x0             = (x->qs[i] & 0x0F);
-        const int x1             = (x->qs[i] >> 4);
-        qs[bi * qk + i + 0]      = x0;
-        qs[bi * qk + i + qk / 2] = x1;
-    }
-}
-
-static void pack_q4_0_quants(block_q4_0 * x, const uint8_t * qs, unsigned int bi) {
-    static const int qk = QK4_0;
-
-    for (unsigned int i = 0; i < qk / 2; ++i) {
-        const uint8_t x0 = qs[bi * qk + i + 0];
-        const uint8_t x1 = qs[bi * qk + i + qk / 2];
-        x->qs[i]         = x0 | (x1 << 4);
-    }
-}
 
 static void unpack_q4_1_quants(uint8_t * qs, const block_q4_1 * x, unsigned int bi) {
     static const int qk = QK4_1;
@@ -876,134 +899,6 @@ static void pack_mxfp4_quants(block_mxfp4 * x, const uint8_t * qs, unsigned int 
         const uint8_t x0 = qs[bi * qk + i + 0];
         const uint8_t x1 = qs[bi * qk + i + qk / 2];
         x->qs[i]         = x0 | (x1 << 4);
-    }
-}
-
-// repack q4_0 data into q4_0_tiled tensor
-static void repack_q4_0_tiled(ggml_tensor * t, const void * data, size_t offset, size_t size) {
-    const block_q4_0 * src_matrix = (const block_q4_0 *) data;
-    int64_t ne0 = t->ne[0];
-    int64_t ne1 = t->ne[1];
-    int64_t ne2 = t->ne[2];
-    int64_t ne3 = t->ne[3];
-    int64_t ne0_padded = hex_round_up(ne0, 32);
-    int64_t ne1_padded = hex_round_up(ne1, 32);
-
-    int n_col_tiles = ne1_padded / 32;
-    int n_k_tiles = ne0_padded / 32;
-    const size_t tile_size = HTP_MM_WEIGHT_TILE_SIZE_Q4_0;
-    const size_t matrix_size = n_col_tiles * n_k_tiles * tile_size;
-
-    size_t slice_size = ne1 * ggml_row_size(t->type, ne0);
-    int64_t start_slice = offset / slice_size;
-    int64_t end_slice = (offset + size + slice_size - 1) / slice_size;
-    if (end_slice > ne2 * ne3) {
-        end_slice = ne2 * ne3;
-    }
-
-    for (int64_t slice_idx = start_slice; slice_idx < end_slice; slice_idx++) {
-        const block_q4_0 * src_slice = src_matrix + (slice_idx - start_slice) * (ne1 * (ne0 / 32));
-        uint8_t * matrix_dst = (uint8_t *) t->data + slice_idx * matrix_size;
-
-        for (int ct = 0; ct < n_col_tiles; ct++) {
-            for (int kt = 0; kt < n_k_tiles; kt++) {
-                uint8_t * tile_dst = matrix_dst + (ct * n_k_tiles + kt) * tile_size;
-
-                uint8_t tile_quants[32][32];
-                for (int row = 0; row < 32; row++) {
-                    int64_t r = ct * 32 + row;
-                    if (r < ne1 && kt < ne0 / 32) {
-                        unpack_q4_0_quants(tile_quants[row], &src_slice[r * (ne0 / 32) + kt], 0);
-                    } else {
-                        memset(tile_quants[row], 8, 32);
-                    }
-                }
-
-                for (int cp = 0; cp < 16; cp++) {
-                    for (int row = 0; row < 32; row++) {
-                        tile_dst[cp * 32 + row] = (tile_quants[row][2 * cp + 1] << 4) | tile_quants[row][2 * cp];
-                    }
-                }
-
-                ggml_half * scale_dst = (ggml_half *)(tile_dst + 512);
-                for (int row = 0; row < 32; row++) {
-                    int64_t r = ct * 32 + row;
-                    scale_dst[row] = (r < ne1 && kt < ne0 / 32) ? src_slice[r * (ne0 / 32) + kt].d : 0;
-                }
-            }
-        }
-    }
-}
-
-// repack q4_0_tiled tensor into q4_0 data
-static void repack_tiled_q4_0(void * data, const ggml_tensor * t, size_t offset, size_t size) {
-    block_q4_0 * dst_matrix = (block_q4_0 *) data;
-    int64_t ne0 = t->ne[0];
-    int64_t ne1 = t->ne[1];
-    int64_t ne2 = t->ne[2];
-    int64_t ne3 = t->ne[3];
-    int64_t ne0_padded = hex_round_up(ne0, 32);
-    int64_t ne1_padded = hex_round_up(ne1, 32);
-
-    int n_col_tiles = ne1_padded / 32;
-    int n_k_tiles = ne0_padded / 32;
-    const size_t tile_size = HTP_MM_WEIGHT_TILE_SIZE_Q4_0;
-    const size_t matrix_size = n_col_tiles * n_k_tiles * tile_size;
-
-    size_t slice_size = ne1 * ggml_row_size(t->type, ne0);
-    size_t row_size_bytes = ggml_row_size(t->type, ne0);
-    int64_t start_slice = offset / slice_size;
-    int64_t end_slice = (offset + size + slice_size - 1) / slice_size;
-    if (end_slice > ne2 * ne3) {
-        end_slice = ne2 * ne3;
-    }
-
-    for (int64_t slice_idx = start_slice; slice_idx < end_slice; slice_idx++) {
-        size_t cur_start_byte = (std::max)(offset, (size_t) slice_idx * slice_size);
-        size_t cur_end_byte   = (std::min)(offset + size, (size_t) (slice_idx + 1) * slice_size);
-        size_t slice_offset_start = cur_start_byte - (size_t) slice_idx * slice_size;
-        size_t slice_offset_end   = cur_end_byte - (size_t) slice_idx * slice_size;
-
-        int64_t start_row = slice_offset_start / row_size_bytes;
-        int64_t end_row   = (slice_offset_end + row_size_bytes - 1) / row_size_bytes;
-        end_row = (std::min)(end_row, ne1);
-
-        int start_ct = start_row / 32;
-        int end_ct   = (end_row + 31) / 32;
-        end_ct = (std::min)(end_ct, n_col_tiles);
-
-        block_q4_0 * dst_slice = dst_matrix + (cur_start_byte - offset) / sizeof(block_q4_0);
-        const uint8_t * matrix_src = (const uint8_t *) t->data + slice_idx * matrix_size;
-
-        for (int ct = start_ct; ct < end_ct; ct++) {
-            for (int kt = 0; kt < n_k_tiles; kt++) {
-                const uint8_t * tile_src = matrix_src + (ct * n_k_tiles + kt) * tile_size;
-
-                uint8_t tile_quants[32][32];
-                for (int cp = 0; cp < 16; cp++) {
-                    for (int row = 0; row < 32; row++) {
-                        uint8_t val = tile_src[cp * 32 + row];
-                        tile_quants[row][2 * cp + 0] = val & 0x0F;
-                        tile_quants[row][2 * cp + 1] = val >> 4;
-                    }
-                }
-
-                for (int row = 0; row < 32; row++) {
-                    int64_t r = ct * 32 + row;
-                    if (r >= start_row && r < end_row && kt < ne0 / 32) {
-                        pack_q4_0_quants(&dst_slice[(r - start_row) * (ne0 / 32) + kt], tile_quants[row], 0);
-                    }
-                }
-
-                const ggml_half * scale_src = (const ggml_half *)(tile_src + 512);
-                for (int row = 0; row < 32; row++) {
-                    int64_t r = ct * 32 + row;
-                    if (r >= start_row && r < end_row && kt < ne0 / 32) {
-                        dst_slice[(r - start_row) * (ne0 / 32) + kt].d = scale_src[row];
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -1960,7 +1855,10 @@ static void repack_tiled_q5_K(void * data, const ggml_tensor * t, size_t offset,
 static void repack_tensor_tiled(ggml_tensor * tensor, const void * data, size_t size) {
     switch (tensor->type) {
         case GGML_TYPE_Q4_0:
-            repack_q4_0_tiled(tensor, data, 0, size);
+        case GGML_TYPE_IQ4_NL:
+            // block_iq4_nl has the same 18-byte { fp16 scale, 16 nibble bytes } row blocks as Q4_0
+            ggml_q4_0_tile32_pack((uint8_t *) tensor->data, (const block_q4_0 *) data, tensor->ne[0], tensor->ne[1],
+                                  tensor->ne[2] * tensor->ne[3], 0, size);
             break;
 
         case GGML_TYPE_Q4_1:
@@ -1973,10 +1871,6 @@ static void repack_tensor_tiled(ggml_tensor * tensor, const void * data, size_t 
 
         case GGML_TYPE_Q8_0:
             repack_q8_0_tiled(tensor, data, 0, size);
-            break;
-
-        case GGML_TYPE_IQ4_NL:
-            repack_q4_0_tiled(tensor, data, 0, size);
             break;
 
         case GGML_TYPE_MXFP4:
@@ -2060,7 +1954,8 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
         case GGML_TYPE_Q4_0:
             GGML_ASSERT(offset == 0);
             GGML_ASSERT(offset + size <= ggml_nbytes(tensor));
-            repack_tiled_q4_0(data, tensor, offset, size);
+            ggml_q4_0_tile32_unpack((block_q4_0 *) data, (const uint8_t *) tensor->data, tensor->ne[0],
+                                    tensor->ne[1], tensor->ne[2] * tensor->ne[3], offset, size);
             break;
 
         case GGML_TYPE_Q4_1:
@@ -2090,7 +1985,8 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
         case GGML_TYPE_IQ4_NL:
             GGML_ASSERT(offset == 0);
             GGML_ASSERT(offset + size <= ggml_nbytes(tensor));
-            repack_tiled_q4_0(data, tensor, offset, size);
+            ggml_q4_0_tile32_unpack((block_q4_0 *) data, (const uint8_t *) tensor->data, tensor->ne[0],
+                                    tensor->ne[1], tensor->ne[2] * tensor->ne[3], offset, size);
             break;
 
         case GGML_TYPE_MXFP4:
@@ -2203,7 +2099,8 @@ static void ggml_backend_hexagon_buffer_get_tensor_2d(ggml_backend_buffer_t buff
 
     switch (tensor->type) {
         case GGML_TYPE_Q4_0:
-            repack_tiled_q4_0(temp_buf.data(), tensor, offset, temp_size);
+            ggml_q4_0_tile32_unpack((block_q4_0 *) temp_buf.data(), (const uint8_t *) tensor->data, tensor->ne[0],
+                                    tensor->ne[1], tensor->ne[2] * tensor->ne[3], offset, temp_size);
             break;
 
         case GGML_TYPE_Q4_1:
@@ -2223,7 +2120,8 @@ static void ggml_backend_hexagon_buffer_get_tensor_2d(ggml_backend_buffer_t buff
             break;
 
         case GGML_TYPE_IQ4_NL:
-            repack_tiled_q4_0(temp_buf.data(), tensor, offset, temp_size);
+            ggml_q4_0_tile32_unpack((block_q4_0 *) temp_buf.data(), (const uint8_t *) tensor->data, tensor->ne[0],
+                                    tensor->ne[1], tensor->ne[2] * tensor->ne[3], offset, temp_size);
             break;
 
         case GGML_TYPE_MXFP4:
@@ -2282,8 +2180,24 @@ static void ggml_backend_hexagon_host_buffer_set_tensor(ggml_backend_buffer_t bu
                                                         const void *          data,
                                                         size_t                offset,
                                                         size_t                size) {
+    auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(buffer->context);
+    if (opt_hostbuf_flush) {
+        struct dma_buf_sync sync = {};
+        sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE;
+        if (ioctl(sbuf->fd(), DMA_BUF_IOCTL_SYNC, &sync) != 0) {
+            GGML_ABORT("ggml-hex: HOST dma-buf START sync failed: %s\n", strerror(errno));
+        }
+    }
+    // the HOST buft keeps native layout: tiled Q4_0 weights live in the TILE32 buft, everything
+    // else here (f32 norms, conv, Q6_K token_embd) the CPU reads in place
     memcpy((char *) tensor->data + offset, data, size);
-    GGML_UNUSED(buffer);
+    if (opt_hostbuf_flush) {
+        struct dma_buf_sync sync = {};
+        sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE;
+        if (ioctl(sbuf->fd(), DMA_BUF_IOCTL_SYNC, &sync) != 0) {
+            GGML_ABORT("ggml-hex: HOST dma-buf END sync failed: %s\n", strerror(errno));
+        }
+    }
 }
 
 static void ggml_backend_hexagon_host_buffer_get_tensor(ggml_backend_buffer_t buffer,
@@ -2305,6 +2219,70 @@ static ggml_backend_buffer_i ggml_backend_hexagon_host_buffer_interface = {
     /* .set_tensor_2d   = */ NULL,
     /* .get_tensor_2d   = */ NULL,
     /* .cpy_tensor      = */ ggml_backend_hexagon_buffer_cpy_tensor,
+    /* .clear           = */ ggml_backend_hexagon_buffer_clear,
+    /* .reset           = */ NULL,
+};
+
+// ** TILE32 buffer: every tensor in it holds HTP 32x32 tiles by construction
+// (GGML_WEIGHT_LAYOUT_Q4_0_TILE32). set_tensor packs, get_tensor unpacks, so every reader of
+// native ggml bytes stays correct.
+
+static void ggml_backend_hexagon_tile32_buffer_set_tensor(ggml_backend_buffer_t buffer,
+                                                          ggml_tensor *         tensor,
+                                                          const void *          data,
+                                                          size_t                offset,
+                                                          size_t                size) {
+    if (tensor->type != GGML_TYPE_Q4_0 || tensor->ne[0] % QK4_0 != 0) {
+        GGML_ABORT("ggml-hex: %s: tensor %s (%s, ne0 %d) does not fit the TILE32 buffer\n",
+                   ggml_backend_buft_name(buffer->buft), tensor->name, ggml_type_name(tensor->type),
+                   (int) tensor->ne[0]);
+    }
+    // the packer indexes src by slice range: a write that splits a slice has no defined meaning
+    const size_t slice_size = (size_t) tensor->ne[1] * ggml_row_size(tensor->type, tensor->ne[0]);
+    const bool   whole_tensor = offset == 0 && size == ggml_nbytes(tensor);
+    const bool   whole_slices = offset % slice_size == 0 && size % slice_size == 0 &&
+                                offset + size <= ggml_nbytes(tensor);
+    if (!whole_tensor && !whole_slices) {
+        GGML_ABORT("ggml-hex: %s: partial write (%zu bytes at %zu of %zu) to tensor %s\n",
+                   ggml_backend_buft_name(buffer->buft), size, offset, ggml_nbytes(tensor), tensor->name);
+    }
+    auto extra = static_cast<ggml_hexagon_tensor_extra *>(tensor->extra);
+    extra->flags |= GGML_HEXAGON_TENSOR_WEIGHT;
+    extra->flags |= GGML_HEXAGON_TENSOR_REPACK;
+    ggml_q4_0_tile32_pack((uint8_t *) tensor->data, (const block_q4_0 *) data, tensor->ne[0], tensor->ne[1],
+                          tensor->ne[2] * tensor->ne[3], offset, size);
+}
+
+static void ggml_backend_hexagon_tile32_buffer_get_tensor(ggml_backend_buffer_t buffer,
+                                                          const ggml_tensor *   tensor,
+                                                          void *                data,
+                                                          size_t                offset,
+                                                          size_t                size) {
+    // mirror of set_tensor: the unpacker indexes the tile side by slice range, so a read that
+    // splits a slice has no defined meaning
+    const size_t slice_size   = (size_t) tensor->ne[1] * ggml_row_size(tensor->type, tensor->ne[0]);
+    const bool   whole_tensor = offset == 0 && size == ggml_nbytes(tensor);
+    const bool   whole_slices = offset % slice_size == 0 && size % slice_size == 0 &&
+                                offset + size <= ggml_nbytes(tensor);
+    if (!whole_tensor && !whole_slices) {
+        GGML_ABORT("ggml-hex: %s: partial read (%zu bytes at %zu of %zu) from tensor %s\n",
+                   ggml_backend_buft_name(buffer->buft), size, offset, ggml_nbytes(tensor), tensor->name);
+    }
+    ggml_q4_0_tile32_unpack((block_q4_0 *) data, (const uint8_t *) tensor->data, tensor->ne[0], tensor->ne[1],
+                            tensor->ne[2] * tensor->ne[3], offset, size);
+    GGML_UNUSED(buffer);
+}
+
+static ggml_backend_buffer_i ggml_backend_hexagon_tile32_buffer_interface = {
+    /* .free_buffer     = */ ggml_backend_hexagon_buffer_free_buffer,
+    /* .get_base        = */ ggml_backend_hexagon_buffer_get_base,
+    /* .init_tensor     = */ ggml_backend_hexagon_buffer_init_tensor,
+    /* .memset_tensor   = */ NULL,
+    /* .set_tensor      = */ ggml_backend_hexagon_tile32_buffer_set_tensor,
+    /* .get_tensor      = */ ggml_backend_hexagon_tile32_buffer_get_tensor,
+    /* .set_tensor_2d   = */ NULL,
+    /* .get_tensor_2d   = */ NULL,
+    /* .cpy_tensor      = */ NULL,
     /* .clear           = */ ggml_backend_hexagon_buffer_clear,
     /* .reset           = */ NULL,
 };
@@ -2343,8 +2321,14 @@ static ggml_backend_buffer_t ggml_backend_hexagon_host_buffer_type_alloc_buffer(
         return nullptr;
     }
     try {
-        ggml_hexagon_shared_buffer * sbuf = new ggml_hexagon_shared_buffer(sess, size, false);
-        return ggml_backend_buffer_init(buffer_type, ggml_backend_hexagon_host_buffer_interface, sbuf, size);
+        const uint32_t flags = opt_hostbuf_uncached ? RPCMEM_FLAG_UNCACHED : RPCMEM_DEFAULT_FLAGS;
+        HEX_VERBOSE("ggml-hex: HOST RPCMEM allocation flags=%u uncached=%u\n", flags, opt_hostbuf_uncached);
+        // held until buffer_init succeeds: its throw must not leak the session buffer
+        std::unique_ptr<ggml_hexagon_shared_buffer> sbuf(new ggml_hexagon_shared_buffer(sess, size, false, flags));
+        ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buffer_type, ggml_backend_hexagon_host_buffer_interface, sbuf.get(), size);
+        sbuf.release();
+        shared_bufs_live.fetch_add(1, std::memory_order_relaxed);
+        return buffer;
     } catch (const std::exception & exc) {
         GGML_LOG_ERROR("ggml-hex: %s failed to allocate host buffer context: %s\n", dev_ctx->c_name(), exc.what());
         return nullptr;
@@ -2402,8 +2386,54 @@ static ggml_backend_buffer_type_i ggml_backend_hexagon_host_buffer_type_interfac
     /* .is_host          = */ ggml_backend_hexagon_host_buffer_type_is_host,
 };
 
+// shares get_alignment with the other hexagon bufts so ggml_backend_buffer_is_hexagon holds
+static ggml_backend_buffer_t ggml_backend_hexagon_tile32_buffer_type_alloc_buffer(
+            ggml_backend_buffer_type_t buffer_type, size_t size) {
+    auto dev_ctx = static_cast<ggml_backend_hexagon_buffer_type_context *>(buffer_type->context)->dev_ctx;
+    auto sess    = dev_ctx->session();
+    try {
+        const uint32_t flags = opt_hostbuf_uncached ? RPCMEM_FLAG_UNCACHED : RPCMEM_DEFAULT_FLAGS;
+        // held until buffer_init succeeds: its throw must not leak the session buffer
+        std::unique_ptr<ggml_hexagon_shared_buffer> sbuf(new ggml_hexagon_shared_buffer(sess, size, false, flags));
+        ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buffer_type, ggml_backend_hexagon_tile32_buffer_interface, sbuf.get(), size);
+        sbuf.release();
+        shared_bufs_live.fetch_add(1, std::memory_order_relaxed);
+        return buffer;
+    } catch (const std::exception & exc) {
+        GGML_LOG_ERROR("ggml-hex: %s failed to allocate TILE32 buffer context: %s\n", dev_ctx->c_name(), exc.what());
+        return nullptr;
+    }
+}
+
+static size_t ggml_backend_hexagon_tile32_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * t) {
+    GGML_UNUSED(buft);
+    if (t->type == GGML_TYPE_Q4_0) {
+        return ggml_q4_0_tile32_nbytes(t->ne[0], t->ne[1]) * t->ne[2] * t->ne[3];
+    }
+    return ggml_nbytes(t);
+}
+
+static enum ggml_backend_weight_layout ggml_backend_hexagon_tile32_buffer_type_get_weight_layout(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return GGML_WEIGHT_LAYOUT_Q4_0_TILE32;
+}
+
+static ggml_backend_buffer_type_i ggml_backend_hexagon_tile32_buffer_type_interface = {
+    /* .get_name          = */ ggml_backend_hexagon_buffer_type_name,
+    /* .alloc_buffer      = */ ggml_backend_hexagon_tile32_buffer_type_alloc_buffer,
+    /* .get_alignment     = */ ggml_backend_hexagon_buffer_type_get_alignment,
+    /* .get_max_size      = */ ggml_backend_hexagon_buffer_type_get_max_size,
+    /* .get_alloc_size    = */ ggml_backend_hexagon_tile32_buffer_type_get_alloc_size,
+    /* .is_host           = */ ggml_backend_hexagon_buffer_type_is_host,
+    /* .get_weight_layout = */ ggml_backend_hexagon_tile32_buffer_type_get_weight_layout,
+};
+
 ggml_backend_hexagon_device_context::ggml_backend_hexagon_device_context(int dev_id, const ggml_hexagon_device_config & config, ggml_backend_dev_t dev)
-    : dev_id(dev_id), config(config), dev(dev) {
+    // The admission is a snapshot of the env-seeded statics: correct only because ggml_hexagon_init parses
+    // the env before it creates the registry that creates the devices (see the `new ggml_hexagon_registry`
+    // at the end of that function). Do not construct a device context earlier.
+    : dev_id(dev_id), config(config), dev(dev),
+      admission_packed(htp_admit_pack({ opt_op_offload_min_batch, opt_admit_ops, opt_admit_gate })) {
     buffer_type.device  = dev;
     buffer_type.iface   = ggml_backend_hexagon_buffer_type_interface;
     buffer_type.context = new ggml_backend_hexagon_buffer_type_context(config.name, this);
@@ -2411,6 +2441,17 @@ ggml_backend_hexagon_device_context::ggml_backend_hexagon_device_context(int dev
     host_buffer_type.device  = dev;
     host_buffer_type.iface   = ggml_backend_hexagon_host_buffer_type_interface;
     host_buffer_type.context = new ggml_backend_hexagon_buffer_type_context(config.name + "-HOST", this);
+
+    // Amendment I: same allocation, same policy, same dma-buf accessor as HOST (they share the
+    // host buffer interface); only the object identity and the name differ, and the identity is
+    // what keeps a byte-for-byte rpcmem buffer from being claimable for CPU activations.
+    host_w_buffer_type.device  = dev;
+    host_w_buffer_type.iface   = ggml_backend_hexagon_host_buffer_type_interface;
+    host_w_buffer_type.context = new ggml_backend_hexagon_buffer_type_context(config.name + "-HOST-W", this);
+
+    tile32_buffer_type.device  = dev;
+    tile32_buffer_type.iface   = ggml_backend_hexagon_tile32_buffer_type_interface;
+    tile32_buffer_type.context = new ggml_backend_hexagon_buffer_type_context(config.name + "-TILE32", this);
 
     fence_buffer_type.device  = dev;
     fence_buffer_type.iface   = ggml_backend_hexagon_buffer_type_interface;
@@ -2420,11 +2461,44 @@ ggml_backend_hexagon_device_context::ggml_backend_hexagon_device_context(int dev
 ggml_backend_hexagon_device_context::~ggml_backend_hexagon_device_context() {
     delete static_cast<ggml_backend_hexagon_buffer_type_context *>(buffer_type.context);
     delete static_cast<ggml_backend_hexagon_buffer_type_context *>(host_buffer_type.context);
+    delete static_cast<ggml_backend_hexagon_buffer_type_context *>(host_w_buffer_type.context);
+    delete static_cast<ggml_backend_hexagon_buffer_type_context *>(tile32_buffer_type.context);
     delete static_cast<ggml_backend_hexagon_buffer_type_context *>(fence_buffer_type.context);
 }
 
 static bool ggml_backend_buffer_is_hexagon(const struct ggml_backend_buffer * b) {
     return b->buft->iface.get_alignment == ggml_backend_hexagon_buffer_type_get_alignment;
+}
+
+// A quantized weight left in raw GGUF layout (e.g. in the -HOST buffer the CPU also reads).
+// The HTP reads it only through the 2-D Q4_0 HVX jobs; everything else needs the tiled repack.
+static bool ggml_hexagon_is_raw_weight(const struct ggml_tensor * t) {
+    const struct ggml_tensor * base = t->view_src ? t->view_src : t;
+    if (!base->buffer || !base->extra || !ggml_backend_buffer_is_hexagon(base->buffer) ||
+        ggml_backend_buffer_get_usage(base->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+        !ggml_hexagon_is_repack_type(base->type)) {
+        return false;
+    }
+    auto extra = (const struct ggml_hexagon_tensor_extra *) base->extra;
+    return (extra->flags & GGML_HEXAGON_TENSOR_REPACK) == 0;
+}
+
+// Only the 2-D Q4_0 matmul reads raw weights (mm_select 1 keeps the HMX path away, and the batched
+// 4-D jobs read tiles); any other op with a raw weight source must stay on the CPU.
+static bool ggml_hexagon_raw_weights_supported(const struct ggml_tensor * op) {
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        const struct ggml_tensor * src = op->src[i];
+        if (!src || !ggml_hexagon_is_raw_weight(src)) {
+            continue;
+        }
+        const struct ggml_tensor * act = op->src[1];
+        if (op->op != GGML_OP_MUL_MAT || i != 0 || src->type != GGML_TYPE_Q4_0 || src->ne[0] % QK4_0 ||
+            src->ne[2] * src->ne[3] > 1 || !act || act->ne[2] * act->ne[3] > 1 ||
+            opt_mm_select != 1) {
+            return false;
+        }
+    }
+    return true;
 }
 
 struct ggml_hexagon_opbatch {
@@ -6871,6 +6945,7 @@ static bool is_mergeable_mul_mat(const ggml_tensor * t) {
     const ggml_tensor * src1 = t->src[1];
     if (src1->type != GGML_TYPE_F32) return false;
     if (src0->ne[2] != 1 || src0->ne[3] != 1) return false;
+    if (ggml_hexagon_is_raw_weight(src0)) return false; // no fused kernel reads raw weights
 
     if (mm_is_hmx_eligible(t)) {
         return ggml_hexagon_is_hmx_weight_type(src0->type);
@@ -6902,7 +6977,7 @@ static bool is_mergeable_mul_mat_id(const ggml_tensor * t) {
     if (t->op != GGML_OP_MUL_MAT_ID) return false;
 
     const ggml_tensor * src0 = t->src[0];
-    return ggml_hexagon_is_repack_type(src0->type);
+    return ggml_hexagon_is_repack_type(src0->type) && !ggml_hexagon_is_raw_weight(src0);
 }
 
 static bool is_mergeable_mul_mat_id_pair(const ggml_tensor * n1, const ggml_tensor * n2) {
@@ -7795,6 +7870,42 @@ static bool ggml_hexagon_supported_fill(const struct ggml_hexagon_session * sess
     GGML_UNUSED(sess);
 }
 
+// An operand sits in a Hexagon buffer the CPU cannot read: the op has no other place to run.
+// The TILE32 buft is non-host and counts here; the CPU still reads it through its tile32
+// dispatch when this backend declines the op.
+static bool ggml_hexagon_op_htp_only(const struct ggml_tensor * op) {
+    for (int i = -1; i < GGML_MAX_SRC; i++) {
+        const struct ggml_tensor * t = i < 0 ? op : op->src[i];
+        const struct ggml_tensor * base = t;
+        while (base && base->view_src) {
+            base = base->view_src;
+        }
+        if (base && base->buffer && ggml_backend_buffer_is_hexagon(base->buffer) &&
+            !ggml_backend_buffer_is_host(base->buffer)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Whether an operand's bytes live in a TILE32 buffer (views resolve to their root). Those bytes
+// are HTP 32x32 tiles by construction; the only op the HTP runs over them is the 2-D Q4_0
+// MUL_MAT, and the weight placement probe (weight_buft_supported) relies on the same restriction
+// to fall through to the next buffer type (f32 norms, Q6_K token_embd).
+static bool ggml_hexagon_op_reads_tile32(const struct ggml_tensor * op) {
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        const struct ggml_tensor * base = op->src[i];
+        while (base && base->view_src) {
+            base = base->view_src;
+        }
+        if (base && base->buffer &&
+            ggml_backend_buft_weight_layout(base->buffer->buft) == GGML_WEIGHT_LAYOUT_Q4_0_TILE32) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool ggml_hexagon_supported_roll(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
     GGML_UNUSED(sess);
 
@@ -7824,9 +7935,32 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
     auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
     auto sess    = dev_ctx->session();
 
+    // one consistent snapshot per call: the admission may be rewritten by another thread in between
+    const ggml_hexagon_admission admission = htp_admit_unpack(dev_ctx->admission_packed.load(std::memory_order_relaxed));
+
     // reject ops that match the filter
     if (opt_opfilter && std::regex_match(ggml_op_desc(op), *opt_opfilter)) {
         return false;
+    }
+
+    if (!ggml_hexagon_raw_weights_supported(op) ||
+        !htp_admit_gate(admission, op, ggml_hexagon_op_htp_only(op))) {
+        ggml_hexagon_dump_op_supp(sess->name, op, false);
+        return false;
+    }
+
+    // a TILE32 operand carries HTP 32x32 tiles: the only op the HTP runs over those bytes is the
+    // 2-D Q4_0 MUL_MAT, and the weight placement probe (weight_buft_supported) relies on the same
+    // restriction to fall through to the next buffer type (f32 norms, Q6_K token_embd).
+    // A view of a TILE32 tensor is not addressable in tile space: view_offs is a native byte
+    // offset (ggml-backend.cpp:2147), so only the whole weight in its own allocation is readable.
+    if (ggml_hexagon_op_reads_tile32(op)) {
+        const struct ggml_tensor * w = op->src[0];
+        if (!(op->op == GGML_OP_MUL_MAT && w && w->view_src == NULL && ggml_n_dims(w) == 2 &&
+              w->type == GGML_TYPE_Q4_0 && w->ne[0] % QK4_0 == 0)) {
+            ggml_hexagon_dump_op_supp(sess->name, op, false);
+            return false;
+        }
     }
 
     bool supp = false;
@@ -8018,10 +8152,18 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
 static bool ggml_backend_hexagon_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
 
-    bool supp = (buft == &dev_ctx->host_buffer_type) || (buft == &dev_ctx->buffer_type);
+    bool supp = (buft == &dev_ctx->host_buffer_type) || (buft == &dev_ctx->host_w_buffer_type) ||
+                (buft == &dev_ctx->buffer_type) || (buft == &dev_ctx->tile32_buffer_type);
 
     HEX_VERBOSE("ggml-hex: %s device-supports-buft %s %s\n", dev_ctx->c_name(), ggml_backend_buft_name(buft), supp ? "yes" : "no");
     return supp;
+}
+
+static bool ggml_backend_hexagon_device_offload_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
+    const ggml_hexagon_admission admission = htp_admit_unpack(dev_ctx->admission_packed.load(std::memory_order_relaxed));
+    return htp_admit_offload(admission, op, opt_mm_select == 1, htp_admit_src1_is_weight(op)) &&
+        ggml_backend_hexagon_device_supports_op(dev, op);
 }
 
 static const struct ggml_backend_device_i ggml_backend_hexagon_device_i = {
@@ -8036,13 +8178,22 @@ static const struct ggml_backend_device_i ggml_backend_hexagon_device_i = {
     /* .buffer_from_host_ptr = */ NULL,  // ggml_backend_hexagon_device_buffer_from_ptr,
     /* .supports_op          = */ ggml_backend_hexagon_device_supports_op,
     /* .supports_buft        = */ ggml_backend_hexagon_device_supports_buft,
-    /* .offload_op           = */ NULL,  // ggml_backend_hexagon_device_offload_op,
+    /* .offload_op           = */ ggml_backend_hexagon_device_offload_op,
     /* .event_new            = */ ggml_backend_hexagon_device_event_new,
     /* .event_free           = */ ggml_backend_hexagon_device_event_free,
     /* .event_synchronize    = */ ggml_backend_hexagon_device_event_synchronize,
 };
 
 //** backend registry
+
+// Integer env override: applied only when the whole string parses into [min, max], otherwise warned and ignored.
+static void ggml_hexagon_env_int(const char * name, int64_t min, int64_t max, int64_t * out) {
+    const char * str = getenv(name);
+    if (str && !htp_admit_parse_int(str, min, max, out)) {
+        GGML_LOG_WARN("ggml-hex: ignoring invalid %s value '%s' (expected integer in [%lld, %lld]), keeping %lld\n",
+                      name, str, (long long) min, (long long) max, (long long) *out);
+    }
+}
 
 ggml_hexagon_registry::ggml_hexagon_registry(ggml_backend_reg_t reg) {
     GGML_LOG_INFO("ggml-hex: batch response timeout %u ms\n", opt_rsp_timeout_ms);
@@ -8275,8 +8426,118 @@ static ggml_backend_buffer_type_t ggml_backend_hexagon_split_buffer_type(int mai
     return &dev_ctx->buffer_type;
 }
 
+// See ggml_backend_hexagon_set_admission_t: takes effect at the next graph, so the caller re-reserves the sched.
+static int ggml_backend_hexagon_set_admission(ggml_backend_t backend, const struct ggml_hexagon_admission * admission) {
+    auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(ggml_backend_get_device(backend)->context);
+    if (!htp_admit_valid(*admission)) {
+        GGML_LOG_WARN("ggml-hex: %s ignoring invalid admission (offload_min %lld, offload_ops %u, gate_min %lld)\n",
+                      dev_ctx->c_name(), (long long) admission->offload_min, admission->offload_ops, (long long) admission->gate_min);
+        return -1;
+    }
+    if (htp_admit_same(htp_admit_unpack(dev_ctx->admission_packed.load(std::memory_order_relaxed)), *admission)) {
+        return 0;
+    }
+    // the packed store first, so a reader that sees the new generation (release) also sees the new admission
+    dev_ctx->admission_packed.store(htp_admit_pack(*admission), std::memory_order_relaxed);
+    dev_ctx->admission_gen.fetch_add(1, std::memory_order_release);
+    return 1;
+}
+
+static uint64_t ggml_backend_hexagon_get_admission_gen(ggml_backend_t backend) {
+    auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(ggml_backend_get_device(backend)->context);
+    return dev_ctx->admission_gen.load(std::memory_order_acquire);
+}
+
+// Process-level placement state, the setter counterpart of the GGML_HEXAGON_HOSTBUF[_REPACK]/MBUF env
+// seeds. Caller contract: before any model load or context creation. Legal while no TILE32 or HOST
+// buffer is alive (shared_bufs_live == 0): after a refused or freed shared load the count is back to
+// 0, so the process can fall back to a two-copy load or set the mode again. The plain opts and
+// opt_mbuf are not synchronized and a ggml_gallocr created before the call keeps the old cap - no
+// mutex, the caller is expected to serialize this. Only reachable through the proc address, so the
+// registry - and with it every device context - already exists; the cap is the global opt_mbuf that
+// the buffer types read, so no per-device copy is written.
+static int ggml_backend_hexagon_set_shared_weights(const struct ggml_hexagon_shared_weights * shared_weights) {
+    if (!shared_weights) {
+        GGML_LOG_WARN("ggml-hex: set_shared_weights ignored: NULL argument\n");
+        return -1;
+    }
+    int live = shared_bufs_live.load(std::memory_order_acquire);
+    if (live != 0) {
+        GGML_LOG_WARN("ggml-hex: set_shared_weights ignored: %d live TILE32/HOST buffer(s), free the model first\n", live);
+        return -1;
+    }
+    opt_hostbuf_repack = shared_weights->enabled;
+    opt_hostbuf        = shared_weights->enabled;
+    if (shared_weights->max_buffer_bytes > 0) {
+        opt_mbuf = shared_weights->max_buffer_bytes;
+    }
+    return 0;
+}
+
+// Extra weight buffer types of this device, read by the llama weight placement probe. Offered only in
+// shared-weights mode (env seed or set_shared_weights): exposing them otherwise would silently put the
+// Q4_0 matrices in a second weight copy. TILE32 first so Q4_0 matrices stop there, and everything it
+// refuses (f32 norms, conv weights) falls to HOST-W - the device buft must never be offered a weight,
+// and neither must HOST, which llama uses for the CPU's compute and output buffers (Amendment I).
+static ggml_backend_buffer_type_t * ggml_backend_hexagon_dev_get_extra_bufts(ggml_backend_dev_t device) {
+    static ggml_backend_buffer_type_t none[1] = { NULL };
+    if (!opt_hostbuf_repack) {
+        return none;
+    }
+    auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(device->context);
+    dev_ctx->extra_bufts[0] = &dev_ctx->tile32_buffer_type;
+    size_t n = 1;
+    if (opt_hostbuf) {
+        dev_ctx->extra_bufts[n++] = &dev_ctx->host_w_buffer_type;
+    }
+    dev_ctx->extra_bufts[n] = NULL;
+    return dev_ctx->extra_bufts;
+}
+
+// Generic dma-buf accessor for the one-copy GPU leg (Amendment E1): the OpenCL backend
+// resolves this proc address from our registry and imports the rpcmem block with
+// cl_qcom_dmabuf_host_ptr. Amendment G (step 4b): the HOST buffers hand out their block
+// too, so the f32 norm/conv weights and Q6_K token_embd are read in place by the same
+// import route. Amendment I: HOST-W shares the host buffer interface, so the identity test
+// below (the interface's is_host) covers both; the two bufts hand out the same block fields
+// and differ only in object identity. The fd stays owned by the block - the importer holds a
+// dma-buf reference until it releases it. G5: *uncached reports the allocation's
+// RPCMEM_FLAG_UNCACHED policy - the importer cannot use an io-coherent or write-back mapping
+// of uncached memory.
+static bool ggml_backend_hexagon_buffer_dmabuf(ggml_backend_buffer_t buffer, int * fd, void ** base, size_t * size, bool * uncached) {
+    const bool tile32 = buffer->buft->iface.get_weight_layout == ggml_backend_hexagon_tile32_buffer_type_get_weight_layout;
+    const bool host   = buffer->buft->iface.is_host == ggml_backend_hexagon_host_buffer_type_is_host;
+    if (!tile32 && !host) {
+        return false;
+    }
+    auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(buffer->context);
+    if (!sbuf || sbuf->fd() < 0 || !sbuf->base() || sbuf->size() == 0) {
+        return false;
+    }
+    *fd       = sbuf->fd();
+    *base     = sbuf->base();
+    *size     = sbuf->size();
+    *uncached = sbuf->uncached();
+    return true;
+}
+
 static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_buffer_dmabuf") == 0) {
+        return (void *) ggml_backend_hexagon_buffer_dmabuf;
+    }
+    if (strcmp(name, "ggml_backend_hexagon_set_shared_weights") == 0) {
+        return (void *) ggml_backend_hexagon_set_shared_weights;
+    }
+    if (strcmp(name, "ggml_backend_hexagon_set_admission") == 0) {
+        return (void *) ggml_backend_hexagon_set_admission;
+    }
+    if (strcmp(name, "ggml_backend_hexagon_get_admission_gen") == 0) {
+        return (void *) ggml_backend_hexagon_get_admission_gen;
+    }
+    if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
+        return (void *) ggml_backend_hexagon_dev_get_extra_bufts;
+    }
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
         return (void *) ggml_backend_hexagon_split_buffer_type;
     }
@@ -8415,6 +8676,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
                   "please update hexagon_type to match ggml_type");
     static_assert((unsigned int) HTP_TYPE_Q6_K == (unsigned int) GGML_TYPE_Q6_K,
                   "please update hexagon_type to match ggml_type");
+    static_assert(GGML_Q4_0_TILE32_SIZE == HTP_MM_WEIGHT_TILE_SIZE_Q4_0,
+                  "please update HTP_MM_WEIGHT_TILE_SIZE_Q4_0 to match GGML_Q4_0_TILE32_SIZE");
 
     const char * str_verbose  = getenv("GGML_HEXAGON_VERBOSE");
     const char * str_opbatch  = getenv("GGML_HEXAGON_OPBATCH");
@@ -8437,6 +8700,9 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_optrace  = getenv("GGML_HEXAGON_OPTRACE");
     const char * str_rsp_timeout = getenv("GGML_HEXAGON_RSP_TIMEOUT_MS");
     const char * str_hostbuf  = getenv("GGML_HEXAGON_HOSTBUF");
+    const char * str_hostbuf_uncached = getenv("GGML_HEXAGON_HOSTBUF_UNCACHED");
+    const char * str_hostbuf_flush = getenv("GGML_HEXAGON_HOSTBUF_FLUSH");
+    const char * str_hostbuf_repack = getenv("GGML_HEXAGON_HOSTBUF_REPACK");
     const char * str_dma64    = getenv("GGML_HEXAGON_DMA64");
 
     // Archs this build ships an HTP skel for; keep in sync with the
@@ -8490,6 +8756,14 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_mbuf      = str_mbuf     ? strtoul(str_mbuf, NULL, 0) * MiB       : opt_mbuf;
     opt_vmem      = str_vmem     ? strtoul(str_vmem, NULL, 0) * MiB       : opt_vmem;
     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf) != 0                 : opt_hostbuf;
+    opt_hostbuf_uncached = str_hostbuf_uncached ? atoi(str_hostbuf_uncached) != 0 : false;
+    opt_hostbuf_flush = str_hostbuf_flush ? atoi(str_hostbuf_flush) != 0 : false;
+    opt_hostbuf_repack = str_hostbuf_repack ? atoi(str_hostbuf_repack) != 0 : false;
+    ggml_hexagon_env_int("GGML_OP_OFFLOAD_MIN_BATCH", 1, INT64_MAX, &opt_op_offload_min_batch);
+    ggml_hexagon_env_int("GGML_HEXAGON_ADMIT_GATE", 0, INT64_MAX, &opt_admit_gate);
+    int64_t admit_ops = opt_admit_ops;
+    ggml_hexagon_env_int("GGML_HEXAGON_ADMIT_OPS", 0, GGML_HEXAGON_ADMIT_OPS_ALL, &admit_ops);
+    opt_admit_ops = (uint32_t) admit_ops;
 
     if (str_rsp_timeout) {
         bool decimal_only = str_rsp_timeout[0] != '\0';

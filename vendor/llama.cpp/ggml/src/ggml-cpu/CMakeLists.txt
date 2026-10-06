@@ -37,6 +37,10 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/quants.h
         ggml-cpu/traits.cpp
         ggml-cpu/traits.h
+        ggml-cpu/tile32.cpp
+        ggml-cpu/tile32.h
+        ggml-cpu/arch/arm/gemv-tile32-q4_0.cpp
+        ggml-cpu/arch/arm/gemv-tile32-q4_0.h
         ggml-cpu/amx/amx.cpp
         ggml-cpu/amx/amx.h
         ggml-cpu/amx/mmq.cpp

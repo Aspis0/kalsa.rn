@@ -67,6 +67,10 @@ set(RNLLAMA_GGML_SOURCES
 # Per-arch SIMD kernels; callers add ${RNLLAMA_GGML_CPU_ARCH_DIR}/<arm|x86>/{quants.c,repack.cpp}
 # when not building with GGML_CPU_GENERIC.
 set(RNLLAMA_GGML_CPU_ARCH_DIR "${_ggml}/ggml-cpu/arch")
+# The TILE32 weight reader's gemv (kalsa one-copy): tile32.cpp calls it on
+# every arch and its TU always defines the symbol (an abort stub without
+# dotprod), so unlike the per-arch kernels it belongs in every build.
+list(APPEND RNLLAMA_GGML_SOURCES ${RNLLAMA_GGML_CPU_ARCH_DIR}/arm/gemv-tile32-q4_0.cpp)
 
 # Metal kernels are embedded via the ggml-metal-embed-*.s files that
 # scripts/bootstrap.sh generates next to the kernels.

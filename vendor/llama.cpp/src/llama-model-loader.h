@@ -84,6 +84,12 @@ struct llama_model_loader {
     bool no_alloc;
     bool load_mtp;
 
+    // shared-weights mode (one-copy): set by llama_model::load_tensors when any buffer-type list
+    // entry reports GGML_WEIGHT_LAYOUT_Q4_0_TILE32. Gates the TENSOR_DUPLICATED reuse rule and the
+    // post-load buffer audit; two-copy loads never set it and run neither.
+    bool shared_weights = false;
+    bool shared_reuse_logged = false; // the reuse INFO line prints once per load
+
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand
     struct lazy_read {

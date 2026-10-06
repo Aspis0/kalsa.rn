@@ -24,7 +24,11 @@ public:
             uint32_t        n_embd_state,
             uint32_t        n_rs_seq,
             const char    * name,
-        const llama_memory_i::layer_filter_cb & filter);
+        const llama_memory_i::layer_filter_cb & filter,
+        // fork: the context's leg devices (NULL-terminated, NULL = the model's
+        // placement); when set, an offloaded layer's state follows the leg's
+        // first device instead of model.dev_layer(il)
+        const ggml_backend_dev_t * leg_devices = nullptr);
 
     void clear(llama_seq_id seq_id, bool data);
     void seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst);
@@ -101,7 +105,11 @@ public:
                      uint32_t   n_pad,
                      uint32_t   n_rs_seq,
         const layer_filter_cb & filter,
-        const  layer_reuse_cb & reuse);
+        const  layer_reuse_cb & reuse,
+        // fork: the context's leg devices (NULL-terminated, NULL = the model's
+        // placement); when set, an offloaded layer's state follows the leg's
+        // first device instead of model.dev_layer(il)
+        const ggml_backend_dev_t * leg_devices = nullptr);
 
     ~llama_kv_cache_dsv4() = default;
 

@@ -473,6 +473,24 @@ void cl_program_cache_try_save(
     }
 }
 
+void cl_program_cache_forget(
+    const cl_program_cache_state & state,
+    const char *                   source,
+    const std::string &            compile_opts) {
+
+    if (state.dir.empty() || !source) {
+        return;
+    }
+
+    const std::string key  = compute_key(state.key_suffix, source, compile_opts);
+    const std::string path = state.dir + "/" + key + ".clbin";
+
+    std::error_code ec;
+    if (fs::remove(path, ec)) {
+        cache_debug_line("FORGET", key, source, compile_opts);
+    }
+}
+
 void cl_program_cache_save_verdict(const cl_program_cache_state & state, const cl_program_cache_verdict & verdict) {
     if (state.dir.empty()) { return; }
 

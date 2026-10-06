@@ -26,7 +26,10 @@ public:
                      uint32_t   n_pad,
         const layer_filter_cb & filter_mla,
         const layer_filter_cb & filter_lid,
-        const  layer_reuse_cb & reuse);
+        const  layer_reuse_cb & reuse,
+        // fork: the context's leg devices (NULL-terminated, NULL = the model's
+        // placement); forwarded to the inner caches
+        const ggml_backend_dev_t * leg_devices = nullptr);
 
     ~llama_kv_cache_dsa_iswa() = default;
 

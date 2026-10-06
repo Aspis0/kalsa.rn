@@ -4,6 +4,7 @@
 #include "log.h"
 
 #include <cmath>
+#include <cstring>
 #include <regex>
 #include <string>
 #include <vector>
@@ -78,13 +79,17 @@ static float common_ggml_get_float_value(const uint8_t * data,
 
 static void common_debug_print_tensor(uint8_t * data, ggml_type type, const int64_t * ne, const size_t * nb, int64_t n, bool abort_on_nan) {
     GGML_ASSERT(n > 0);
-    float sum = 0;
+    float    sum  = 0;
+    uint64_t hash = 0xcbf29ce484222325ull; // FNV-1a over the element bits, to compare runs exactly
     for (int64_t i3 = 0; i3 < ne[3]; i3++) {
         for (int64_t i2 = 0; i2 < ne[2]; i2++) {
             for (int64_t i1 = 0; i1 < ne[1]; i1++) {
                 for (int64_t i0 = 0; i0 < ne[0]; i0++) {
                     const float v = common_ggml_get_float_value(data, type, nb, i0, i1, i2, i3);
                     sum += v;
+                    uint32_t bits;
+                    memcpy(&bits, &v, sizeof(bits));
+                    hash = (hash ^ bits) * 0x100000001b3ull;
                 }
             }
         }
@@ -120,6 +125,7 @@ static void common_debug_print_tensor(uint8_t * data, ggml_type type, const int6
         }
         LOG(INDENT "]\n");
         LOG(INDENT "sum = %f\n", sum);
+        LOG(INDENT "hash = %016llx\n", (unsigned long long) hash);
     }
 
     if (abort_on_nan) {

@@ -41,7 +41,11 @@ public:
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
                             /* the indexer cache exists only if this is given */
-    const layer_filter_cb & filter_idx);
+    const layer_filter_cb & filter_idx,
+                            /* fork: the context's leg devices (NULL-terminated,
+                               NULL = the model's placement); forwarded to the
+                               inner caches */
+        const ggml_backend_dev_t * leg_devices = nullptr);
 
     // Defined out of line because kpool_layout is incomplete here.
     ~llama_memory_hybrid_idx();

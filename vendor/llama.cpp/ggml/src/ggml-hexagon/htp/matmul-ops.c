@@ -240,10 +240,51 @@ static const uint8_t __attribute__((aligned(VLEN))) kvalues_mxfp4_lut[] = {
 #include "hvx-mm-kernels-tiled.h"
 #include "hvx-mm-kernels-float.h"
 #include "hmx-mm-kernels-tiled.h"
+#include "q4_0-raw-tile.h"
 
-// Specialized repacked matmul macros
+// Raw GGUF Q4_0 weights (no HTP_TENSOR_REPACK, e.g. the -HOST buffer shared with the CPU):
+// DMA one 32-row group as-is, then convert it in VTCM into the tiles the tiled kernels read.
+// n_k is the caller's slot basis (ne10 / 32); op_matmul checks ne00 == ne10, so a group of
+// raw rows (n_rows * n_k * 18 bytes) and its tiles (n_k * 640 bytes) both fit one slot.
+
+// Rows of group ct present in src0: 32, fewer for the last group, 0 past the end.
+static inline uint32_t hvx_mm_raw_group_rows(const struct htp_tensor * src0, uint32_t ct) {
+    return ct * 32 >= src0->ne[1] ? 0 : MIN(32, src0->ne[1] - ct * 32);
+}
+
+static inline void hvx_mm_push_raw_q4_0(dma_queue * q, uint8_t * dst, const struct htp_tensor * src0, uint32_t ct, uint32_t n_k) {
+    const size_t row_size = n_k * sizeof(block_q4_0);
+    dma_queue_push(q, dma_make_data(dst, (const uint8_t *) src0->data + ct * 32 * src0->nb[1]), row_size, src0->nb[1], row_size,
+                   hvx_mm_raw_group_rows(src0, ct));
+}
+
+static inline const uint8_t * hvx_mm_raw_q4_0_to_tiles(uint8_t * tiles, const uint8_t * raw, const struct htp_tensor * src0, uint32_t ct, uint32_t n_k) {
+    q4_0_raw_rows_to_tiles(tiles, HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0, (const block_q4_0 *) raw, n_k, hvx_mm_raw_group_rows(src0, ct));
+    return tiles;
+}
+
+// Quantized weights without HTP_TENSOR_REPACK hold raw GGUF blocks. Only the 2-D Q4_0 jobs read
+// those; every other kernel assumes tiles and must refuse them rather than read garbage.
+static inline bool htp_mm_has_raw_weight(const struct htp_ops_context * octx, uint32_t n_weights) {
+    for (uint32_t i = 0; i < n_weights; i++) {
+        const struct htp_tensor * w = octx->src[i];
+        const bool quant = w->type == HTP_TYPE_Q4_0  || w->type == HTP_TYPE_Q4_1  || w->type == HTP_TYPE_Q8_0 ||
+                           w->type == HTP_TYPE_IQ4_NL || w->type == HTP_TYPE_MXFP4 || w->type == HTP_TYPE_Q6_K ||
+                           w->type == HTP_TYPE_Q4_K  || w->type == HTP_TYPE_Q5_K;
+        if (quant && !(w->flags & HTP_TENSOR_REPACK)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Specialized repacked matmul macros. MATMUL_2D_TILES_IMPL takes the job name so the raw Q4_0
+// variant (RAW_Q4_0 = 1) can reuse this body with one VTCM slot reserved for the converted tiles.
 #define MATMUL_2D_REPACKED_IMPL(SUFFIX, TILE_SIZE, DOT_2X2, DOT_2X1)                                                                       \
-static void hvx_mm_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void * data) {                                                 \
+    MATMUL_2D_TILES_IMPL(hvx_mm_2d_repacked_##SUFFIX, TILE_SIZE, DOT_2X2, DOT_2X1, 0)
+
+#define MATMUL_2D_TILES_IMPL(NAME, TILE_SIZE, DOT_2X2, DOT_2X1, RAW_Q4_0)                                                                  \
+static void NAME(unsigned int nth, unsigned int ith, void * data) {                                                                        \
     htp_matmul_preamble;                                                                                                                   \
                                                                                                                                            \
     const uint32_t src0_nrows = mmctx->src0_row_end - mmctx->src0_row_start;                                                               \
@@ -277,15 +318,23 @@ static void hvx_mm_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
     uint32_t n_k_tiles_a = ne10 / 32;                                                                                                      \
     uint32_t tile_row_stride = n_k_tiles_w * tile_size;                                                                                    \
     uint32_t tile_row_transfer_size_aligned = n_k_tiles_a * aligned_tile_size;                                                             \
+    /* raw Q4_0: the last prefetch slot holds the tiles converted from the popped raw rows */                                                   \
+    const uint32_t n_src0_slots = RAW_Q4_0 ? n_prefetch - 1 : n_prefetch;                                                                     \
+    uint8_t * restrict vtcm_tiles_ptr = vtcm_src0_ptr + (n_prefetch - 1) * tile_row_transfer_size_aligned;                                    \
                                                                                                                                            \
     uint32_t ct_start = src0_start_row / 32;                                                                                               \
     uint32_t ct_end   = (src0_end_row + 31) / 32;                                                                                          \
                                                                                                                                            \
     uint32_t push_ct = ct_start;                                                                                                           \
     if (src0_start_row < src0_end_row) {                                                                                                   \
-        for (uint32_t d = 0; d < n_prefetch && push_ct < ct_end; d++, push_ct++) {                                                         \
-            dma_queue_push(dma_q, dma_make_data(vtcm_src0_ptr + d * tile_row_transfer_size_aligned,                                        \
-                           src0_row + push_ct * tile_row_stride), aligned_tile_size, tile_size, tile_size, n_k_tiles_a);                   \
+        for (uint32_t d = 0; d < n_src0_slots && push_ct < ct_end; d++, push_ct++) {                                                       \
+            uint8_t * slot = vtcm_src0_ptr + d * tile_row_transfer_size_aligned;                                                            \
+            if (RAW_Q4_0) {                                                                                                                 \
+                hvx_mm_push_raw_q4_0(dma_q, slot, src0, push_ct, n_k_tiles_a);                                                              \
+            } else {                                                                                                                        \
+                dma_queue_push(dma_q, dma_make_data(slot, src0_row + push_ct * tile_row_stride),                                            \
+                               aligned_tile_size, tile_size, tile_size, n_k_tiles_a);                                                       \
+            }                                                                                                                               \
         }                                                                                                                                  \
     }                                                                                                                                      \
                                                                                                                                            \
@@ -294,7 +343,8 @@ static void hvx_mm_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
     }                                                                                                                                      \
                                                                                                                                            \
     for (uint32_t ct = ct_start; ct < ct_end; ct++) {                                                                                      \
-        const uint8_t * w_tile = (void *) dma_queue_pop(dma_q).dst;                                                                        \
+        uint8_t * slot = (uint8_t *) dma_queue_pop(dma_q).dst;                                                                                         \
+        const uint8_t * w_tile = RAW_Q4_0 ? hvx_mm_raw_q4_0_to_tiles(vtcm_tiles_ptr, slot, src0, ct, n_k_tiles_a) : slot;                   \
                                                                                                                                            \
         int valid_rows = (int)ne0 - (int)(ct * 32);                                                                                        \
         valid_rows = MIN(32, MAX(0, valid_rows));                                                                                          \
@@ -336,15 +386,22 @@ static void hvx_mm_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);                                                                              \
                                                                                                                                            \
         if (push_ct < ct_end) {                                                                                                            \
-            dma_queue_push(dma_q, dma_make_data(w_tile, src0_row + push_ct * tile_row_stride),                                             \
-                           aligned_tile_size, tile_size, tile_size, n_k_tiles_a);                                                          \
+            if (RAW_Q4_0) {                                                                                                                \
+                hvx_mm_push_raw_q4_0(dma_q, slot, src0, push_ct, n_k_tiles_a);                                                              \
+            } else {                                                                                                                        \
+                dma_queue_push(dma_q, dma_make_data(slot, src0_row + push_ct * tile_row_stride),                                            \
+                               aligned_tile_size, tile_size, tile_size, n_k_tiles_a);                                                       \
+            }                                                                                                                               \
             push_ct++;                                                                                                                     \
         }                                                                                                                                  \
     }                                                                                                                                      \
 }
 
 #define MATVEC_2D_REPACKED_IMPL(SUFFIX, TILE_SIZE, DOT_2X1)                                                              \
-static void hvx_mv_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void * data) {                               \
+    MATVEC_2D_TILES_IMPL(hvx_mv_2d_repacked_##SUFFIX, TILE_SIZE, DOT_2X1, 0)
+
+#define MATVEC_2D_TILES_IMPL(NAME, TILE_SIZE, DOT_2X1, RAW_Q4_0)                                                         \
+static void NAME(unsigned int nth, unsigned int ith, void * data) {                                                      \
     htp_matmul_preamble;                                                                                                 \
                                                                                                                          \
     const uint32_t src0_nrows = mmctx->src0_row_end - mmctx->src0_row_start;                                             \
@@ -380,6 +437,9 @@ static void hvx_mv_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
     uint32_t n_k_tiles_a = ne10 / 32;                                                                                    \
     uint32_t tile_row_stride = n_k_tiles_w * tile_size;                                                                  \
     uint32_t tile_row_transfer_size_aligned = n_k_tiles_a * aligned_tile_size;                                           \
+    /* raw Q4_0: the last prefetch slot holds the tiles converted from the popped raw rows */                            \
+    const uint32_t n_src0_slots = RAW_Q4_0 ? n_prefetch - 1 : n_prefetch;                                                \
+    uint8_t * restrict vtcm_tiles_ptr = vtcm_src0_ptr + (n_prefetch - 1) * tile_row_transfer_size_aligned;               \
                                                                                                                          \
     uint32_t ct_start = src0_start_row / 32;                                                                             \
     uint32_t ct_end   = (src0_end_row + 31) / 32;                                                                        \
@@ -396,9 +456,14 @@ static void hvx_mv_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
                 dma_queue_pop_nowait(dma_q);                                                                             \
             }                                                                                                            \
         }                                                                                                                \
-        for (uint32_t d = 0; d < n_prefetch && push_ct < ct_end; d++, push_ct++) {                                       \
-            dma_queue_push(dma_q, dma_make_data(vtcm_src0_ptr + d * tile_row_transfer_size_aligned,                      \
-                           src0_row + push_ct * tile_row_stride), aligned_tile_size, tile_size, tile_size, n_k_tiles_a); \
+        for (uint32_t d = 0; d < n_src0_slots && push_ct < ct_end; d++, push_ct++) {                                     \
+            uint8_t * slot = vtcm_src0_ptr + d * tile_row_transfer_size_aligned;                                          \
+            if (RAW_Q4_0) {                                                                                              \
+                hvx_mm_push_raw_q4_0(dma_q, slot, src0, push_ct, n_k_tiles_a);                                            \
+            } else {                                                                                                     \
+                dma_queue_push(dma_q, dma_make_data(slot, src0_row + push_ct * tile_row_stride),                          \
+                               aligned_tile_size, tile_size, tile_size, n_k_tiles_a);                                     \
+            }                                                                                                            \
         }                                                                                                                \
     }                                                                                                                    \
                                                                                                                          \
@@ -407,7 +472,8 @@ static void hvx_mv_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
     }                                                                                                                    \
                                                                                                                          \
     for (uint32_t ct = ct_start; ct < ct_end; ct++) {                                                                    \
-        const uint8_t * w_tile = (void *) dma_queue_pop(dma_q).dst;                                                      \
+        uint8_t * slot = (uint8_t *) dma_queue_pop(dma_q).dst;                                                                       \
+        const uint8_t * w_tile = RAW_Q4_0 ? hvx_mm_raw_q4_0_to_tiles(vtcm_tiles_ptr, slot, src0, ct, n_k_tiles_a) : slot; \
                                                                                                                          \
         float * dst_ptr = &tmp[ct * 32 - src0_start_row];                                                                \
         int valid_rows = (int)ne0 - (int)(ct * 32);                                                                      \
@@ -418,8 +484,12 @@ static void hvx_mv_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);                                                            \
                                                                                                                          \
         if (push_ct < ct_end) {                                                                                          \
-            dma_queue_push(dma_q, dma_make_data(w_tile, src0_row + push_ct * tile_row_stride),                           \
-                           aligned_tile_size, tile_size, tile_size, n_k_tiles_a);                                        \
+            if (RAW_Q4_0) {                                                                                              \
+                hvx_mm_push_raw_q4_0(dma_q, slot, src0, push_ct, n_k_tiles_a);                                            \
+            } else {                                                                                                     \
+                dma_queue_push(dma_q, dma_make_data(slot, src0_row + push_ct * tile_row_stride),                          \
+                               aligned_tile_size, tile_size, tile_size, n_k_tiles_a);                                     \
+            }                                                                                                            \
             push_ct++;                                                                                                   \
         }                                                                                                                \
     }                                                                                                                    \
@@ -547,6 +617,9 @@ MATMUL_2D_REPACKED_IMPL(q6_k,       896,  tiled_vec_dot_q6_k_32x2,  tiled_vec_do
 MATMUL_2D_REPACKED_IMPL(q5_k,       768,  tiled_vec_dot_q5_k_32x2,  tiled_vec_dot_q5_k_32x1)
 MATMUL_2D_REPACKED_IMPL(iq4nl,      576,  tiled_vec_dot_iq4nl_32x2, tiled_vec_dot_iq4nl_32x1)
 MATMUL_2D_REPACKED_IMPL(mxfp4,      544,  tiled_vec_dot_mxfp4_32x2, tiled_vec_dot_mxfp4_32x1)
+
+// Raw GGUF Q4_0 in a shared host buffer: the same tiles, converted in VTCM per 32-row group.
+MATMUL_2D_TILES_IMPL(hvx_mm_2d_raw_q4_0, HTP_MM_WEIGHT_TILE_SIZE_Q4_0, tiled_vec_dot_q4_0_32x2, tiled_vec_dot_q4_0_32x1, 1)
 
 static void hvx_mm_transfer_src1_dma(
     struct htp_ops_context * octx,
@@ -719,6 +792,8 @@ MATVEC_2D_REPACKED_IMPL(q5_k,       768,  tiled_vec_dot_q5_k_32x1)
 MATVEC_2D_REPACKED_IMPL(q6_k,       896,  tiled_vec_dot_q6_k_32x1)
 MATVEC_2D_REPACKED_IMPL(iq4nl,      576,  tiled_vec_dot_iq4nl_32x1)
 MATVEC_2D_REPACKED_IMPL(mxfp4,      544,  tiled_vec_dot_mxfp4_32x1)
+
+MATVEC_2D_TILES_IMPL(hvx_mv_2d_raw_q4_0, HTP_MM_WEIGHT_TILE_SIZE_Q4_0, tiled_vec_dot_q4_0_32x1, 1)
 
 MATMUL_NX_2D_REPACKED_IMPL(q4_0,    576,  tiled_vec_dot_q4_0_32x2,  tiled_vec_dot_q4_0_32x1)
 MATMUL_NX_2D_REPACKED_IMPL(q4_1,    640,  tiled_vec_dot_q4_1_32x2,  tiled_vec_dot_q4_1_32x1)
@@ -1652,6 +1727,7 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
                         src0->type == HTP_TYPE_Q8_0 || src0->type == HTP_TYPE_IQ4_NL ||
                         src0->type == HTP_TYPE_MXFP4 || src0->type == HTP_TYPE_Q6_K ||
                         src0->type == HTP_TYPE_Q4_K || src0->type == HTP_TYPE_Q5_K);
+    const bool is_raw = htp_mm_has_raw_weight(octx, 1); // op_matmul admits it only on the 2-D Q4_0 HVX path
 
     // Compute src0_nrows_per_thread
     mmctx->src0_nrows_per_thread  = fastdiv(nrows + octx->n_threads - 1, &octx->n_threads_div);
@@ -1691,7 +1767,7 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
     } else if (src1_nrows > 1) {
         if (is_repacked) {
             switch (src0->type) {
-                case HTP_TYPE_Q4_0:   matmul_job_func = hvx_mm_2d_repacked_q4_0;   break;
+                case HTP_TYPE_Q4_0:   matmul_job_func = is_raw ? hvx_mm_2d_raw_q4_0 : hvx_mm_2d_repacked_q4_0; break;
                 case HTP_TYPE_Q4_1:
                 case HTP_TYPE_Q4_K:   matmul_job_func = hvx_mm_2d_repacked_q4_1;   break;
                 case HTP_TYPE_Q8_0:   matmul_job_func = hvx_mm_2d_repacked_q8_0;   break;
@@ -1707,7 +1783,7 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
     } else {
         if (is_repacked) {
             switch (src0->type) {
-                case HTP_TYPE_Q4_0:   matmul_job_func = hvx_mv_2d_repacked_q4_0;   break;
+                case HTP_TYPE_Q4_0:   matmul_job_func = is_raw ? hvx_mv_2d_raw_q4_0 : hvx_mv_2d_repacked_q4_0; break;
                 case HTP_TYPE_Q4_1:
                 case HTP_TYPE_Q4_K:   matmul_job_func = hvx_mv_2d_repacked_q4_1;   break;
                 case HTP_TYPE_Q8_0:   matmul_job_func = hvx_mv_2d_repacked_q8_0;   break;
@@ -3822,6 +3898,18 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
 int op_matmul(struct htp_ops_context * octx) {
     const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
 
+    // Raw weights (no HTP_TENSOR_REPACK, e.g. a buffer shared with the CPU) hold GGUF blocks and run
+    // only through the 2-D Q4_0 jobs, which read whole blocks and size a row group by ne10. HMX and
+    // the batched 4-D kernels read tiles, so a raw weight must be refused there, not read as tiles.
+    const struct htp_tensor * w = octx->src[0];
+    if (htp_mm_has_raw_weight(octx, 1) &&
+        (w->type != HTP_TYPE_Q4_0 || kparams->n_hmx ||
+         (kparams->kernel_type != HTP_MM_KERNEL_HVX_QUANT_ROW && kparams->kernel_type != HTP_MM_KERNEL_HVX_QUANT_BLOCK) ||
+         w->ne[0] % QK4_0 || w->ne[0] != octx->src[1]->ne[0] ||
+         w->ne[2] * w->ne[3] > 1 || octx->src[1]->ne[2] * octx->src[1]->ne[3] > 1)) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+
     const int status = htp_mm_init_context(octx, kparams);
     if (status != HTP_STATUS_OK) {
         return status;
@@ -4193,6 +4281,10 @@ static inline void scan_expert_ids(
 int op_matmul_id(struct htp_ops_context * octx) {
     htp_matmul_tensors_preamble;
 
+    if (htp_mm_has_raw_weight(octx, 1)) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+
     const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
     struct htp_mm_context mmctx_struct = {0};
     struct htp_mm_context * mmctx = &mmctx_struct;
@@ -4313,6 +4405,11 @@ int op_matmul_id(struct htp_ops_context * octx) {
 
 int op_matmul_id_nx(struct htp_ops_context * octx) {
     const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
+
+    if (htp_mm_has_raw_weight(octx, kparams->n_weights)) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+
     struct htp_mm_context mmctx_struct = {0};
     struct htp_mm_context * mmctx = &mmctx_struct;
 
@@ -4412,6 +4509,10 @@ int op_matmul_id_nx(struct htp_ops_context * octx) {
 }
 int op_matmul_nx(struct htp_ops_context * octx) {
     const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
+
+    if (htp_mm_has_raw_weight(octx, kparams->n_weights)) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
 
     const int status = htp_mm_init_context(octx, kparams);
     if (status != HTP_STATUS_OK) {

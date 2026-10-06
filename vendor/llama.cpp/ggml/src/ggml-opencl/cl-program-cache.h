@@ -97,6 +97,14 @@ void cl_program_cache_try_save(
     const char *                   source,
     const std::string &            compile_opts);
 
+// Remove the entry for (source, compile_opts) if it exists. The optional-kernel path calls
+// this when the program it built or loaded yielded no kernel: a binary the driver refuses must
+// not outlive the failure that found it, in this process or the next.
+void cl_program_cache_forget(
+    const cl_program_cache_state & state,
+    const char *                   source,
+    const std::string &            compile_opts);
+
 // Both are no-ops (load returns false) when the cache is disabled.
 void cl_program_cache_save_verdict(const cl_program_cache_state & state, const cl_program_cache_verdict & verdict);
 bool cl_program_cache_load_verdict(const cl_program_cache_state & state, cl_program_cache_verdict & verdict);

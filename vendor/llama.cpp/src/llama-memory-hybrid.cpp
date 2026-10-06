@@ -49,7 +49,8 @@ llama_memory_hybrid::llama_memory_hybrid(
            llama_memory_t   mem_other,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr) :
+    const layer_filter_cb & filter_recr,
+        const ggml_backend_dev_t * leg_devices) :
     hparams(model.hparams),
     shared(mem_other != nullptr),
     mem_attn(new llama_kv_cache(
@@ -70,7 +71,9 @@ llama_memory_hybrid::llama_memory_hybrid(
             [&](int32_t il) { return !hparams.is_recr(il); }
             : filter_attn,
         nullptr,
-        nullptr
+        nullptr,
+        "",
+        leg_devices
     )),
     mem_recr(new llama_memory_recurrent(
         model,
@@ -82,7 +85,8 @@ llama_memory_hybrid::llama_memory_hybrid(
         n_rs_seq,
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recr(il); }
-            : filter_recr
+            : filter_recr,
+        leg_devices
     )) {}
 
 bool llama_memory_hybrid::shared_fence(const char * operation) const {

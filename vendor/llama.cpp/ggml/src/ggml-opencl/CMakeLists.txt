@@ -6,6 +6,13 @@ set(TARGET_NAME ggml-opencl)
 ggml_add_backend_library(${TARGET_NAME}
                          ggml-opencl.cpp
                          ggml-opencl-kalsa-diag.cpp
+                         ggml-opencl-tile32.cpp
+                         ggml-opencl-tile32-gate.cpp
+                         ggml-opencl-tile32-matvec.cpp
+                         ggml-opencl-tile32-host.cpp
+                         ggml-opencl-tile32-host-q6k.cpp
+                         ggml-opencl-tile32-internal.h
+                         ggml-opencl-tile32-facts.cpp
                          cl-program-cache.cpp
                          cl-program-cache.h
                          ../../include/ggml-opencl.h)
@@ -102,6 +109,7 @@ set(GGML_OPENCL_KERNELS
     mul_mv_q4_0_f32_8x_flat
     mul_mv_q4_0_f32_1d_8x_flat
     mul_mv_q4_0_f32_1d_16x_flat
+    mul_mv_q4_0_f32_tiled_v4
     mul_mv_q4_1_f32
     mul_mv_q4_1_f32_flat
     mul_mv_q4_k_f32
@@ -114,6 +122,7 @@ set(GGML_OPENCL_KERNELS
     mul_mv_q5_k_f32_flat
     mul_mv_q6_k_f32
     mul_mv_q6_k_f32_flat
+    mul_mv_q6_k_f32_aos
     mul_mv_q8_0_f32
     mul_mv_q8_0_f32_flat
     mul_mv_iq4_nl_f32

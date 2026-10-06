@@ -26,7 +26,16 @@ extern "C" {
         size_t                (*get_alloc_size)(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor);
         // (optional) check if tensor data is in host memory and uses standard ggml tensor layout (defaults to false)
         bool                  (*is_host)       (ggml_backend_buffer_type_t buft);
+        // (optional) weight layout stored by this buffer type (defaults to GGML_WEIGHT_LAYOUT_NATIVE)
+        enum ggml_backend_weight_layout (*get_weight_layout)(ggml_backend_buffer_type_t buft);
     };
+
+    GGML_API enum ggml_backend_weight_layout ggml_backend_buft_weight_layout(ggml_backend_buffer_type_t buft);
+
+    // weight layout of a tensor's storage, resolving views to their root buffer (a view carries
+    // buffer == NULL and points into the root's storage). An unallocated root - the placement
+    // probes - reads as NATIVE.
+    GGML_API enum ggml_backend_weight_layout ggml_backend_tensor_weight_layout(const struct ggml_tensor * tensor);
 
     struct ggml_backend_buffer_type {
         struct ggml_backend_buffer_type_i  iface;

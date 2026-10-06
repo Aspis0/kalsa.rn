@@ -73,11 +73,18 @@ void llama_governor::refresh_policy_stats() {
 int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {
     // Every executed piece must fit one llama_decode, which asserts
     // n_tokens_all <= cparams.n_batch; the input batch itself may be larger
-    // (partitioning is this function's job). Either context can execute the
-    // pieces (CPU vs GPU route), so cap to the smaller n_batch.
-    const uint32_t n_batch = ctx_prefill != nullptr && ctx_decode != nullptr
-        ? std::min(ctx_prefill->get_cparams().n_batch, ctx_decode->get_cparams().n_batch)
-        : UINT32_MAX; // test-only governor without contexts
+    // (partitioning is this function's job). Any present context can execute
+    // the pieces (CPU vs GPU route), so cap to the smallest n_batch of the
+    // present contexts (both governor forms).
+    uint32_t n_batch = UINT32_MAX; // test-only governor without contexts
+    {
+        llama_context * side_ctxs[3];
+        side_state * side_states[3];
+        const size_t n_sides = collect_sides(side_ctxs, side_states);
+        for (size_t i = 0; i < n_sides; ++i) {
+            n_batch = std::min(n_batch, side_ctxs[i]->get_cparams().n_batch);
+        }
+    }
     llama_governor_prefill_mode mode_used = llama_governor_prefill_mode::Auto;
     bool override_decided = false;
     const auto requested = policy_.prefill_engine(&mode_used, &override_decided);
@@ -189,8 +196,11 @@ int32_t llama_governor::select_decode() {
     stats_.cpu_to_gpu_engagements = policy_.cpu_to_gpu_engagements();
     // hop_rule is set only on the token that decides a window, so this counts
     // windows, in the same clear_cache interval as the other decode_hop_* stats.
-    if (selection.hop_rule != nullptr && std::strcmp(selection.hop_rule, "headroom") == 0) {
-        ++stats_.decode_hop_headroom_windows;
+    if (selection.hop_rule != nullptr) {
+        stats_.decode_hop_rule = selection.hop_rule;
+        if (std::strcmp(selection.hop_rule, "headroom") == 0) {
+            ++stats_.decode_hop_headroom_windows;
+        }
     }
     if (selection.wait) {
         if (policy_.thermal_state() == llama_governor_thermal_state::Invalid ||
@@ -220,19 +230,26 @@ llama_governor_stats llama_governor::stats() const {
 }
 
 void llama_governor::clear_cache(bool clear_data) {
-    if (ctx_prefill != nullptr) {
-        llama_memory_clear(llama_get_memory(ctx_prefill), clear_data);
+    {
+        llama_context * side_ctxs[3];
+        side_state * side_states[3];
+        const size_t n_sides = collect_sides(side_ctxs, side_states);
+        for (size_t i = 0; i < n_sides; ++i) {
+            llama_memory_clear(llama_get_memory(side_ctxs[i]), clear_data);
+            *side_states[i] = side_state{};
+        }
     }
-    if (ctx_decode != nullptr) {
-        llama_memory_clear(llama_get_memory(ctx_decode), clear_data);
-    }
-    prefill_state = side_state{};
-    decode_state = side_state{};
     last_ctx = nullptr;
     last_phase = phase::None;
     prefill_route_ = prefill_route::Undecided;
     decode_tokens_since_prefill_ = 0;
+    forced_window_ = UINT32_MAX;
     policy_.reset_decode_hop();
+    // a fully cached turn's 1-token batch never enters the prefill branch,
+    // so the floor refresh lives here too (one-model only)
+    if (!legs.empty()) {
+        refresh_decode_legs();
+    }
 
     stats_.commit_bytes = 0;
     stats_.commit_us = 0;
@@ -245,9 +262,23 @@ void llama_governor::clear_cache(bool clear_data) {
     stats_.decode_hops = 0;
     stats_.decode_tokens_cpu = 0;
     stats_.decode_tokens_npu = 0;
+    stats_.decode_tokens_gpu = 0;
+    stats_.decode_us_cpu = 0;
+    stats_.decode_us_npu = 0;
+    stats_.decode_us_gpu = 0;
+    for (auto & pair : stats_.decode_hop_pairs) {
+        pair = llama_governor_stats::llama_governor_hop_pair{};
+    }
     stats_.decode_hop_commit_bytes = 0;
     stats_.decode_hop_commit_us = 0;
     stats_.decode_hop_headroom_windows = 0;
+    stats_.decode_hop_rule = nullptr;
+    // the floor evidence is measured against these marks; with the counters
+    // zeroed the marks must go too or the next delta underflows
+    for (int i = 0; i < 3; ++i) {
+        floor_mark_tokens_[i] = 0;
+        floor_mark_us_[i] = 0;
+    }
 }
 
 void llama_governor::reset_prefill_stats() {
@@ -257,7 +288,13 @@ void llama_governor::reset_prefill_stats() {
     // cached (its 1-token batch never enters the prefill branch) still
     // decides hop window 0 fresh, whichever rule runs.
     decode_tokens_since_prefill_ = 0;
+    forced_window_ = UINT32_MAX;
     policy_.reset_decode_hop();
+    // a fully cached turn's 1-token batch never enters the prefill branch,
+    // so the floor refresh lives here too (one-model only)
+    if (!legs.empty()) {
+        refresh_decode_legs();
+    }
     stats_.prefill_us = 0;
     stats_.prefill_n = 0;
     stats_.prefill_chunks[0] = '\0';
@@ -282,11 +319,20 @@ bool llama_governor::set_thermo_profile(const llama_governor_thermo_profile & pr
     return ok;
 }
 
-bool llama_governor::set_decode_headroom(float cpu_headroom_c, float npu_headroom_c) {
+bool llama_governor::set_decode_headroom(float cpu_headroom_c, float npu_headroom_c,
+                                          float gpu_headroom_c) {
     if (!policy_enabled_) {
         return false;
     }
-    policy_.set_decode_headroom(cpu_headroom_c, npu_headroom_c);
+    policy_.set_decode_headroom(cpu_headroom_c, npu_headroom_c, gpu_headroom_c);
+    return true;
+}
+
+bool llama_governor::set_decode_legs(bool npu, bool gpu, bool cpu) {
+    if (!policy_enabled_) {
+        return false;
+    }
+    policy_.set_decode_legs(npu, gpu, cpu);
     return true;
 }
 
@@ -328,8 +374,14 @@ bool llama_governor::note_expert_route(bool resident, float resident_score,
 }
 
 llama_context * llama_governor::context() const { return last_ctx; }
-llama_context * llama_governor::prefill_context() const { return ctx_prefill; }
-llama_context * llama_governor::decode_context() const { return ctx_decode; }
+// two-model: the two named contexts; one-model: the accelerator-role leg
+// (NPU, else GPU, else CPU) and the CPU leg
+llama_context * llama_governor::prefill_context() const {
+    return legs.empty() ? ctx_prefill : prefill_ctx(false);
+}
+llama_context * llama_governor::decode_context() const {
+    return legs.empty() ? ctx_decode : leg_ctx(llama_governor_engine::CPU);
+}
 
 llama_governor * llama_governor_init(llama_model * model_prefill, llama_model * model_decode,
                                      llama_context_params params_prefill, llama_context_params params_decode) {
@@ -366,6 +418,21 @@ llama_governor * llama_governor_init_with_params_internal(
     }
 }
 
+llama_governor * llama_governor_init_one_model_with_params(
+        llama_model * model, const llama_governor_leg * legs, uint32_t n_legs,
+        llama_governor_params governor_params) {
+    try {
+        return new llama_governor(model, legs, n_legs, governor_params);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.what());
+        return nullptr;
+    }
+}
+
+llama_context * llama_governor_leg_ctx(const llama_governor * governor, llama_governor_engine engine) {
+    return governor ? governor->leg_ctx(engine) : nullptr;
+}
+
 void llama_governor_free(llama_governor * governor) { delete governor; }
 
 int32_t llama_governor_decode(llama_governor * governor, llama_batch batch) {
@@ -382,8 +449,13 @@ bool llama_governor_set_thermo_profile(llama_governor * governor,
 }
 
 bool llama_governor_set_decode_headroom(llama_governor * governor,
-                                        float cpu_headroom_c, float npu_headroom_c) {
-    return governor && governor->set_decode_headroom(cpu_headroom_c, npu_headroom_c);
+                                        float cpu_headroom_c, float npu_headroom_c,
+                                        float gpu_headroom_c) {
+    return governor && governor->set_decode_headroom(cpu_headroom_c, npu_headroom_c, gpu_headroom_c);
+}
+
+bool llama_governor_set_decode_legs(llama_governor * governor, bool npu, bool gpu, bool cpu) {
+    return governor && governor->set_decode_legs(npu, gpu, cpu);
 }
 
 bool llama_governor_set_prefill_override(llama_governor * governor, int mode) {

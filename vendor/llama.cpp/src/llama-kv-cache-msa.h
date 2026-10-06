@@ -27,7 +27,10 @@ public:
                llama_swa_type   swa_type,
         const layer_filter_cb & filter,
         const layer_filter_cb & filter_idx,
-        const  layer_reuse_cb & reuse);
+        const  layer_reuse_cb & reuse,
+        // fork: the context's leg devices (NULL-terminated, NULL = the model's
+        // placement); forwarded to the inner caches
+        const ggml_backend_dev_t * leg_devices = nullptr);
 
     ~llama_kv_cache_msa() = default;
 

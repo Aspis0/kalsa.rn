@@ -24,6 +24,12 @@ bool llama_governor_expert_substitution_would_displace(
         float lambda, bool resident, float resident_score,
         float flash_winner_score, float score_range);
 
+// Decode-hop hysteresis (llama-governor-policy-hop.cpp): another leg must
+// beat the current one's effective headroom by this much before a window
+// boundary moves the work, so sample noise cannot buy a flip-flopping KV
+// commit. Starting value, to be tuned on the S23.
+constexpr float k_hop_hysteresis_c = 4.0f;
+
 struct llama_governor_prefill_admission {
     llama_governor_decision decision = llama_governor_decision::Wait;
     llama_governor_engine engine = llama_governor_engine::CPU;
@@ -62,8 +68,19 @@ public:
 
     bool update_thermal(const llama_governor_thermo_profile & profile, int64_t now_ms);
     // Per-leg decode-hop headroom in C (NaN = unknown leg, no usable zone on
-    // this phone); read by the hop rule in select_decode.
-    void set_decode_headroom(float cpu_headroom_c, float npu_headroom_c);
+    // this phone); read by the hop rule in select_decode. The gpu leg is the
+    // one-model governor's third leg and stays NaN for the two-model form.
+    void set_decode_headroom(float cpu_headroom_c, float npu_headroom_c,
+                             float gpu_headroom_c = std::numeric_limits<float>::quiet_NaN());
+    // Which decode legs exist and may hop (rule v2): the one-model governor
+    // pushes its leg table here (floors may drop a leg); the default
+    // NPU+CPU is the two-model form's set, so v1 decisions are unchanged.
+    void set_decode_legs(bool npu, bool gpu, bool cpu);
+    // The one-model governor's lane proof: its NPU leg exists and its
+    // admission was set, which stands in for the LaunchConfig's fit /
+    // readable-streams facts. npu_lane_enabled (the binding's platform
+    // switch) stays the master gate either way.
+    void set_npu_lane_capable(bool capable) { npu_lane_capable_ = capable; }
     // Arms a fresh hop leg decision for the next decode: the governor calls
     // this wherever it zeroes its decode-hop clock, and the headroom samples
     // go with the clock, so window 0 decides on this turn's reading (the
@@ -94,6 +111,8 @@ public:
     bool set_prefill_override(int mode);
     llama_governor_thermal_state thermal_state() const;
     llama_governor_thermal_snapshot thermal_snapshot() const;
+    // the constructor-time inputs (floor / heat knobs for the hop rule)
+    const llama_governor_params & params() const { return params_; }
     // True while a platform-raised COOLMODE stands that battery heat does
     // not justify (sticky for the state's whole life, see update_thermal).
     bool state_from_platform() const;
@@ -126,6 +145,12 @@ private:
     bool npu_lane_live() const;
     bool not_a_safety_state() const;
 
+    // Rule 4's leg choice (llama-governor-policy-hop.cpp): called only at
+    // window boundaries while the hop is active; decides decode_hop_leg_,
+    // returns the hop-rule label ("headroom"/"alternation") and logs one
+    // line per leg change.
+    const char * hop_decide(uint32_t window, uint32_t tokens_since_prefill);
+
     llama_governor_params params_;
     llama_governor_thermo_profile profile_;
     llama_governor_thermal_state state_ = llama_governor_thermal_state::Unknown;
@@ -149,12 +174,19 @@ private:
     float t_idle_reference_c_ = 0.0f;
     bool have_t_idle_reference_ = false;
     llama_governor_engine last_decode_engine_ = llama_governor_engine::CPU;
-    // Decode-hop leg state (the rule lives in select_decode): per-leg
-    // headroom input (NaN = unknown), the window the current leg was decided
+    // Decode-hop leg state (the rule lives in select_decode /
+    // llama-governor-policy-hop.cpp): per-leg headroom input (NaN =
+    // unknown), the present-leg mask, the window the current leg was decided
     // for, and the leg itself. The window guard is what keeps decisions at
     // window boundaries - a caller polls select_decode per token.
     float decode_cpu_headroom_c_ = std::numeric_limits<float>::quiet_NaN();
     float decode_npu_headroom_c_ = std::numeric_limits<float>::quiet_NaN();
+    float decode_gpu_headroom_c_ = std::numeric_limits<float>::quiet_NaN();
+    // indexed like llama_governor_engine (CPU, GPU, NPU); the default is the
+    // two-model form's set, so v1 decisions are byte-identical
+    bool decode_leg_present_[3] = { true, false, true };
+    // the one-model governor's lane proof (see set_npu_lane_capable)
+    bool npu_lane_capable_ = false;
     // Window the current hop leg was decided for; the sentinel means no
     // window is decided yet (fresh policy or reset_decode_hop), so window 0
     // of a new decode always decides.

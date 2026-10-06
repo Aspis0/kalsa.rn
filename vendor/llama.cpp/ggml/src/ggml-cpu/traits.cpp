@@ -1,5 +1,7 @@
 #include "traits.h"
 
+#include "tile32.h"
+
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
 #include "repack-q23k.h"
@@ -10,7 +12,17 @@ tensor_traits::~tensor_traits() {}
 extra_buffer_type::~extra_buffer_type() {}
 }  // namespace ggml::cpu
 
+// weights in a Q4_0 TILE32 buffer are read by the tile32 dispatch, not the extra buffer types;
+// a view resolves to the root's layout, and the dispatch declines views itself (no tile-space
+// address), so a view falls through to the native-read guard
+static bool ggml_cpu_src0_is_tile32(const struct ggml_tensor * op) {
+    return op->src[0] && ggml_backend_tensor_weight_layout(op->src[0]) == GGML_WEIGHT_LAYOUT_Q4_0_TILE32;
+}
+
 bool ggml_cpu_extra_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * op) {
+    if (ggml_cpu_src0_is_tile32(op)) {
+        return ggml_cpu_tile32_compute_forward(params, op);
+    }
     for (auto extra : ggml_backend_cpu_get_extra_buffer_types()) {
         if (extra && extra->context) {
             auto buf_extra     = (ggml::cpu::extra_buffer_type *) extra->context;
@@ -35,6 +47,9 @@ bool ggml_cpu_extra_compute_forward(struct ggml_compute_params * params, struct 
 }
 
 bool ggml_cpu_extra_work_size(int n_threads, const struct ggml_tensor * op, size_t * size) {
+    if (ggml_cpu_src0_is_tile32(op)) {
+        return ggml_cpu_tile32_work_size(n_threads, op, size);
+    }
     for (auto extra : ggml_backend_cpu_get_extra_buffer_types()) {
         if (extra && extra->context) {
             auto buf_extra     = (ggml::cpu::extra_buffer_type *) extra->context;

@@ -2,6 +2,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
 #include "repack.h"
+#include "tile32.h"
 #include "traits.h"
 #include "ggml-impl.h"
 #include "amx/amx.h"
@@ -432,10 +433,16 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     // check extra buffer types
     // note: only the first sources are checked for extra buffer types to reduce overhead, increase if necessary
     for (int i = 0; i < 4; i++) {
-        if (op->src[i] && op->src[i]->buffer &&
-            ggml_backend_cpu_is_extra_buffer_type(op->src[i]->buffer->buft)) {
-            auto * buf_extra = (ggml::cpu::extra_buffer_type *) op->src[i]->buffer->buft->context;
-            return buf_extra->supports_op(dev, op);
+        if (op->src[i] && op->src[i]->buffer) {
+            if (ggml_backend_cpu_is_extra_buffer_type(op->src[i]->buffer->buft)) {
+                auto * buf_extra = (ggml::cpu::extra_buffer_type *) op->src[i]->buffer->buft->context;
+                return buf_extra->supports_op(dev, op);
+            }
+        }
+        // a weight in a Q4_0 TILE32 buffer is read by the tile32 dispatch; the layout reader
+        // resolves views to the root buffer, and the dispatch declines views itself
+        if (op->src[i] && ggml_backend_tensor_weight_layout(op->src[i]) == GGML_WEIGHT_LAYOUT_Q4_0_TILE32) {
+            return ggml_cpu_tile32_supports_op(op);
         }
     }
 
@@ -487,7 +494,9 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
 }
 
 static bool ggml_backend_cpu_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    return ggml_backend_buft_is_host(buft) || ggml_backend_cpu_is_extra_buffer_type(buft);
+    return ggml_backend_buft_is_host(buft) || ggml_backend_cpu_is_extra_buffer_type(buft) ||
+        // the tile32 dispatch reads a device's tiled Q4_0 weight copy on a dotprod ARM host
+        (ggml_backend_buft_weight_layout(buft) == GGML_WEIGHT_LAYOUT_Q4_0_TILE32 && ggml_cpu_has_dotprod());
     GGML_UNUSED(dev);
 }
 

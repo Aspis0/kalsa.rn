@@ -1076,6 +1076,18 @@ llm_ffn_op_type llm_ffn_op_type_from_string(const std::string & name, llm_ffn_op
     return fallback;
 }
 
+// True when a placement candidate carries the tiled weight layout (the Hexagon repack mode:
+// set_shared_weights, or its env seed). Not a proxy for the HOST buft - that is the device's
+// HOST mode, asked for separately.
+static bool buft_list_has_tile32(const buft_list_t & buft_list) {
+    for (const auto & [_, buft] : buft_list) {
+        if (ggml_backend_buft_weight_layout(buft) == GGML_WEIGHT_LAYOUT_Q4_0_TILE32) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // CPU: ACCEL -> GPU host -> CPU extra -> CPU
 static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices, bool use_extra_bufts, bool no_host) {
     buft_list_t buft_list;
@@ -1138,6 +1150,66 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
     return buft_list;
 }
 
+// The weights HOST buft of a device in shared-weights mode (Amendment I): a host buffer type the
+// device offers as an extra buft, i.e. not the one ggml_backend_dev_host_buffer_type hands out.
+// That other host buft backs the CPU's compute and output buffers, and a backend must never
+// claim it for weights. The list the placement probe walks is the same source, so a device
+// without such an entry (every device but Hexagon in shared mode) returns null.
+static ggml_backend_buffer_type_t device_weight_host_buft(ggml_backend_dev_t dev) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (!reg) {
+        return nullptr;
+    }
+    auto get_extra_bufts = (ggml_backend_dev_get_extra_bufts_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+    if (!get_extra_bufts) {
+        return nullptr;
+    }
+    ggml_backend_buffer_type_t dev_host = ggml_backend_dev_host_buffer_type(dev);
+    ggml_backend_buffer_type_t * bufts = get_extra_bufts(dev);
+    for (; bufts && *bufts; ++bufts) {
+        if (*bufts != dev_host && ggml_backend_buft_is_host(*bufts)) {
+            return *bufts;
+        }
+    }
+    return nullptr;
+}
+
+// The weights HOST buft of a device in shared-weights mode: the one-copy buffer the GPU leg imports
+// through the generic dma-buf accessor of the same registry. Null when no device offers both, which
+// is every device but Hexagon, and every device in two-copy mode.
+static ggml_backend_buffer_type_t shared_weights_host_buft(const std::vector<llama_device> & devices) {
+    for (const auto & dev : devices) {
+        ggml_backend_buffer_type_t buft = device_weight_host_buft(dev.dev);
+        if (!buft) {
+            continue;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev.dev);
+        if (!reg || !ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_dmabuf")) {
+            continue;
+        }
+        return buft;
+    }
+    return nullptr;
+}
+
+// Input-role list in shared-weights mode (Amendment G1, buft renamed in Amendment I): the
+// weights HOST buffer goes first, so the placement probe puts token_embd into the one-copy HOST
+// copy the GPU imports and the CPU reads in place, instead of the plain CPU buffer where the tied
+// lm_head would be unreachable for the GPU leg. The entry is paired with the CPU device on
+// purpose: the probe asks whether some device can compute the input role (GET_ROWS) over this
+// buffer type, and the CPU answers yes, reading host memory directly. A load without such a buft
+// leaves the caller with cpu_list unchanged, so two-copy placement is byte-identical.
+static buft_list_t make_shared_input_buft_list(ggml_backend_buffer_type_t weight_host_buft,
+                                               ggml_backend_dev_t cpu_dev, const buft_list_t & cpu_list) {
+    if (weight_host_buft == nullptr) {
+        return cpu_list;
+    }
+    buft_list_t list = { { cpu_dev, weight_host_buft } };
+    list.insert(list.end(), cpu_list.begin(), cpu_list.end());
+    return list;
+}
+
 // GPU: split if LLAMA_SPLIT_MODE_ROW -> GPU
 static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode split_mode, const float * tensor_split) {
     buft_list_t buft_list;
@@ -1166,10 +1238,9 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
         }
     }
 
-    // add the device default buffer type
-    buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
-
-    // add the device extra buffer type (if any)
+    // add the device extra buffer types (if any) before the default buffer type: the placement
+    // probe (select_weight_buft) walks the list in order, so a device buft with a special weight
+    // layout must be offered before the layout-agnostic default (e.g. HTP0-TILE32 vs HTP0)
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
     if (reg) {
         auto ggml_backend_dev_get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)
@@ -1183,6 +1254,9 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
             }
         }
     }
+
+    // add the device default buffer type
+    buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
 
     return buft_list;
 }
@@ -1210,6 +1284,7 @@ struct llama_model::impl {
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
     buft_list_t cpu_buft_list;
+    buft_list_t input_buft_list;   // shared-weights input role: HOST first (Amendment G1)
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
     struct layer_dev {
@@ -1499,6 +1574,77 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
     vocab.load(ml, kv);
 }
 
+// a host buft of the CPU device: the plain CPU buft and CPU_Mapped (mmap through
+// buffer_from_host_ptr). Both carry no device pointer yet (the ggml-backend.cpp FIXME), so on a
+// host buft a NULL device means CPU; every real device buft names its device. CPU_REPACK is not
+// host, so it stays in the audit's throw branch.
+static bool buft_is_cpu_host(ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    return ggml_backend_buft_is_host(buft) &&
+        (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU);
+}
+
+// Name of the first tensor a weight buffer holds, for a refusal that must say what landed in
+// the wrong place.
+static const char * buffer_tensor_name(ggml_context * ctx, ggml_backend_buffer_t buf) {
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->buffer == buf) {
+            return ggml_get_name(t);
+        }
+    }
+    return "<unnamed>";
+}
+
+// Amendment C1 post-load audit: in shared-weights mode every weights buffer must be a shared one -
+// TILE32, the weights HOST buft (HOST-W, Amendment I) or a CPU buft. A device's own host buffer
+// type (HTP0-HOST) is what llama hands the CPU for its compute and output buffers; the legs refuse
+// it by identity, so a weight there is not claimed by them and the one-copy guarantee is gone.
+// Those bytes are counted apart from HOST-W and any weight in that buft fails the load, whatever
+// placed it there (-ot included). Summed sizes go to one INFO line the RAM measurements read.
+static void audit_shared_weight_buffers(
+        const std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> & ctxs_bufs) {
+    size_t tile32_bytes      = 0;
+    size_t host_bytes        = 0;   // HOST-W
+    size_t cpu_bytes         = 0;
+    size_t dev_host_bytes    = 0;
+    std::string dev_host_error;
+
+    for (const auto & [ctx, bufs] : ctxs_bufs) {
+        for (const auto & buf : bufs) {
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
+            const size_t size = ggml_backend_buffer_get_size(buf.get());
+
+            if (ggml_backend_buft_weight_layout(buft) == GGML_WEIGHT_LAYOUT_Q4_0_TILE32) {
+                tile32_bytes += size;
+            } else if (buft_is_cpu_host(buft)) {
+                cpu_bytes += size;
+            } else if (ggml_backend_buft_is_host(buft)) {
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                if (dev != nullptr && buft == ggml_backend_dev_host_buffer_type(dev)) {
+                    dev_host_bytes += size;
+                    if (dev_host_error.empty()) {
+                        dev_host_error = format("%s landed in %s",
+                            buffer_tensor_name(ctx.get(), buf.get()), ggml_backend_buft_name(buft));
+                    }
+                } else {
+                    host_bytes += size;
+                }
+            } else {
+                throw std::runtime_error(format("shared weights: %s landed in %s, not a shared buffer",
+                    ggml_get_name(ggml_get_first_tensor(ctx.get())), ggml_backend_buft_name(buft)));
+            }
+        }
+    }
+
+    if (dev_host_bytes > 0) {
+        throw std::runtime_error(format("shared weights: %s, a device host buffer type that llama gives "
+            "the CPU for its compute and output buffers (%zu bytes) - the legs refuse it, so a weight "
+            "there loses the one-copy guarantee", dev_host_error.c_str(), dev_host_bytes));
+    }
+
+    LLAMA_LOG_INFO("shared weights: TILE32 %zu HOST %zu CPU %zu bytes\n", tile32_bytes, host_bytes, cpu_bytes);
+}
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
@@ -1544,15 +1690,38 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
     for (const auto & dev : devices) {
-        buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
-        // add CPU buffer types as a fallback
-        buft_list.insert(buft_list.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
-        pimpl->gpu_buft_list.emplace(dev.dev, std::move(buft_list));
+        pimpl->gpu_buft_list.emplace(dev.dev, make_gpu_buft_list(dev.dev, split_mode, tensor_split));
+    }
+
+    ml.shared_weights = buft_list_has_tile32(pimpl->cpu_buft_list);
+    for (const auto & [_, buft_list] : pimpl->gpu_buft_list) {
+        ml.shared_weights = ml.shared_weights || buft_list_has_tile32(buft_list);
     }
 
     ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (cpu_dev == nullptr) {
         throw std::runtime_error(format("%s: no CPU backend found", __func__));
+    }
+
+    // The one weights HOST copy of this load, resolved from the devices once (Amendment G1). Null in
+    // two-copy mode and on a device that offers no such buft: then no list changes at all.
+    ggml_backend_buffer_type_t weight_host_buft = ml.shared_weights ? shared_weights_host_buft(devices) : nullptr;
+
+    for (auto & [_, buft_list] : pimpl->gpu_buft_list) {
+        // a layer list offers the shared weights HOST copy in front of the CPU fallbacks: a
+        // native-layout weight the device's TILE32 buft refuses (the f32 norms, conv weights) must
+        // go to HOST-W, where the GPU leg reads it, instead of the CPU buffer. The probe restricts
+        // the entry to those weights (select_weight_buft's f32-only rule), so it never catches a
+        // Q4_0 matrix: one the device admits stops at TILE32, one it refuses (GGML_HEXAGON_OPFILTER)
+        // falls to the CPU fallbacks like before. The entry is paired with the CPU device as in the
+        // input list: the probe asks the paired device whether it computes the op over that buft,
+        // the device answers no for these weights - the very reason they reach this far - and the
+        // CPU says yes, reading host memory.
+        if (weight_host_buft != nullptr) {
+            buft_list.emplace_back(cpu_dev, weight_host_buft);
+        }
+        // add CPU buffer types as a fallback
+        buft_list.insert(buft_list.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
     }
 
     // calculate the split points
@@ -1603,8 +1772,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     };
 
     // assign the input layer
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    // there is very little benefit to offloading the input layer, so always keep it on the CPU.
+    // Shared weights (Amendment G1, buft renamed in Amendment I): the tied output and the GPU
+    // leg read token_embd where it lives, so the input list offers the shared weights HOST
+    // buffer first; the plain CPU buffer would leave the lm_head on a second copy. The buft that
+    // decides is weight_host_buft, resolved once above; without one the input list is the CPU
+    // list verbatim, so two-copy placement stays byte-identical.
+    if (ml.shared_weights) {
+        pimpl->input_buft_list = make_shared_input_buft_list(weight_host_buft, cpu_dev, pimpl->cpu_buft_list);
+        pimpl->dev_input = { cpu_dev, &pimpl->input_buft_list };
+    } else {
+        pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    }
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);
@@ -1951,6 +2130,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
+    }
+
+    if (ml.shared_weights) {
+        audit_shared_weight_buffers(pimpl->ctxs_bufs);
     }
 
     if (use_mmap_buffer) {
@@ -2433,7 +2616,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         hparams.swa_type,
                         nullptr,
                         filter_idx,
-                        nullptr);
+                        nullptr,
+                        params.leg_devices);
             } break;
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_DEEPSEEK32:
@@ -2461,7 +2645,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             filter,
                             nullptr,
-                            nullptr);
+                            nullptr,
+                            "",
+                            params.leg_devices);
                 } else {
                     // Main context: DSA cache for the trunk layers only - the nextn
                     // layer(s) are never attended by the trunk graph.
@@ -2485,7 +2671,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             hparams.swa_type,
                             filter_mla,
                             filter_lid,
-                            nullptr);
+                            nullptr,
+                            params.leg_devices);
                 }
             } break;
         case LLM_ARCH_GLM5_NEXT:
@@ -2530,7 +2717,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     /* unified           */ cparams.kv_unified,
                     /* filter_attn       */ std::move(filter_attn),
                     /* filter_recr       */ std::move(filter_recr),
-                    /* filter_idx        */ std::move(filter_idx));
+                    /* filter_idx        */ std::move(filter_idx),
+                    /* leg_devices       */ params.leg_devices);
             } break;
         case LLM_ARCH_HY_V4:
             {
@@ -2552,7 +2740,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             nullptr,
                             nullptr,
-                            nullptr);
+                            nullptr,
+                            "",
+                            params.leg_devices);
                 } else {
                     // only "full" layers own an indexer, so the shared layers need no indexer cache
                     llama_kv_cache::layer_filter_cb filter_lid = [&](uint32_t il) { return hparams.is_indexer_full(il); };
@@ -2571,7 +2761,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             hparams.swa_type,
                             nullptr,
                             filter_lid,
-                            nullptr);
+                            nullptr,
+                            params.leg_devices);
                 }
             } break;
         case LLM_ARCH_DOTS3NOTE:
@@ -2599,7 +2790,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             filter,
                             nullptr,
-                            nullptr);
+                            nullptr,
+                            "",
+                            params.leg_devices);
                 } else {
                     // main context: DSA cache for the trunk full-attention layers plus a window-sized SWA cache
                     llama_kv_cache::layer_filter_cb filter_mla = nullptr;
@@ -2622,7 +2815,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             1,
                             filter_mla,
                             filter_lid,
-                            nullptr);
+                            nullptr,
+                            params.leg_devices);
                 }
             } break;
         case LLM_ARCH_DEEPSEEK4:
@@ -2649,7 +2843,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             filter_mtp,
                             nullptr,
-                            nullptr);
+                            nullptr,
+                            params.leg_devices);
                 } else {
                     res = new llama_kv_cache_dsv4(
                             *this,
@@ -2665,7 +2860,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             1,
                             cparams.n_rs_seq,
                             nullptr,
-                            nullptr);
+                            nullptr,
+                            params.leg_devices);
                 }
             } break;
         case LLM_ARCH_DFLASH:
@@ -2689,7 +2885,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             nullptr,
                             nullptr,
-                            nullptr);
+                            nullptr,
+                            params.leg_devices);
                     break;
                 }
             }
@@ -2720,7 +2917,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             std::max((uint32_t) 1, cparams.n_seq_max),
                             cparams.n_seq_max,
                             cparams.n_rs_seq,
-                            nullptr);
+                            nullptr,
+                            params.leg_devices);
                 } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen && !mtp_on_hybrid_nemotron) {
                     // The main difference between hybrid architectures is the
                     // layer filters, so pick the right one here
@@ -2778,7 +2976,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* leg_devices       */ params.leg_devices);
                     } else if (needs_mem_idx) {
                         // sparse attention over a per-token indexer cache, in its own memory type
                         res = new llama_memory_hybrid_idx(
@@ -2799,7 +2998,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
-                            /* filter_idx        */ std::move(filter_idx));
+                            /* filter_idx        */ std::move(filter_idx),
+                            /* leg_devices       */ params.leg_devices);
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
@@ -2819,7 +3019,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* unified           */ cparams.kv_unified,
                             /* mem_other         */ params.mem_other,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* leg_devices       */ params.leg_devices);
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;
@@ -2907,7 +3108,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     mem_other,
                                     filter,
                                     reuse,
-                                    share);
+                                    share,
+                                    params.leg_devices);
                         } else {
                             res = new llama_kv_cache_iswa(
                                     *this,
@@ -2924,7 +3126,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     mem_share_iswa,
                                     filter,
                                     reuse,
-                                    share);
+                                    share,
+                                    params.leg_devices);
                         }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
@@ -2945,7 +3148,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 mem_share_kv,
                                 filter,
                                 nullptr,
-                                nullptr);
+                                nullptr,
+                                "",
+                                params.leg_devices);
                     }
                 }
             }

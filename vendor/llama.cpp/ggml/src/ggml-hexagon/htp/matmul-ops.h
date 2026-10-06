@@ -20,6 +20,10 @@ extern "C" {
 #define HTP_MM_HMX_MIN_NROWS   4
 
 // --- Weight Repacked Tile Sizes ---
+// Q4_0 weights are packed on the host by ggml_q4_0_tile32_pack, so this must equal
+// GGML_Q4_0_TILE32_SIZE (ggml/src/ggml-q4_0-tile32.h). That header is not included here: it pulls
+// in ggml-quants.h and ggml_fp16_to_fp32, which is a host GGML_API symbol the DSP image does not
+// link. ggml-hexagon.cpp includes both headers and asserts the two sizes against each other.
 #define HTP_MM_WEIGHT_TILE_SIZE_Q4_0   576
 #define HTP_MM_WEIGHT_TILE_SIZE_Q4_1   640
 #define HTP_MM_WEIGHT_TILE_SIZE_Q8_0   1088

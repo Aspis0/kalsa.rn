@@ -4,12 +4,27 @@
 #include "llama-governor-metrics.h"
 #include "llama-governor-policy.h"
 
+#include <limits>
 #include <string>
+#include <vector>
+
+struct llama_governor;
+
+// Device name holding most of a context model's repeating layers, resolved
+// once per context at construction (llama-governor.cpp; used by
+// llama-governor-legs.cpp).
+std::string context_layers_device(llama_context * ctx);
 
 struct llama_governor {
     llama_governor(llama_model * model_prefill, llama_model * model_decode,
                    llama_context_params params_prefill, llama_context_params params_decode);
     explicit llama_governor(llama_governor_params governor_params);
+    // One-model form (F1): legs over ONE shared llama_model, each built with
+    // llama_init_from_model_with_legs. Throws on a load that cannot serve any
+    // leg or lacks the CPU leg; a leg whose device the model does not list is
+    // simply absent.
+    llama_governor(llama_model * model, const llama_governor_leg * legs, uint32_t n_legs,
+                   llama_governor_params governor_params);
     ~llama_governor();
 
     // Threading contract: decode(), set_thermo_profile(),
@@ -39,9 +54,13 @@ struct llama_governor {
     void clear_cache(bool clear_data);
     void reset_prefill_stats();
     bool set_thermo_profile(const llama_governor_thermo_profile & profile, int64_t now_ms);
-    // Decode-hop leg headroom (llama_governor_set_decode_headroom); same
-    // decode-thread contract as set_thermo_profile.
-    bool set_decode_headroom(float cpu_headroom_c, float npu_headroom_c);
+    // Decode-hop leg headroom (llama_governor_set_decode_headroom), gpu =
+    // the one-model third leg (NaN keeps the two-model form); and the
+    // present-leg mask for rule v2. Same decode-thread contract as
+    // set_thermo_profile.
+    bool set_decode_headroom(float cpu_headroom_c, float npu_headroom_c,
+                             float gpu_headroom_c = std::numeric_limits<float>::quiet_NaN());
+    bool set_decode_legs(bool npu, bool gpu, bool cpu);
     // Bench route dev hook: validates mode (0..2) into the policy override.
     // Atomic store only - no stats refresh (threading contract above); it
     // takes effect at the next prefill latch.
@@ -56,6 +75,10 @@ struct llama_governor {
     // which never set it - the binding keys its fallback on exactly that.
     bool is_failed() const { return failed; }
     const char * failure_reason() const { return failure_reason_; }
+
+    // The context of one leg of the one-model form; NULL when the leg is
+    // absent or this is the two-model form.
+    llama_context * leg_ctx(llama_governor_engine engine) const;
 
 private:
     friend llama_governor * llama_governor_init_with_params_internal(
@@ -93,6 +116,52 @@ private:
     int32_t select_decode();
     int32_t decode_impl(llama_batch batch, bool allow_chunking);
     int32_t fail(const char * message);
+
+    // leg/context routing, shared by both forms (llama-governor-legs.cpp):
+    // the accelerator context of today's ctx_prefill role (NPU leg first,
+    // then the GPU leg, then the CPU leg; two-model: ctx_prefill itself,
+    // ctx_decode on the CPU route)
+    llama_context * prefill_ctx(bool cpu_route) const;
+    // the decode context for the selected engine (one-model: its leg, the
+    // CPU leg when absent; two-model: NPU on ctx_prefill, else ctx_decode)
+    llama_context * decode_ctx(llama_governor_engine engine) const;
+    // the side state of a present context; NULL for a foreign pointer
+    side_state * side_of(llama_context * ctx);
+    // every present context with its side state (2 in the two-model form,
+    // 1..3 in the one-model form); returns the count
+    size_t collect_sides(llama_context * ctxs[3], side_state * states[3]);
+    // the engine whose leg owns this context in the one-model form
+    llama_governor_engine leg_engine_of(llama_context * ctx) const;
+    // the engine a decode TARGET runs on (two-model: ctx_prefill = NPU role)
+    llama_governor_engine engine_of_ctx(llama_context * ctx) const;
+    // stats_.decode_hop_pairs index for an unordered engine pair
+    static size_t hop_pair_index(llama_governor_engine a, llama_governor_engine b);
+    // rule v2 availability mask: present legs the floors did not drop
+    void refresh_decode_legs();
+    // turn-local per-leg samples the floor evidence is measured against
+    // (refresh_decode_legs), indexed like llama_governor_engine
+    uint64_t floor_mark_tokens_[3] = {};
+    uint64_t floor_mark_us_[3] = {};
+    // forced-leg rotation (see llama_governor_params::forced_leg_*)
+    void forced_rotate();
+    void init_forced_rotation(const llama_governor_params & governor_params);
+
+    // one-model form storage; empty in the two-model form
+    struct leg {
+        llama_governor_engine engine = llama_governor_engine::CPU;
+        llama_context * ctx = nullptr; // owned
+        side_state state;
+    };
+    std::vector<leg> legs;
+
+    // forced rotation spec, validated from llama_governor_params at
+    // construction; empty means off
+    std::vector<llama_governor_engine> forced_leg_sequence_;
+    uint32_t forced_leg_tokens_ = 0;
+    // window the current forced leg was decided for (UINT32_MAX = none yet);
+    // reset wherever the decode-hop clock resets
+    uint32_t forced_window_ = UINT32_MAX;
+    llama_governor_engine forced_window_engine_ = llama_governor_engine::CPU;
 
     llama_context * ctx_prefill = nullptr;
     llama_context * ctx_decode = nullptr;

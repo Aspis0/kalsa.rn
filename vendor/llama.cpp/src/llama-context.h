@@ -9,6 +9,7 @@
 #include "llama-memory.h"
 
 #include "ggml-cpp.h"
+#include "ggml-hexagon.h"
 #include "ggml-opt.h"
 
 #include <array>
@@ -42,9 +43,12 @@ using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_b
 
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
+    // leg_devices: the fork's leg extension (llama_init_from_model_with_legs),
+    // NULL = build the backends from the model's devices
     llama_context(
             const llama_model & model,
-                  llama_context_params params);
+                  llama_context_params params,
+            const ggml_backend_dev_t * leg_devices = nullptr);
 
     ~llama_context();
 
@@ -120,7 +124,11 @@ struct llama_context {
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
+    bool set_backend_admission(const ggml_hexagon_admission & admission);
     void set_warmup(bool value);
+
+    // sum of the admission generations of every Hexagon device among the backends (0 without one)
+    uint64_t backend_admission_gen() const;
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -367,8 +375,17 @@ private:
 
     bool sched_need_reserve = true;
 
+    // device admission generation this sched was reserved with: a context re-reserves when another
+    // context moved the admission of a shared Hexagon device under it
+    uint64_t sched_admission_gen = 0;
+
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+
+    // the leg's offload devices, null-terminated (fork extension); empty = no
+    // leg, the context follows the model's devices. Owned here: the caller's
+    // array may be a temporary.
+    std::vector<ggml_backend_dev_t> leg_devices;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

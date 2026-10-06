@@ -40,7 +40,11 @@ public:
            llama_memory_t   mem_other,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+                            /* fork: the context's leg devices (NULL-terminated,
+                               NULL = the model's placement); forwarded to the
+                               inner caches */
+        const ggml_backend_dev_t * leg_devices = nullptr);
 
     ~llama_memory_hybrid() = default;
 

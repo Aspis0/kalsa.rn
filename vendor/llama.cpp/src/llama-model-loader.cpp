@@ -1064,11 +1064,28 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
 }
 
 // find the first buffer type in the list that can use the tensor
-static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t * buft_list) {
+static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op,
+                                                     const buft_list_t * buft_list, bool shared_host_f32_only) {
     GGML_ASSERT(!buft_list->empty());
     for (const auto & cur : *buft_list) {
         ggml_backend_dev_t cur_dev = cur.first;
         ggml_backend_buffer_type_t cur_buft = cur.second;
+        // The layer/output lists' shared-weights HOST catch-all exists for the native-layout f32
+        // weights the device's TILE32 probe refuses - the norms, the shortconv conv kernels - and
+        // for no other weight. The entry is a host buft of one device probed under another (the
+        // CPU device), so that pair shape identifies it; a buft without an owner device (the plain
+        // CPU buffer) is not a catch-all. A non-f32 weight it caught would sit in the HOST-W
+        // import's shadow while the CPU still computes it: a Q4_0 matrix under
+        // GGML_HEXAGON_OPFILTER (HTP refuses the probe, the catch-all wins, the GPU leg does not
+        // read Q4_0), a mixed-quant matrix preempting CPU_REPACK, a chunk against the import cap.
+        // F16 is not read in place by any leg either (the HOST leg forms are f32 or Q6_K), so it
+        // keeps the CPU fallback too. The input role passes shared_host_f32_only = false: its
+        // entry pairs the same buft for token_embd itself.
+        if (shared_host_f32_only && tensor->type != GGML_TYPE_F32 &&
+            ggml_backend_buft_is_host(cur_buft) && ggml_backend_buft_get_device(cur_buft) != nullptr &&
+            cur_dev != ggml_backend_buft_get_device(cur_buft)) {
+            continue;
+        }
         if (weight_buft_supported(hparams, tensor, op, cur_buft, cur_dev)) {
             return cur_buft;
         }
@@ -1119,6 +1136,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
 
+    // some models use the token embedding tensor as the output: a TENSOR_DUPLICATED token_embd is
+    // being loaded as the output, and the buffer-type selection and the shared-weights reuse
+    // message both speak of the output role
+    llm_tensor tn_tensor = tn.tensor;
+    if (tn.tensor == LLM_TENSOR_TOKEN_EMBD && (flags & TENSOR_DUPLICATED)) {
+        tn_tensor = LLM_TENSOR_OUTPUT;
+    }
+
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         const ctx_key key { buft, is_lazy };
 
@@ -1159,14 +1184,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             throw std::runtime_error(format("missing tensor '%s'", tn.str().c_str()));
         }
 
-        // some models use the token embedding tensor as the output, but since these are used in different layers and with different ops
-        // the tensor is duplicated
-        // to handle this, we check if the tensor is duplicated, and if so, we assume that it is being loaded as the output tensor
-        llm_tensor tn_tensor = tn.tensor;
-        if (tn.tensor == LLM_TENSOR_TOKEN_EMBD && (flags & TENSOR_DUPLICATED)) {
-            tn_tensor = LLM_TENSOR_OUTPUT;
-        }
-
+        // the duplicated tensor is being loaded under the role computed above (the output)
         llm_tensor_info info;
         try {
             info = llm_tensor_info_for(tn_tensor);
@@ -1214,9 +1232,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         // select the buffer type for this tensor
         const buft_list_t * buft_list;
+        // the input list leads with the shared-weights HOST buft for token_embd itself, any type
+        // the GPU leg reads in place; the layer/output lists carry it as an f32-only catch-all
+        bool shared_host_f32_only = true;
         switch (info.layer) {
             case LLM_TENSOR_LAYER_INPUT:
                 buft_list = buft_list_input;
+                shared_host_f32_only = false;
                 break;
             case LLM_TENSOR_LAYER_OUTPUT:
                 buft_list = buft_list_output;
@@ -1239,7 +1261,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 if (std::regex_search(tensor_name, pattern)) {
                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                         // when overriding to a CPU buffer, consider the extra buffer types
-                        buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+                        buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu, true);
                         if (use_mmap) {
                             static std::once_flag once;
                             std::call_once(once, [] {
@@ -1260,7 +1282,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         if (!buft) {
-            buft = select_weight_buft(hparams, t_meta, op, buft_list);
+            buft = select_weight_buft(hparams, t_meta, op, buft_list, shared_host_f32_only);
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
             }
@@ -1369,6 +1391,38 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
     if (flags & TENSOR_DUPLICATED) {
+        if (shared_weights) {
+            // shared mode: the duplicate would be a second copy of the weight in flight; reuse the
+            // original from any host buffer type context, fail the load otherwise (the binding
+            // falls back to two-copy). The scan runs over every context before deciding: ctx_map is
+            // unordered, so a non-host hit must not preempt a host one.
+            const std::string role = LLM_TN_IMPL(tn.arch, tn_tensor, tn.suffix, tn.bid, tn.xid).str();
+            ggml_tensor * host_t = nullptr;
+            ggml_backend_buffer_type_t host_buft = nullptr;
+            ggml_backend_buffer_type_t other_buft = nullptr;
+            for (const auto & [key, ctx_ptr] : ctx_map) {
+                ggml_tensor * t = ggml_get_tensor(ctx_ptr.get(), tn.str().c_str());
+                if (t == nullptr) {
+                    continue;
+                }
+                if (ggml_backend_buft_is_host(key.buft)) {
+                    host_t = t;
+                    host_buft = key.buft;
+                    break;
+                }
+                other_buft = key.buft;
+            }
+            if (host_t) {
+                if (!shared_reuse_logged) {
+                    LLAMA_LOG_INFO("shared weights: %s reused for %s from %s\n",
+                        ggml_get_name(host_t), role.c_str(), ggml_backend_buft_name(host_buft));
+                    shared_reuse_logged = true;
+                }
+                return host_t;
+            }
+            throw std::runtime_error(format("shared weights: %s would be loaded twice (%s and %s)",
+                tn.str().c_str(), role.c_str(), ggml_backend_buft_name(other_buft ? other_buft : buft)));
+        }
         ggml_tensor * t = ggml_get_tensor(ctx, tn.str().c_str());
         if (t) {
             return t;

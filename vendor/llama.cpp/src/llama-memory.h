@@ -25,6 +25,12 @@ struct llama_memory_params {
     llama_context_type ctx_type;
 
     llama_memory_t mem_other;
+
+    // fork: the context's leg devices (llama_init_from_model_with_legs),
+    // NULL-terminated; NULL = the model's own per-layer device placement.
+    // When set, the per-context buffers (KV, recurrent state) follow the leg's
+    // first device instead of model.dev_layer().
+    const ggml_backend_dev_t * leg_devices = nullptr;
 };
 
 enum llama_memory_status {

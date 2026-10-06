@@ -81,9 +81,12 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// the definition names the leg list `legs` so the member `leg_devices` (the
+// copied, null-terminated list) is the one the body reads
 llama_context::llama_context(
         const llama_model & model,
-              llama_context_params params) :
+              llama_context_params params,
+        const ggml_backend_dev_t * legs) :
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
@@ -96,6 +99,16 @@ llama_context::llama_context(
     t_load_us  = model.t_load_us;
 
     const auto & hparams = model.hparams;
+
+    // copy the leg list including its NULL terminator, so the memory module
+    // and the buffer-type rule can read it as a C array later
+    if (legs) {
+        while (*legs) {
+            leg_devices.push_back(*legs);
+            ++legs;
+        }
+        leg_devices.push_back(nullptr);
+    }
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
@@ -331,11 +344,29 @@ llama_context::llama_context(
     }
 
     if (!hparams.vocab_only) {
+        // the context's offload devices: the leg list when the context was
+        // built with one (llama_init_from_model_with_legs), else the model's
+        // load-time device list
+        std::vector<ggml_backend_dev_t> ctx_devs;
+        if (leg_devices.empty()) {
+            ctx_devs.reserve(model.devices.size());
+            for (const auto & dev : model.devices) {
+                ctx_devs.push_back(dev.dev);
+            }
+        } else {
+            for (ggml_backend_dev_t dev : leg_devices) {
+                if (!dev) {
+                    break;
+                }
+                ctx_devs.push_back(dev);
+            }
+        }
+
         // GPU backends
-        for (const auto & dev : model.devices) {
-            ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
+        for (const auto & dev : ctx_devs) {
+            ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
             if (backend == nullptr) {
-                throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
+                throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
             }
             backends.emplace_back(backend);
         }
@@ -393,6 +424,7 @@ llama_context::llama_context(
             /*.swa_full  =*/ params.swa_full,
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+            /*.leg_devices =*/ leg_devices.empty() ? nullptr : leg_devices.data(),
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -410,12 +442,20 @@ llama_context::llama_context(
             auto * buft = ggml_backend_get_default_buffer_type(backend.get());
             auto backend_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
 
-            if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {
-                // use the host buffer of the first device CPU for faster transfer of the intermediate state
-                const auto & dev = model.devices[0];
-                auto * host_buft = ggml_backend_dev_host_buffer_type(dev.dev);
-                if (host_buft) {
-                    buft = host_buft;
+            if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                // use the host buffer of the first offload device for faster transfer of the intermediate state
+                // (the leg's first device when the context was built with a leg, else the model's first device)
+                ggml_backend_dev_t dev = nullptr;
+                if (!leg_devices.empty()) {
+                    dev = leg_devices[0];
+                } else if (!model.devices.empty()) {
+                    dev = model.devices[0].dev;
+                }
+                if (dev) {
+                    auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
+                    if (host_buft) {
+                        buft = host_buft;
+                    }
                 }
             }
 
@@ -531,8 +571,11 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             ggml_backend_dev_t device_fused = backend_fused ? ggml_backend_get_device(backend_fused) : nullptr;
 
             // TODO: make this descriptor-specific; model.dev_layer() preserves the current behavior,
-            // but is still wrong for cases like --no-kv-offload.
-            ggml_backend_dev_t device_layer = model.dev_layer(node.il);
+            // but is still wrong for cases like --no-kv-offload. With a leg the layer's device is
+            // the leg's first device; the CPU leg runs the layer on this context's CPU backend.
+            ggml_backend_dev_t device_layer = leg_devices.empty() ? model.dev_layer(node.il) :
+                                              leg_devices[0]      ? leg_devices[0] :
+                                              ggml_backend_get_device(backend_cpu);
 
             if (device_fused != device_layer) {
                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
@@ -614,6 +657,14 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
 }
 
 void llama_context::sched_reserve() {
+    const uint64_t admission_gen = backend_admission_gen();
+
+    if (admission_gen != sched_admission_gen) {
+        // another context changed the admission of a shared Hexagon device: this context's reserved sched
+        // and cached graphs were built under the old placement, so it re-reserves too
+        sched_need_reserve = true;
+    }
+
     if (!sched_need_reserve) {
         return;
     }
@@ -765,6 +816,10 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+
+    // the generation captured before the split: a change while it runs is not in this reserve's placement
+    // and must force the next decode to re-reserve
+    sched_admission_gen = admission_gen;
 }
 
 void llama_context::synchronize() {
@@ -1267,6 +1322,39 @@ bool llama_context::get_causal_attn() const {
     return cparams.causal_attn;
 }
 
+bool llama_context::set_backend_admission(const ggml_hexagon_admission & admission) {
+    LLAMA_LOG_DEBUG("%s: offload_min = %lld, offload_ops = %u, gate_min = %lld\n", __func__,
+            (long long) admission.offload_min, admission.offload_ops, (long long) admission.gate_min);
+
+    bool accepted = false;
+    for (auto & backend : backends) {
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get()));
+        auto * set_admission_fn = reg ? (ggml_backend_hexagon_set_admission_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_set_admission") : nullptr;
+        if (!set_admission_fn) {
+            continue;
+        }
+        const int result = set_admission_fn(backend.get(), &admission);
+        accepted |= result >= 0;
+        if (result > 0) {
+            // the op-to-backend assignment changes, so the reserved buffers and the cached graphs are stale
+            sched_need_reserve = true;
+        }
+    }
+    return accepted;
+}
+
+uint64_t llama_context::backend_admission_gen() const {
+    uint64_t gen = 0;
+    for (const auto & backend : backends) {
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get()));
+        auto * gen_fn = reg ? (ggml_backend_hexagon_admission_gen_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_get_admission_gen") : nullptr;
+        if (gen_fn) {
+            gen += gen_fn(backend.get());
+        }
+    }
+    return gen;
+}
+
 void llama_context::set_warmup(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1307,7 +1395,9 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         llama_sampler_chain_n(sampler) > 0;
 
     if (sampler && can_offload) {
-        auto * buft = ggml_backend_dev_buffer_type(model.dev_output());
+        // with a leg the sampler buffer follows the leg's first device; the CPU leg keeps the CPU buffer type
+        auto * output_dev = leg_devices.empty() ? model.dev_output() : leg_devices[0];
+        auto * buft = output_dev ? ggml_backend_dev_buffer_type(output_dev) : ggml_backend_cpu_buffer_type();
 
         sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
 
@@ -2200,7 +2290,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
         auto * buft = ggml_backend_cpu_buffer_type();
         // try to use the host buffer of the device where the output tensor is allocated for faster transfer to system memory
-        auto * output_dev = model.dev_output();
+        // (with a leg: the leg's first device; the CPU leg keeps the CPU buffer type)
+        auto * output_dev = leg_devices.empty() ? model.dev_output() : leg_devices[0];
         auto * output_dev_host_buft = output_dev ? ggml_backend_dev_host_buffer_type(output_dev) : nullptr;
         if (output_dev_host_buft) {
             buft = output_dev_host_buft;
@@ -3813,9 +3904,52 @@ llama_context_params llama_context_default_params() {
 llama_context * llama_init_from_model(
                  llama_model * model,
         llama_context_params   params) {
+    return llama_init_from_model_with_legs(model, params, nullptr);
+}
+
+llama_context * llama_init_from_model_with_legs(
+                 llama_model * model,
+        llama_context_params   params,
+        const ggml_backend_dev_t * leg_devices) {
     if (!model) {
         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
         return nullptr;
+    }
+
+    // the leg devices must all be devices the model was loaded with: a leg
+    // backend that holds no weights could never run a weight op one-copy.
+    // A duplicate would enter the same device twice in the scheduler, and a
+    // CPU entry would double the always-present CPU backend - the CPU leg is
+    // the empty list.
+    std::vector<ggml_backend_dev_t> leg_seen;
+    for (const ggml_backend_dev_t * dev = leg_devices; dev && *dev; ++dev) {
+        if (ggml_backend_dev_type(*dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            LLAMA_LOG_ERROR("%s: leg device %s is a CPU device - the CPU backend is always part of the "
+                            "context; pass the empty list for the CPU leg\n",
+                            __func__, ggml_backend_dev_name(*dev));
+            return nullptr;
+        }
+        for (const auto & seen : leg_seen) {
+            if (seen == *dev) {
+                LLAMA_LOG_ERROR("%s: leg device %s is listed more than once\n", __func__, ggml_backend_dev_name(*dev));
+                return nullptr;
+            }
+        }
+        leg_seen.push_back(*dev);
+
+        bool found = false;
+        for (const auto & model_dev : model->devices) {
+            if (model_dev.dev == *dev) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            LLAMA_LOG_ERROR("%s: leg device %s is not one of the model's devices - a leg device must be "
+                            "one of the llama_model_params::devices the model was loaded with\n",
+                            __func__, ggml_backend_dev_name(*dev));
+            return nullptr;
+        }
     }
 
     if (params.n_batch == 0 && params.n_ubatch == 0) {
@@ -3913,7 +4047,7 @@ llama_context * llama_init_from_model(
     }
 
     try {
-        auto * ctx = new llama_context(*model, params);
+        auto * ctx = new llama_context(*model, params, leg_devices);
         const auto & cparams = ctx->get_cparams();
 
         if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN && cparams.rope_freq_scale != model->hparams.rope_freq_scale_train) {
@@ -4006,6 +4140,11 @@ void llama_set_embeddings(llama_context * ctx, bool embeddings) {
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
+}
+
+bool llama_set_backend_admission(llama_context * ctx, int64_t offload_min, uint32_t offload_ops, int64_t gate_min) {
+    const ggml_hexagon_admission admission = { offload_min, offload_ops, gate_min };
+    return ctx->set_backend_admission(admission);
 }
 
 bool llama_get_causal_attn(const llama_context * ctx) {

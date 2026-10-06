@@ -19,7 +19,8 @@
 // split is not where the bulk of the layers live. dev_layer() is sized to
 // n_layer_all, so a zero-layer model contributes no names instead of throwing.
 // Resolved once per context at construction; decode_impl copies the cached name.
-static std::string context_layers_device(llama_context * ctx) {
+// Shared with llama-governor-legs.cpp (declared in llama-governor.h).
+std::string context_layers_device(llama_context * ctx) {
     const llama_model & model = ctx->get_model();
     std::vector<std::string> layer_devices;
     layer_devices.reserve(model.hparams.n_layer_all);
@@ -37,6 +38,11 @@ llama_governor::llama_governor(llama_model * model_prefill, llama_model * model_
 
 llama_governor::llama_governor(llama_governor_params governor_params)
     : policy_(governor_params), policy_enabled_(true) {
+    // F-08: forced rotation is a one-model proof hook; this test-only form
+    // has no legs to rotate.
+    if (governor_params.forced_leg_tokens != 0) {
+        throw std::runtime_error("forced-leg rotation is a one-model proof hook");
+    }
     stats_.npu_fit = policy_.npu_fit();
     stats_.prefill_token_cap = policy_.prefill_token_cap();
     stats_.expert_substitution_lambda = governor_params.expert_substitution_lambda;
@@ -47,6 +53,12 @@ llama_governor::llama_governor(llama_model * model_prefill, llama_model * model_
                                llama_context_params params_prefill, llama_context_params params_decode,
                                llama_governor_params governor_params, bool policy_enabled)
     : policy_(governor_params), policy_enabled_(policy_enabled) {
+    // F-08: forced rotation is a one-model proof hook; the two-model form
+    // maps NPU to ctx_prefill and everything else to ctx_decode, so a forced
+    // GPU window would be counted as GPU while running on the CPU context.
+    if (governor_params.forced_leg_tokens != 0) {
+        throw std::runtime_error("forced-leg rotation is a one-model proof hook");
+    }
     if (!model_prefill || !model_decode) {
         throw std::runtime_error("governor requires two models");
     }
@@ -83,9 +95,86 @@ llama_governor::llama_governor(llama_model * model_prefill, llama_model * model_
     }
 }
 
+// Decode-leg label for the one-model hop and forced-rotation lines (the
+// two-model form keeps its historical cpu/npu strings on its own code path).
+static const char * engine_label(llama_governor_engine engine) {
+    switch (engine) {
+        case llama_governor_engine::CPU:         return "cpu";
+        case llama_governor_engine::GPU:         return "gpu";
+        case llama_governor_engine::NPU:         return "npu";
+        case llama_governor_engine::GPU_COOLMODE: return "gpu-coolmode";
+    }
+    return "?";
+}
+
 llama_governor::~llama_governor() {
     llama_free(ctx_decode);
     llama_free(ctx_prefill);
+    for (auto & l : legs) {
+        llama_free(l.ctx);
+    }
+}
+
+// Validates and copies the forced-leg rotation spec (llama_governor_params).
+// A nonzero token count with no sequence, or a sequence naming GPU_COOLMODE,
+// is a caller error and turns the governor away at construction.
+void llama_governor::init_forced_rotation(const llama_governor_params & governor_params) {
+    if (governor_params.forced_leg_tokens == 0) {
+        if (governor_params.forced_leg_sequence != nullptr ||
+            governor_params.forced_leg_sequence_n != 0) {
+            LLAMA_LOG_WARN("%s: forced_leg_sequence ignored (forced_leg_tokens is 0)\n", __func__);
+        }
+        return;
+    }
+    if (governor_params.forced_leg_sequence == nullptr || governor_params.forced_leg_sequence_n == 0) {
+        throw std::runtime_error("forced_leg_tokens > 0 requires a forced_leg_sequence");
+    }
+    for (uint32_t i = 0; i < governor_params.forced_leg_sequence_n; ++i) {
+        const auto engine = governor_params.forced_leg_sequence[i];
+        if (engine != llama_governor_engine::CPU &&
+            engine != llama_governor_engine::GPU &&
+            engine != llama_governor_engine::NPU) {
+            throw std::runtime_error("forced_leg_sequence allows only CPU, GPU and NPU");
+        }
+        forced_leg_sequence_.push_back(engine);
+    }
+    forced_leg_tokens_ = governor_params.forced_leg_tokens;
+}
+
+// Forced decode-leg rotation (F5 proof and governor-bench hook): round-robin
+// over the caller's engine sequence, one leg per window of
+// forced_leg_tokens generated tokens, on the same window clock the decode
+// hop uses. decode_impl calls it only after select_decode returned 0, so it
+// overrides exactly the leg that rule chose - a safety state, a thermal wait
+// or a required reload keeps winning. An engine whose leg is absent runs its
+// window on the CPU leg (decode_ctx fallback).
+void llama_governor::forced_rotate() {
+    const uint32_t window = decode_tokens_since_prefill_ / forced_leg_tokens_;
+    if (window != forced_window_) {
+        forced_window_ = window;
+        llama_governor_engine next = forced_leg_sequence_[window % forced_leg_sequence_.size()];
+        if (!legs.empty() && leg_ctx(next) == nullptr) {
+            // keep the log and the stats truthful about where the window runs
+            LLAMA_LOG_WARN("%s: forced leg %s is absent; its windows run on the CPU leg\n",
+                           __func__, engine_label(next));
+            next = llama_governor_engine::CPU;
+        }
+        // One line per leg change, like the policy hop rule; window 0 follows
+        // the prefill-to-decode transition, which logs its own line.
+        if (window > 0 && next != forced_window_engine_) {
+            LLAMA_LOG_INFO("governor: decode hop %s->%s at token %u (forced)\n",
+                           engine_label(forced_window_engine_), engine_label(next),
+                           decode_tokens_since_prefill_);
+        }
+        forced_window_engine_ = next;
+    }
+    // Applied on EVERY call: select_decode just ran and reset the engine to
+    // its own choice, so the override must stand per token, not only at the
+    // window boundary.
+    decode_engine_ = forced_window_engine_;
+    decode_hop_rule_ = "forced";
+    stats_.decode_engine = forced_window_engine_;
+    stats_.decode_requires_reload = false;
 }
 
 bool llama_governor::sequence_end(llama_context * ctx, llama_seq_id seq_id, llama_pos & end) {
@@ -131,7 +220,14 @@ bool llama_governor::commit_side(llama_context * src_ctx, llama_context * dst_ct
             return false;
         }
     }
-    if (end > src.watermark) {
+    // The copy range is [DST.watermark, end) - what the DESTINATION is
+    // missing, not what the source has added since the last commit. With two
+    // contexts the watermarks are equal at every commit (both are set to end
+    // below), so this is the historical behaviour; with three legs a leg
+    // that has not participated yet (watermark 0) receives the whole
+    // sequence, exactly F2's "the first GPU hop after a prefill receives the
+    // entire turn".
+    if (end > dst.watermark) {
         size_t copied_bytes = 0;
         // Keep staged selection on the same v_trans predicate used by mirror(); otherwise
         // FA-enabled caches would be counted as staged while copying V naively.
@@ -141,7 +237,7 @@ bool llama_governor::commit_side(llama_context * src_ctx, llama_context * dst_ct
         const int64_t t0 = ggml_time_us();
         bool ok = false;
         try {
-            ok = llama_kv_commit_with_stats(dst_ctx, src_ctx, 0, src.watermark, end,
+            ok = llama_kv_commit_with_stats(dst_ctx, src_ctx, 0, dst.watermark, end,
                                             &copied_bytes, mode, &commit_stats);
         } catch (const std::exception & e) {
             // The OpenCL set_tensor path throws on device OOM (86f602f8a). An
@@ -205,13 +301,14 @@ bool llama_governor::trim_sequence(llama_pos p) {
     if (failed) {
         return false;
     }
-    struct side_t { llama_context * ctx; side_state * state; };
-    const side_t sides[2] = { { ctx_prefill, &prefill_state }, { ctx_decode, &decode_state } };
+    llama_context * side_ctxs[3];
+    side_state * side_states[3];
+    const size_t n_sides = collect_sides(side_ctxs, side_states);
 
     bool exact = true;
-    bool untrimmable[2] = { false, false };
-    for (int i = 0; i < 2; ++i) {
-        llama_memory_t mem = llama_get_memory(sides[i].ctx);
+    bool untrimmable[3] = { false, false, false };
+    for (size_t i = 0; i < n_sides; ++i) {
+        llama_memory_t mem = llama_get_memory(side_ctxs[i]);
         // WHY pos_max decides here and not seq_rm's return value: for a shared
         // KV view seq_rm answers true without removing anything (the shared
         // early return in llama-kv-cache.cpp:427), so a "true" there never means
@@ -227,27 +324,28 @@ bool llama_governor::trim_sequence(llama_pos p) {
         }
     }
     if (exact) {
-        for (int i = 0; i < 2; ++i) {
-            sides[i].state->watermark = std::min(sides[i].state->watermark, p);
+        for (size_t i = 0; i < n_sides; ++i) {
+            side_states[i]->watermark = std::min(side_states[i]->watermark, p);
         }
         return true;
     }
 
     // A partial rewind is inexpressible on at least one side. Drop that
-    // side's whole sequence and zero BOTH watermarks, so the next handoff
+    // side's whole sequence and zero EVERY watermark, so the next handoff
     // re-commits [0, end) attention cells and the wholesale recurrent state
     // from the rewound side (llama-hybrid-commit.cpp) instead of letting
     // commit_side adopt the stale side.
-    for (int i = 0; i < 2; ++i) {
+    for (size_t i = 0; i < n_sides; ++i) {
         if (!untrimmable[i]) { continue; }
-        llama_memory_t mem = llama_get_memory(sides[i].ctx);
+        llama_memory_t mem = llama_get_memory(side_ctxs[i]);
         llama_memory_seq_rm(mem, 0, -1, -1);
         if (llama_memory_seq_pos_max(mem, 0) != -1) {
             return false;
         }
     }
-    prefill_state.watermark = 0;
-    decode_state.watermark = 0;
+    for (size_t i = 0; i < n_sides; ++i) {
+        side_states[i]->watermark = 0;
+    }
     return true;
 }
 
@@ -288,7 +386,12 @@ int32_t llama_governor::decode_impl(llama_batch batch, bool allow_chunking) {
     if (is_prefill && allow_chunking && last_phase != phase::Prefill) {
         prefill_route_ = prefill_route::Undecided;
         decode_tokens_since_prefill_ = 0;
+        forced_window_ = UINT32_MAX;
         policy_.reset_decode_hop();
+        // each turn re-checks the floors against the legs' measured rates
+        if (!legs.empty()) {
+            refresh_decode_legs();
+        }
     }
 
     if (policy_enabled_) {
@@ -297,18 +400,24 @@ int32_t llama_governor::decode_impl(llama_batch batch, bool allow_chunking) {
         if (policy_rc != 0) {
             return policy_rc == k_prefill_chunked ? 0 : policy_rc;
         }
+        // Proof hook (F-07): the forced rotation replaces ONLY the leg choice
+        // select_decode just made - the thermal wait/abort and reload gates
+        // inside it have already spoken and win. Off (0) nothing changes.
+        if (!is_prefill && forced_leg_tokens_ > 0) {
+            forced_rotate();
+        }
     }
 
     // The target context is chosen by (phase, prefill route, decode engine):
     // decode on the NPU is decode on ctx_prefill, the HTP-pinned context when
     // the lane is resolved - the binding forces matching q8_0 KV on both
     // contexts, so a committed cache is directly readable on either side and
-    // a hop never needs a reload.
+    // a hop never needs a reload. The one-model form routes the same roles
+    // through its legs (prefill_ctx / decode_ctx, llama-governor-legs.cpp).
     const bool cpu_prefill = is_prefill && prefill_route_ == prefill_route::CPU;
-    const bool npu_decode = !is_prefill && decode_engine_ == llama_governor_engine::NPU;
-    llama_context * target = is_prefill ? (cpu_prefill ? ctx_decode : ctx_prefill)
-                                        : (npu_decode ? ctx_prefill : ctx_decode);
-    side_state * state = target == ctx_prefill ? &prefill_state : &decode_state;
+    llama_context * target = is_prefill ? prefill_ctx(cpu_prefill)
+                                        : decode_ctx(decode_engine_);
+    side_state * state = side_of(target);
     const phase next_phase = is_prefill ? phase::Prefill : phase::Decode;
 
     if (is_prefill && last_phase != phase::Prefill) {
@@ -318,7 +427,7 @@ int32_t llama_governor::decode_impl(llama_batch batch, bool allow_chunking) {
         record_tally();
     }
 
-    // One switch, one commit: whenever a batch moves to the other context the
+    // One switch, one commit: whenever a batch moves to another context the
     // KV follows it - the prefill<->decode handoffs and the mid-turn decode
     // hops are the same event on this one code path (this also covers the
     // CPU-route prefill that follows a GPU prewarm: a prefill route switch
@@ -327,35 +436,53 @@ int32_t llama_governor::decode_impl(llama_batch batch, bool allow_chunking) {
     // stay on their context and never commit.
     const bool decode_hop = !is_prefill && last_phase == phase::Decode && target != last_ctx;
     if (last_ctx != nullptr && target != last_ctx) {
-        // Name the decider in the hop label ("... (headroom)"/"... (alternation)");
-        // a safety exit that moves the work keeps the bare direction.
+        // Name the decider in the hop label ("... (headroom)"/"... (alternation)"/
+        // "... (forced)"); a safety exit that moves the work keeps the bare direction.
         char hop_direction[64];
-        const char * direction = is_prefill
-            ? (last_phase == phase::Decode ? "decode-to-prefill" : "prefill route switch")
-            : last_phase == phase::Decode
-                ? (npu_decode ? "decode hop cpu-to-npu" : "decode hop npu-to-cpu")
-                : "prefill-to-decode";
-        if (decode_hop && decode_hop_rule_ != nullptr) {
-            std::snprintf(hop_direction, sizeof(hop_direction), "%s (%s)",
-                          direction, decode_hop_rule_);
-            direction = hop_direction;
+        char hop_labeled[96];
+        const char * direction = nullptr;
+        if (is_prefill) {
+            direction = last_phase == phase::Decode ? "decode-to-prefill" : "prefill route switch";
+        } else if (last_phase == phase::Decode) {
+            if (!legs.empty()) {
+                std::snprintf(hop_direction, sizeof(hop_direction), "decode hop %s->%s",
+                              engine_label(leg_engine_of(last_ctx)), engine_label(decode_engine_));
+                direction = hop_direction;
+            } else {
+                direction = decode_engine_ == llama_governor_engine::NPU
+                    ? "decode hop cpu-to-npu" : "decode hop npu-to-cpu";
+            }
+        } else {
+            direction = "prefill-to-decode";
         }
-        side_state & src = last_ctx == ctx_prefill ? prefill_state : decode_state;
+        if (decode_hop && decode_hop_rule_ != nullptr) {
+            // hop_labeled, not hop_direction: direction may point into it
+            std::snprintf(hop_labeled, sizeof(hop_labeled), "%s (%s)",
+                          direction, decode_hop_rule_);
+            direction = hop_labeled;
+        }
+        side_state * src = side_of(last_ctx);
         const uint64_t commit_bytes_before = stats_.commit_bytes;
         const uint64_t commit_us_before = stats_.commit_us;
-        if (!commit_side(last_ctx, target, src, *state, direction)) {
+        if (!commit_side(last_ctx, target, *src, *state, direction)) {
             // commit_side may already have latched a specific reason (the KV
             // commit catch); keep it instead of overwriting with the generic
             // route Reject.
             return failed ? -1 : fail("route Reject during context switch");
         }
         if (decode_hop) {
-            stats_.decode_hop_commit_bytes += stats_.commit_bytes - commit_bytes_before;
-            stats_.decode_hop_commit_us += stats_.commit_us - commit_us_before;
+            const uint64_t bytes = stats_.commit_bytes - commit_bytes_before;
+            const uint64_t us = stats_.commit_us - commit_us_before;
+            stats_.decode_hop_commit_bytes += bytes;
+            stats_.decode_hop_commit_us += us;
+            auto & pair = stats_.decode_hop_pairs[hop_pair_index(engine_of_ctx(last_ctx), decode_engine_)];
+            ++pair.hops;
+            pair.commit_bytes += bytes;
+            pair.commit_us += us;
         }
     }
 
-    const int64_t t0 = is_prefill ? ggml_time_us() : 0;
+    const int64_t t0 = ggml_time_us();
     const int32_t rc = llama_decode(target, batch);
     if (rc != 0) {
         LLAMA_LOG_ERROR("%s: llama_decode failed with rc=%d\n", __func__, rc);
@@ -405,10 +532,23 @@ int32_t llama_governor::decode_impl(llama_batch batch, bool allow_chunking) {
     }
     if (!is_prefill) {
         ++decode_tokens_since_prefill_;
-        if (npu_decode) {
-            stats_.decode_tokens_npu += batch.n_tokens;
-        } else {
-            stats_.decode_tokens_cpu += batch.n_tokens;
+        const uint64_t decode_us = static_cast<uint64_t>(ggml_time_us() - t0);
+        // GPU is a decode engine only in the one-model form (the v2 hop rule
+        // or forced rotation); the two-model router never selects it for
+        // decode without a reload, so its counting is unchanged.
+        switch (decode_engine_) {
+            case llama_governor_engine::NPU:
+                stats_.decode_tokens_npu += batch.n_tokens;
+                stats_.decode_us_npu += decode_us;
+                break;
+            case llama_governor_engine::GPU:
+                stats_.decode_tokens_gpu += batch.n_tokens;
+                stats_.decode_us_gpu += decode_us;
+                break;
+            default:
+                stats_.decode_tokens_cpu += batch.n_tokens;
+                stats_.decode_us_cpu += decode_us;
+                break;
         }
     }
     last_ctx = target;

@@ -82,7 +82,8 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-             const char *   name_tag) :
+             const char *   name_tag,
+    const ggml_backend_dev_t * leg_devices) :
     model(model), hparams(hparams), v_trans(v_trans),
     cache_type_k(type_k), cache_type_v(type_v),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
@@ -242,7 +243,21 @@ llama_kv_cache::llama_kv_cache(
                     }
 
                     bool allowed = false;
-                    for (const auto & dev : model.devices) {
+                    // the check runs against this context's own device set:
+                    // the leg list when the cache was built for a leg context,
+                    // else the model's devices
+                    std::vector<ggml_backend_dev_t> ctx_devs;
+                    if (leg_devices) {
+                        for (const ggml_backend_dev_t * d = leg_devices; *d; ++d) {
+                            ctx_devs.push_back(*d);
+                        }
+                    } else {
+                        ctx_devs.reserve(model.devices.size());
+                        for (const auto & dev : model.devices) {
+                            ctx_devs.push_back(dev.dev);
+                        }
+                    }
+                    for (const auto & dev : ctx_devs) {
                         // a meta device accepts only its own buffer type, and
                         // only when the buft's device is a meta device wrapping
                         // the identical device set (ggml-backend-meta.cpp
@@ -250,7 +265,7 @@ llama_kv_cache::llama_kv_cache(
                         // exactly the tensor-split case: model.devices holds
                         // the one meta device and the shared K/V buffers are
                         // allocated from its buffer type.
-                        if (ggml_backend_dev_supports_buft(dev.dev, buft)) {
+                        if (ggml_backend_dev_supports_buft(dev, buft)) {
                             allowed = true;
                             break;
                         }
@@ -258,11 +273,11 @@ llama_kv_cache::llama_kv_cache(
 
                     if (!allowed) {
                         std::string mine;
-                        for (const auto & dev : model.devices) {
+                        for (const auto & dev : ctx_devs) {
                             if (!mine.empty()) {
                                 mine += ", ";
                             }
-                            mine += ggml_backend_dev_name(dev.dev);
+                            mine += ggml_backend_dev_name(dev);
                         }
                         if (mine.empty()) {
                             mine = "CPU";
@@ -313,10 +328,15 @@ llama_kv_cache::llama_kv_cache(
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
         if (offload) {
-            auto * dev = model.dev_layer(il);
-            buft = ggml_backend_dev_buffer_type(dev);
+            // fork leg rule: a leg context (llama_init_from_model_with_legs)
+            // pins every offloaded layer's cache to its first leg device; the
+            // CPU leg (empty list) keeps the CPU buffer type
+            auto * dev = leg_devices ? leg_devices[0] : model.dev_layer(il);
+            if (dev) {
+                buft = ggml_backend_dev_buffer_type(dev);
 
-            dev_name = ggml_backend_dev_name(dev);
+                dev_name = ggml_backend_dev_name(dev);
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);

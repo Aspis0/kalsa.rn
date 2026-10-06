@@ -42,6 +42,16 @@ extern "C" {
     GGML_API bool                  ggml_backend_buft_is_host       (ggml_backend_buffer_type_t buft);
     GGML_API ggml_backend_dev_t    ggml_backend_buft_get_device    (ggml_backend_buffer_type_t buft);
 
+    // weight byte layout a buffer type stores. NATIVE means ggml_nbytes bytes in the standard
+    // ggml layout for the tensor type; anything else is opaque to every reader that does not
+    // opt in through this enum (the CPU reads Q4_0_TILE32 through its tile32 dispatch).
+    enum ggml_backend_weight_layout {
+        GGML_WEIGHT_LAYOUT_NATIVE = 0,
+        GGML_WEIGHT_LAYOUT_Q4_0_TILE32,
+    };
+
+    GGML_API enum ggml_backend_weight_layout ggml_backend_buft_weight_layout(ggml_backend_buffer_type_t buft);
+
     //
     // Backend buffer
     //

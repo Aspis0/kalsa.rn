@@ -28,9 +28,11 @@ set(LLAMA_CORE_SOURCES
     llama-kv-staged.cpp
     llama-hybrid-commit.cpp
     llama-governor.cpp
+    llama-governor-legs.cpp
     llama-governor-runtime.cpp
     llama-governor-metrics.cpp
     llama-governor-policy.cpp
+    llama-governor-policy-hop.cpp
     llama-governor-device.cpp
     llama-kv-cache-iswa.cpp
     llama-kv-cache-dsa.cpp

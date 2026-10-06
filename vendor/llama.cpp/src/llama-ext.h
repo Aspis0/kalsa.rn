@@ -7,6 +7,7 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <limits>
 #include <map>
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
@@ -160,6 +161,60 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
+/** Fork extension (one model, one context per decode "leg"): construct a context whose device
+ *  set is an explicit leg over the shared llama_model, instead of the model's load-time device
+ *  list. Several contexts (legs) can live over one llama_model, each with its own backends,
+ *  scheduler and memory; the model's weight buffers are neither duplicated nor moved.
+ *
+ *  leg_devices is a NULL-terminated array of devices:
+ *    - NULL      = today's behaviour exactly (the context builds its backends from the model's
+ *                  devices);
+ *    - {NULL}    = the CPU leg (no offload device; the context runs entirely on CPU);
+ *    - otherwise = the leg's offload devices, in order, each listed at most once and never a
+ *                  CPU device (the CPU backend is always part of the context; the CPU leg is
+ *                  the empty list). Every device must be one of the model's devices, else the
+ *                  call fails. The context's backends are these devices plus the always-present
+ *                  CPU backend; the FIRST device owns the leg's per-context buffers (KV cache,
+ *                  recurrent state, output), where today they follow the model's per-layer
+ *                  placement.
+ *
+ *  Load contract: "one of the model's devices" means the model's load list must name every
+ *  device some leg will pick. The one-copy three-leg load lists devices {HTP0, GPUOpenCL} with
+ *  n_gpu_layers covering all layers and tensor_split {1, 0} - every layer on HTP0, GPUOpenCL
+ *  in the list but holding none (the load the S23 J(1) arm already uses) - and the legs pick
+ *  {HTP0, GPUOpenCL}, {GPUOpenCL} and {} from that list. The NPU leg keeps HTP0 first (its KV
+ *  and per-context buffers follow HTP0) and carries GPUOpenCL second so OpenCL takes what the
+ *  HTP refuses - the tied Q6_K lm_head stays one flat copy in HTP0-HOST-W and is read in place
+ *  by the GPU's AoS kernel inside the NPU decode (owner decision 2026-10-05: an NPU decode on
+ *  the shared copy REQUIRES the OpenCL HOST leg; without it the lm_head falls back to the CPU
+ *  and the leg is not the J(1) configuration).
+ *
+ *  Shared-model rule: every leg over one model must pass identical rope/YaRN context params
+ *  (rope_scaling_type, rope_freq_scale, yarn_orig_ctx). Context initialization keeps an
+ *  upstream behaviour that writes into the shared model: a custom YaRN rescale adjusts
+ *  model->hparams.n_ctx_train (see llama_init_from_model_with_legs). Legs with differing YaRN
+ *  values would each rewrite that one field - the last-constructed leg wins silently - so they
+ *  must agree up front.
+ *
+ *  Returns NULL on failure, like llama_init_from_model. */
+LLAMA_API llama_context * llama_init_from_model_with_legs(
+        llama_model * model,
+        llama_context_params params,
+        const ggml_backend_dev_t * leg_devices);
+
+/** Per-phase admission of the Hexagon backend the context runs on (one weight copy). `offload_min` is the
+ *  number of tokens an op needs before a host weight offloads it (>= 1); `offload_ops` a bitmask of the
+ *  GGML_HEXAGON_ADMIT_* op kinds a host weight may offload, 0..7 (0 = offload nothing), from
+ *  ggml-hexagon.h; `gate_min` the number of tokens any CPU-runnable op needs to be supported by the
+ *  Hexagon backend (0 = gate off). Returns true if a backend of the context accepted the call (the values
+ *  were valid); false if none has the setter (CPU/GPU-only context) or the values were invalid. When a
+ *  backend's admission changed, the scheduler is re-reserved at the next llama_decode (about 0.1 s on the
+ *  S23: call it at a lane change, never per phase). The admission belongs to the device, so every context
+ *  on that device re-reserves at its next decode. Must not run concurrently with a reserve, split or
+ *  decode on any context of the same device: the governor calls it from its single decode thread, between
+ *  phases. */
+LLAMA_API bool llama_set_backend_admission(struct llama_context * ctx, int64_t offload_min, uint32_t offload_ops, int64_t gate_min);
+
 enum class llama_kv_route {
     Direct,
     MirrorAndCopy,
@@ -266,6 +321,28 @@ struct llama_governor_params {
     // every decode_hop_tokens generated tokens (policy select_decode); 0
     // keeps CPU-only decode.
     uint32_t decode_hop_tokens = 0;
+    // Rule v2, three legs (one-model governor): per-leg availability floors
+    // in tok/s - a leg whose measured decode rate falls below its floor is
+    // dropped from the hop candidates (0 = no floor, today's behaviour). The
+    // heat-per-token weighting (battery C*s/token from the lab; NPU 0.15-0.17,
+    // CPU 0.30, GPU 0.35-0.42) subtracts weight*heat from a leg's effective
+    // headroom; the weight defaults to 0 = pure headroom = the v1 rule.
+    float decode_floor_tps_npu = 0;
+    float decode_floor_tps_gpu = 0;
+    float decode_floor_tps_cpu = 0;
+    float decode_heat_weight = 0;
+    float decode_heat_per_token_npu = 0;
+    float decode_heat_per_token_gpu = 0;
+    float decode_heat_per_token_cpu = 0;
+    // Forced decode-leg rotation (F5 proof hook; off by default): when
+    // forced_leg_tokens > 0, decode follows forced_leg_sequence
+    // (engines CPU/GPU/NPU) round-robin, one engine per window of
+    // forced_leg_tokens generated tokens, overriding select_decode's rule.
+    // An engine whose leg is absent runs its window on the CPU leg. NULL/0
+    // with a nonzero token count is invalid; 0 keeps today's behaviour.
+    const llama_governor_engine * forced_leg_sequence = nullptr;
+    uint32_t forced_leg_sequence_n = 0;
+    uint32_t forced_leg_tokens = 0;
 };
 
 /** One successful battery poll. Temperature is the dumpsys tenths-of-degrees-C
@@ -399,9 +476,25 @@ struct llama_governor_stats {
     uint64_t decode_hops = 0;
     uint64_t decode_tokens_cpu = 0;
     uint64_t decode_tokens_npu = 0;
+    uint64_t decode_tokens_gpu = 0;   // one-model governor legs only (forced rotation)
+    uint64_t decode_us_cpu = 0;       // per-leg decode time (one-model legs / rotation)
+    uint64_t decode_us_npu = 0;
+    uint64_t decode_us_gpu = 0;
+    // hops and their commit cost per leg PAIR (unordered): 0 = NPU<->GPU,
+    // 1 = NPU<->CPU, 2 = GPU<->CPU
+    struct llama_governor_hop_pair {
+        uint64_t hops = 0;
+        uint64_t commit_bytes = 0;
+        uint64_t commit_us = 0;
+    };
+    llama_governor_hop_pair decode_hop_pairs[3];
     uint64_t decode_hop_commit_bytes = 0;
     uint64_t decode_hop_commit_us = 0;
     uint64_t decode_hop_headroom_windows = 0;
+    // the label of the last window decision ("headroom"/"alternation";
+    // string literal, null while no window has been decided) - what a
+    // free-running run prints as the reason per leg change
+    const char * decode_hop_rule = nullptr;
     uint64_t stall_union_us = 0;
     uint64_t prefill_cpu_us = 0;
     uint64_t prefill_read_bytes = 0;
@@ -467,6 +560,40 @@ LLAMA_API struct llama_governor * llama_governor_init_with_params(
         struct llama_context_params params_decode,
         struct llama_governor_params governor_params);
 
+/** One leg of the one-model governor: the engine the leg serves, the leg's
+ *  device list (llama_init_from_model_with_legs) and its context params.
+ *  The CPU leg ignores `devices` and is always the empty list; an NPU or GPU
+ *  leg with devices == NULL is simply absent, and a leg whose first device
+ *  the model does not list is absent too - the governor works with any
+ *  subset that includes the CPU leg. GPU_COOLMODE is a decode state, not a
+ *  leg. Params the legs must share (rope/YaRN) follow the
+ *  llama_init_from_model_with_legs shared-model rule. */
+struct llama_governor_leg {
+    llama_governor_engine engine = llama_governor_engine::CPU;
+    const ggml_backend_dev_t * devices = nullptr;
+    llama_context_params params;
+};
+
+/** The one-model governor (F1): one shared llama_model, one context per leg
+ *  built with llama_init_from_model_with_legs. The model handle is borrowed
+ *  for the governor lifetime. Prefill runs where it runs in the two-model
+ *  form (the NPU leg plays the ctx_prefill role, the GPU leg when there is
+ *  no NPU, the CPU leg on the CPU route); decode follows the router, which
+ *  the forced-leg rotation (llama_governor_params) can override. Returns
+ *  NULL with a logged reason when no legs could be built or the CPU leg is
+ *  missing. */
+LLAMA_API struct llama_governor * llama_governor_init_one_model_with_params(
+        struct llama_model * model,
+        const struct llama_governor_leg * legs,
+        uint32_t n_legs,
+        struct llama_governor_params governor_params);
+
+/** The context of one leg of a one-model governor; NULL when the leg is
+ *  absent or the governor is the two-model form. */
+LLAMA_API struct llama_context * llama_governor_leg_ctx(
+        const struct llama_governor * governor,
+        llama_governor_engine engine);
+
 LLAMA_API void llama_governor_free(struct llama_governor * governor);
 
 /**
@@ -500,15 +627,30 @@ LLAMA_API bool llama_governor_set_thermo_profile(
 
 /** Update the decode-hop thermal headroom: for each leg, the margin in C
  *  between that leg's temperature and its first passive trip (the binding
- *  samples its thermal zones). NaN = unknown leg; with either leg unknown
- *  the hop falls back to the odd/even alternation, with both known it opens
- *  every decode on the NPU and moves a window only when the other leg's
- *  headroom outruns the current one by the policy hysteresis (see
- *  select_decode). Same decode-thread contract as set_thermo_profile. */
+ *  samples its thermal zones). NaN = unknown leg; with any present leg
+ *  unknown the hop falls back to the fixed alternation, with all known it
+ *  opens every decode on the NPU and moves a window only when another leg's
+ *  effective headroom leads by the policy hysteresis (see select_decode).
+ *  The gpu leg is the one-model governor's third leg; the two-value call
+ *  keeps it NaN, which is exactly right for the two-model form. Same
+ *  decode-thread contract as set_thermo_profile. */
 LLAMA_API bool llama_governor_set_decode_headroom(
         struct llama_governor * governor,
         float cpu_headroom_c,
-        float npu_headroom_c);
+        float npu_headroom_c,
+        float gpu_headroom_c = std::numeric_limits<float>::quiet_NaN());
+
+/** Declare which decode legs exist and may hop (rule v2): the one-model
+ *  governor sets this from its leg table (a leg the floors dropped is
+ *  excluded); the default is NPU+CPU, the two-model form's set. The cpu
+ *  flag is accepted for symmetry but the CPU leg is never excludable - it
+ *  is the fallback that always exists. Same decode-thread contract as
+ *  set_thermo_profile. */
+LLAMA_API bool llama_governor_set_decode_legs(
+        struct llama_governor * governor,
+        bool npu,
+        bool gpu,
+        bool cpu);
 
 /** Dev hook (/bench route): set the per-governor prefill override.
  *  mode: 0=auto (clears), 1=cpu, 2=gpu. Safe to call while another thread

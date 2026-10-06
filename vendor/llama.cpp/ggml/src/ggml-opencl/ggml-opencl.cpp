@@ -13,6 +13,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml.h"
 #include "../ggml-quants.h"
+#include "../ggml-q4_0-tile32.h"
 
 #include "cl-program-cache.h"
 
@@ -61,11 +62,15 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 
 #include "ggml-opencl-kalsa-diag.h"
+#include "ggml-opencl-tile32.h"
+#include "ggml-opencl-tile32-host.h"
 
 
 #define UNUSED(x) (void)(x)
 
-#define CL_CHECK(err)                                               \
+// The hard contract: a failed OpenCL call aborts. Used everywhere except the body of
+// load_cl_kernels, which swaps in CL_CHECK_DECLINE below.
+#define CL_CHECK_ABORT(err)                                         \
     do {                                                            \
         cl_int err_ = (err);                                        \
         if (err_ != CL_SUCCESS) {                                   \
@@ -74,6 +79,23 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
             GGML_ASSERT(0);                                         \
         }                                                           \
     } while (0)
+
+// Amendment I (P2-8): load_cl_kernels is reached from env_fill, the leg's admission probe,
+// during model load, where a kernel-creation failure must decline the leg instead of killing
+// the process. This form poisons the (device, driver) pair and returns from the void loader;
+// every other caller keeps the hard contract above.
+#define CL_CHECK_DECLINE(backend_ctx, err)                          \
+    do {                                                            \
+        cl_int err_ = (err);                                        \
+        if (err_ != CL_SUCCESS) {                                   \
+            GGML_LOG_ERROR("ggml_opencl: %s error %d at %s:%d\n",  \
+                #err, err_, __FILE__, __LINE__);                    \
+            (backend_ctx)->kernel_build_failed = true;              \
+            return;                                                 \
+        }                                                           \
+    } while (0)
+
+#define CL_CHECK(err) CL_CHECK_ABORT(err)
 
 //------------------------------------------------------------------------------
 // OpenCL
@@ -666,10 +688,15 @@ struct ggml_backend_opencl_context {
 
     std::string driver_version;
 
+    // CL_DEVICE_VERSION: the Adreno model number lives here on devices whose CL_DEVICE_NAME
+    // is only the vendor string (S23: "QUALCOMM Adreno(TM)" vs "OpenCL 3.0 Adreno(TM) 740").
+    std::string device_version;
+
     GPU_FAMILY gpu_family;
     ADRENO_GPU_GEN adreno_gen;
 
     cl_int alignment;
+    cl_uint image_base_align = 0;   // CL_DEVICE_IMAGE_BASE_ADDRESS_ALIGNMENT, bytes
     size_t global_mem_size;
     size_t max_alloc_size;
     size_t max_workgroup_size;
@@ -678,6 +705,9 @@ struct ggml_backend_opencl_context {
     bool has_subgroup_shuffle = false;       // cl_khr_subgroup_shuffle or cl_qcom_subgroup_shuffle
     bool has_integer_dot      = false;       // cl_khr_integer_dot_product or cl_qcom_dot_product8
     bool has_qcom_subgroup_shuffle = false;  // specifically cl_qcom_subgroup_shuffle
+    // TILE32 weight leg (Amendment E4): both halves of the ext-host-ptr import route
+    bool has_qcom_dmabuf_host_ptr = false;
+    bool has_qcom_ext_host_ptr    = false;
     bool disable_fusion;
     bool fuse_mm_glu = true;                     // opt-out GGML_OPENCL_FUSE_MM_GLU=0 (byte-identical gate+up GEMV + GLU, q4_K FFN)
     bool fuse_rms_add = true;                    // opt-out GGML_OPENCL_FUSE_RMS_ADD=0 (fused rms_norm*w + residual)
@@ -974,6 +1004,10 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_q5_K_f32_flat;
     cl_kernel kernel_mul_mv_q6_K_f32;
     cl_kernel kernel_mul_mv_q6_K_f32_flat;
+    // The HOST leg's optional AoS Q6_K arm: the leg fills it on first ask through the env's
+    // build hook, and this context owns and releases it in free(). Deliberately not built by
+    // load_cl_kernels: the arm may fail without taking the kernel set down.
+    struct ggml_opencl_host_q6k_aos host_q6k_aos;
     cl_kernel kernel_mul_mv_mxfp4_f32, kernel_mul_mv_mxfp4_f32_flat;
     cl_kernel kernel_mul_mv_q8_0_f32, kernel_mul_mv_q8_0_f32_flat;
     cl_kernel kernel_mul_mv_iq4_nl_f32;
@@ -1326,6 +1360,12 @@ struct ggml_backend_opencl_context {
             write_profiling_info();
             profiling_results.clear();
 #endif
+            // The HOST leg's AoS arm belongs to this context - a kernel cannot outlive its
+            // cl_context - and the handles are cleared so a later init on this same object
+            // cannot plan a kernel this context has released. The drop flag stays: it is this
+            // context's verdict.
+            if (host_q6k_aos.kernel)  { CL_CHECK(clReleaseKernel(host_q6k_aos.kernel));   host_q6k_aos.kernel = nullptr; }
+            if (host_q6k_aos.program) { CL_CHECK(clReleaseProgram(host_q6k_aos.program)); host_q6k_aos.program = nullptr; }
             // release pooled image1d_buffer views over KV cache layers.
             for (auto & kv : kq_img_pool) {
                 if (kv.second.image)      { CL_CHECK(clReleaseMemObject(kv.second.image)); }
@@ -1619,7 +1659,19 @@ inline bool kalsa_cok_acc_f32() {
     return value;
 }
 
+// Amendment I (P2-8): the body of load_cl_kernels uses the declining CL_CHECK - the loader is
+// reached from the leg's admission probe during model load, where no leg may cost the process.
+// The swap covers exactly this function body; every other caller keeps CL_CHECK_ABORT.
+#undef  CL_CHECK
+#define CL_CHECK(err) CL_CHECK_DECLINE(backend_ctx, err)
+
 static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+    // env_fill now reaches this loader from a placement probe, so the first load can race the
+    // buffer allocator's call (and a second device's support probe). The mutex makes the first
+    // load the only one; the flags make every later call a no-op.
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
     if (backend_ctx->kernels_loaded || backend_ctx->kernel_build_failed) {
         return;
     }
@@ -5874,6 +5926,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     ggml_opencl_log_alloc_note("load_cl_kernels.done");
 }
 
+#undef  CL_CHECK
+#define CL_CHECK(err) CL_CHECK_ABORT(err)
+
 static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev);
 static bool ggml_opencl_is_device_supported(ggml_backend_dev_t dev);
 
@@ -7219,7 +7274,8 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     }
 
     // Populate backend device name
-    backend_ctx->device_name = dev_ctx->device_name;
+    backend_ctx->device_name    = dev_ctx->device_name;
+    backend_ctx->device_version = dev_ctx->device_version;
 
     // A local ref of cl_device_id for convenience
     cl_device_id device = backend_ctx->device;
@@ -7271,6 +7327,9 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     // check Adreno large buffer support
     backend_ctx->adreno_has_large_buffer = strstr(ext_buffer, "cl_qcom_large_buffer") != NULL;
 
+    backend_ctx->has_qcom_dmabuf_host_ptr = strstr(ext_buffer, "cl_qcom_dmabuf_host_ptr") != NULL;
+    backend_ctx->has_qcom_ext_host_ptr    = strstr(ext_buffer, "cl_qcom_ext_host_ptr") != NULL;
+
     // subgroup shuffle support (N_SPLIT>1 FA kernel)
     backend_ctx->has_qcom_subgroup_shuffle = strstr(ext_buffer, "cl_qcom_subgroup_shuffle") != NULL;
     backend_ctx->has_subgroup_shuffle =
@@ -7295,6 +7354,7 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     {
         cl_uint img_align = 0;
         clGetDeviceInfo(device, CL_DEVICE_IMAGE_BASE_ADDRESS_ALIGNMENT, sizeof(img_align), &img_align, NULL);
+        backend_ctx->image_base_align = img_align;
         GGML_LOG_INFO("ggml_opencl: mem base addr align: %u bytes | IMAGE base addr align: %u bytes\n",
                       backend_ctx->alignment, img_align);
     }
@@ -8432,6 +8492,11 @@ static bool ggml_opencl_can_fuse_moe_combine(const struct ggml_cgraph * cgraph, 
     const int outs[] = { node_idx + n_nodes - 1 };
     if (!ggml_can_fuse_subgraph(cgraph, node_idx, n_nodes, ops, outs, 1)) { return false; }
 
+    // this executor casts the experts/weights/dst extras directly and substitutes nothing, so
+    // a host operand or output must not reach it (see the fail-closed note at the end of
+    // ggml_opencl_can_fuse); checked before the overlap bail, which would cast the extras first
+    if (!ggml_opencl_fuse_operands_ok(cgraph->nodes + node_idx, n_nodes, false)) { return false; }
+
     for (int j = 0; j < (int)k; ++j) {
         const ggml_tensor * vw = cgraph->nodes[node_idx + 1 + j];
         if (vw->op != GGML_OP_VIEW || vw->src[0] != mul || vw->ne[0] != n_embd || vw->ne[1] != nt) { return false; }
@@ -8516,6 +8581,12 @@ static bool ggml_opencl_can_fuse_moe_bias_glu(const struct ggml_cgraph * cgraph,
     // The destination is addressed by (expert slot, token) rather than the GLU's flat row
     // walk; those agree only for a contiguous destination.
     if (!ggml_is_contiguous(glu) || !ggml_is_contiguous(gmm) || !ggml_is_contiguous(umm)) {
+        return false;
+    }
+    // the fused epilogue casts the add_id/GLU extras directly and substitutes nothing, so a
+    // host operand or output must not reach it (see the fail-closed note at the end of
+    // ggml_opencl_can_fuse)
+    if (!ggml_opencl_fuse_operands_ok(cgraph->nodes + node_idx, 5, false)) {
         return false;
     }
     return true;
@@ -8667,6 +8738,14 @@ static bool ggml_opencl_can_fuse_moe_bias_combine(const struct ggml_cgraph * cgr
     for (int j = 0; j < k - 1; ++j) ops[n++] = GGML_OP_ADD;
     const int outs[] = { node_idx + n_nodes - 1 };
     if (!ggml_can_fuse_subgraph(cgraph, node_idx, n_nodes, ops, outs, 1)) {
+        return false;
+    }
+
+    // one guard over the whole run (the combine tail's own gate covers it again from
+    // node_idx+1): this executor casts the raw output, bias, ids, router weights and dst
+    // extras directly and substitutes nothing (see the fail-closed note at the end of
+    // ggml_opencl_can_fuse)
+    if (!ggml_opencl_fuse_operands_ok(cgraph->nodes + node_idx, n_nodes, false)) {
         return false;
     }
 
@@ -8865,6 +8944,11 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
             !use_adreno_kernels(backend_ctx, up->src[0])) {
             return false;
         }
+        // this executor casts the q4_K and dst extras directly and substitutes nothing, so a
+        // host operand or output must not reach it (see the fail-closed note at the end)
+        if (!ggml_opencl_fuse_operands_ok(cgraph->nodes + node_idx, 3, false)) {
+            return false;
+        }
         return true;
     }
 
@@ -8963,12 +9047,31 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
         }
     }
 
+    // The only arms that reach here are the norm families, whose fused kernels read every src
+    // through ggml_opencl_fused_src, so an admitted HOST-W weight (the MUL's f32 norm weight)
+    // may sit in any src slot. A host tensor anywhere else - a foreign host src, or the dst,
+    // which no fused path substitutes - must not reach the executor: the old code cast
+    // src->extra as a ggml_tensor_extra_cl and passed it to clSetKernelArg as a cl_mem, which
+    // for a HOST-W tensor is Hexagon's extra - silent garbage, no CL error (the one-copy G arm
+    // read the f32 norms that way: KLD 9.85 on the S23). Fail closed and let the per-op paths,
+    // which substitute, take the op.
+    if (!ggml_opencl_fuse_operands_ok(cgraph->nodes + node_idx, (int)ops.size(), true)) {
+        return false;
+    }
+
     return true;
 }
 
 static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor);
 static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor * gn_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
+
+// defined with ggml_opencl_host_extra, below the fused kernels' first user
+static cl_ulong ggml_opencl_fused_src(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * t,
+                                      ggml_tensor_extra_cl * host, ggml_tensor_extra_cl ** extra);
+
+// defined below; the fused kernels abort on a foreign host dst before the first extra cast
+static void ggml_opencl_reject_foreign_host(const ggml_tensor * t);
 
 static void ggml_cl_mul_mat_q4_k_glu_fused(ggml_backend_t backend, ggml_tensor * gate_tensor, ggml_tensor * up_tensor, ggml_tensor * glu_tensor) {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
@@ -9100,17 +9203,23 @@ static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_t
     GGML_ASSERT(src2 && src2->extra);
     GGML_ASSERT(dst  && dst->extra);
 
-    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
-    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
-    ggml_tensor_extra_cl * extra2 = (ggml_tensor_extra_cl *)src2->extra;
-    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
-
-    cl_ulong offset0 = extra0->offset + src0->view_offs;
-    cl_ulong offset1 = extra1->offset + src1->view_offs;
-    cl_ulong offset2 = extra2->offset + src2->view_offs;
-    cl_ulong offsetd = extrad->offset + dst->view_offs;
-
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    // the weight slots go through the import when they are admitted HOST-W weights; the dst is
+    // never substituted, so a host one aborts here (the same G10 rule as the per-op paths)
+    ggml_opencl_reject_foreign_host(dst);
+
+    ggml_tensor_extra_cl host0 = {};
+    ggml_tensor_extra_cl host1 = {};
+    ggml_tensor_extra_cl host2 = {};
+    ggml_tensor_extra_cl * extra0 = nullptr;
+    ggml_tensor_extra_cl * extra1 = nullptr;
+    ggml_tensor_extra_cl * extra2 = nullptr;
+    const cl_ulong offset0 = ggml_opencl_fused_src(backend_ctx, src0, &host0, &extra0);
+    const cl_ulong offset1 = ggml_opencl_fused_src(backend_ctx, src1, &host1, &extra1);
+    const cl_ulong offset2 = ggml_opencl_fused_src(backend_ctx, src2, &host2, &extra2);
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *) dst->extra;
+    const cl_ulong offsetd = extrad->offset + dst->view_offs;
 
     float eps;
     memcpy(&eps, rms_norm_tensor->op_params, sizeof(float));
@@ -9828,6 +9937,153 @@ inline bool use_q5_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx,
 #endif
 }
 
+// TILE32 weight leg (Amendment E): snapshot what the leg needs from the context, plus the
+// engine's standard program build path. The leg never sees the context struct itself.
+static cl_program ggml_opencl_tile32_build_program_hook(void * opaque, const char * src, const char * opts) {
+    return build_program_from_source((ggml_backend_opencl_context *) opaque, src, opts);
+}
+
+// The same build path for an arm the leg may drop (the HOST leg's AoS GEMV): the cache is the
+// same, the failure is not. build_program_from_source's poison is right for a kernel the device
+// needs - kernel_build_failed takes every OpenCL op off the graph and the recorded fail verdict
+// turns the device off again in the next process - and wrong for a kernel the leg can replace
+// with the plain one.
+static cl_program build_program_optional_from_source(void * opaque, const char * src, const char * opts) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) opaque;
+    const std::string compile_opts = opts ? opts : "";
+    cl_program p = cl_program_cache_try_load(backend_ctx->program_cache, backend_ctx->context,
+                                             backend_ctx->device, src, compile_opts);
+    if (p) {
+        return p;
+    }
+    p = build_program_from_source_ex(backend_ctx->context, backend_ctx->device, src, compile_opts,
+                                     /*fatal=*/false);
+    if (p) {
+        cl_program_cache_try_save(backend_ctx->program_cache, p, backend_ctx->device, src, compile_opts);
+    }
+    return p;
+}
+
+// The other half of that path: the leg calls this when clCreateKernel refused the program, so
+// the binary this build just cached - or one an earlier process left - is not reloaded by the
+// next process.
+static void ggml_opencl_tile32_forget_program_hook(void * opaque, const char * src, const char * opts) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) opaque;
+    cl_program_cache_forget(backend_ctx->program_cache, src, opts ? opts : "");
+}
+
+static void ggml_opencl_tile32_env_fill(ggml_backend_opencl_context * backend_ctx, struct ggml_opencl_tile32_env * env) {
+    // Amendment I: the HOST leg's Q6_K self-check runs the plain kernel_mul_mv_q6_K_f32, which
+    // load_cl_kernels creates, and nothing else loads the kernels before the first OpenCL buffer
+    // allocation - in the GPU leg that happens after the imports, so the handle was still null
+    // and the check declined silently. Loading here also gives the v4 program the engine's
+    // general compile options (E2) instead of the empty string it saw before. A kernel failure
+    // only marks kernel_build_failed (P2-8): the supports_buft callers read it right after this
+    // and decline the leg, instead of aborting the process mid-load.
+    load_cl_kernels(backend_ctx);
+    env->context       = backend_ctx->context;
+    env->queue         = backend_ctx->queue;
+    env->device        = backend_ctx->device;
+    env->facts.adreno  = backend_ctx->gpu_family == GPU_FAMILY::ADRENO;
+    env->facts.device_name     = backend_ctx->device_name.c_str();
+    env->facts.device_version  = backend_ctx->device_version.c_str();
+    env->facts.driver_version  = backend_ctx->driver_version.c_str();
+    env->facts.ext_dmabuf_host_ptr = backend_ctx->has_qcom_dmabuf_host_ptr;
+    env->facts.ext_host_ptr        = backend_ctx->has_qcom_ext_host_ptr;
+    env->facts.max_alloc_size      = backend_ctx->max_alloc_size;
+    env->image_max_buffer_size = backend_ctx->image_max_buffer_size;
+    env->mem_base_align        = backend_ctx->alignment;
+    env->image_base_align      = backend_ctx->image_base_align;
+    env->kernel_compile_opts     = backend_ctx->kernel_compile_opts.c_str();
+    env->build_program           = ggml_opencl_tile32_build_program_hook;
+    env->build_program_optional  = build_program_optional_from_source;
+    env->forget_program_optional = ggml_opencl_tile32_forget_program_hook;
+    env->build_program_opaque    = backend_ctx;
+    env->host_q6k_aos            = &backend_ctx->host_q6k_aos;
+}
+
+// A tensor whose buffer is an importable weights HOST buffer (Amendment I): the device's own
+// host buffer type is excluded, so the CPU's compute and output buffers never enter the leg.
+// Deliberately not the WEIGHTS-usage test: the compute path has to recognise such a tensor to
+// fail closed when admission should have refused it, and a usage test here would hide it.
+static bool ggml_opencl_in_host_leg_buffer(const ggml_tensor * t) {
+    return t->buffer && ggml_backend_buffer_is_host(t->buffer) &&
+           ggml_opencl_host_weights_buft(ggml_backend_buffer_get_type(t->buffer));
+}
+
+// Amendment I, compute-side half of the identity test: a tensor in a host buffer that the
+// admission predicates did not admit is a placement override - the scheduler copies a tensor
+// in a buft OpenCL does not claim, so the normal path never sees one. Its extra belongs to
+// its own backend, and reading it as an OpenCL one would be silent garbage: abort by name,
+// and callers must run this before the first cast or read of tensor->extra.
+static void ggml_opencl_reject_foreign_host(const ggml_tensor * t) {
+    if (!ggml_opencl_host_foreign_tensor(t)) {
+        return;
+    }
+    GGML_ABORT("ggml-opencl: %s is in host buffer %s (usage %d, size %zu), the leg addresses admitted HOST-W weights only",
+               t->name, ggml_backend_buffer_name(t->buffer),
+               (int) ggml_backend_buffer_get_usage(t->buffer),
+               ggml_backend_buffer_get_size(t->buffer));
+}
+
+// The {cl_mem, offset} of a tensor in an imported HOST buffer, as a plain extra the
+// existing kernels read (Amendment G1). tensor->extra stays Hexagon's and is never cast on
+// this path. False for tensors of any other buffer, whose normal extras apply; a view miss
+// on a HOST tensor is a compute-time failure after admission - the G10 rule applies, abort.
+static bool ggml_opencl_host_extra(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * t,
+                                   ggml_tensor_extra_cl * out) {
+    if (!t || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
+        return false;
+    }
+    // Amendment I, fail closed on the same predicate supports_op admits on, the 0-byte
+    // placement probe included: only a HOST-W weights tensor has an import address here. A
+    // probe has no data, so if one ever reached compute the view below would fail closed.
+    ggml_opencl_reject_foreign_host(t);
+    struct ggml_opencl_tile32_env env;
+    ggml_opencl_tile32_env_fill(backend_ctx, &env);
+    cl_mem buf = nullptr;
+    cl_ulong off = 0;
+    const char * why = nullptr;
+    if (!ggml_opencl_host_view(&env, t, &buf, &off, &why)) {
+        GGML_ABORT("ggml-opencl: HOST view failed for %s: %s", t->name, why ? why : "unknown");
+    }
+    out->data_device = buf;
+    out->offset = off;
+    return true;
+}
+
+// The {cl_mem, byte offset} a fused kernel reads one operand from. A tensor in an admitted HOST
+// buffer has no OpenCL extra - tensor->extra stays Hexagon's - so the fused paths substitute the
+// import address exactly as ggml_cl_mul does (offset without view_offs: the import address is
+// data - dma-buf base, which already carries it), and a host tensor the leg did not admit aborts
+// by name inside ggml_opencl_host_extra instead of reaching the kernel as a cl_mem. The caller
+// passes one scratch extra per operand; *extra aliases either it or the tensor's own.
+static cl_ulong ggml_opencl_fused_src(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * t,
+                                      ggml_tensor_extra_cl * host, ggml_tensor_extra_cl ** extra) {
+    if (ggml_opencl_host_extra(backend_ctx, t, host)) {
+        *extra = host;
+        return host->offset;
+    }
+    *extra = (ggml_tensor_extra_cl *) t->extra;
+    return (*extra)->offset + t->view_offs;
+}
+
+// The device half of the HOST weight leg's admission (Amendment I split it off the pure
+// predicate): the R2 gate, the lazy import, the per-tensor address and, for a Q6_K lm_head
+// weight, the one read-only self-check. Cached per tensor in the import map, so supports_op
+// and offload_op can both ask on every op of a graph for the price of one lookup.
+static bool ggml_opencl_host_weight_admitted(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * w) {
+    struct ggml_opencl_tile32_env env;
+    ggml_opencl_tile32_env_fill(backend_ctx, &env);
+    // llama's weight_buft_supported asks with a 0-byte dummy buffer and no data: those
+    // placement probes have nothing to import, so the device facts are the whole answer.
+    if (!w->buffer || w->buffer->size == 0 || !w->data) {
+        return ggml_opencl_tile32_ready(&env);
+    }
+    const char * reason = nullptr;
+    return ggml_opencl_host_weight_ready(&env, w, backend_ctx->kernel_mul_mv_q6_K_f32, &reason);
+}
+
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
@@ -9841,6 +10097,53 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
     // reject ops that match the opfilter regex
     if (dev_ctx->opfilter && std::regex_match(std::string(ggml_op_desc(op)), *dev_ctx->opfilter)) {
         return false;
+    }
+
+    // TILE32 weight leg (Amendment E1): a weight in a TILE32 buffer is readable only by the
+    // tiled mat-vec; anything else the scheduler answers with a copy or the native readers
+    // crash on tiles. Mirrors ggml-cpu/tile32.cpp's predicate plus ne11 == 1 - v4 is a
+    // mat-vec and the owner excludes GPU prefill - so a wider batch falls to the CPU reader.
+    // src1's outer planes are pinned too: the kernel writes exactly one ne11-length column,
+    // so a 3-D src1 with ne12 > 1 would leave the other planes untouched.
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        const ggml_tensor * src = op->src[i];
+        if (!src || ggml_backend_tensor_weight_layout(src) != GGML_WEIGHT_LAYOUT_Q4_0_TILE32) {
+            continue;
+        }
+        const ggml_tensor * w = op->src[0];
+        const ggml_tensor * x = op->src[1];
+        const bool mul_mat_ok = op->op == GGML_OP_MUL_MAT && op->type == GGML_TYPE_F32 &&
+                                w && x && !w->view_src &&
+                                ggml_backend_tensor_weight_layout(w) == GGML_WEIGHT_LAYOUT_Q4_0_TILE32 &&
+                                w->type == GGML_TYPE_Q4_0 && w->ne[2] == 1 && w->ne[3] == 1 &&
+                                w->ne[0] % GGML_Q4_0_TILE32_K == 0 &&
+                                x->type == GGML_TYPE_F32 && x->ne[1] == 1 &&
+                                x->ne[2] == 1 && x->ne[3] == 1 &&
+                                x->nb[0] == sizeof(float) &&
+                                ggml_is_contiguous(op);
+        if (!mul_mat_ok) {
+            return false;
+        }
+        struct ggml_opencl_tile32_env env;
+        ggml_opencl_tile32_env_fill(backend_ctx, &env);
+        // The whole admission, not just the facts: import + views + v4 program + the one
+        // read-only self-check, cached per tensor (G2). A miss disables the leg and the op
+        // falls to the CPU tile reader instead of aborting at compute.
+        return ggml_opencl_tile32_weight_ready(&env, w);
+    }
+
+    // HOST weight leg (Amendment G1): the native-layout weights of a HOST buffer are read in
+    // place through the imported block. The src scan is shared with offload_op (the pure
+    // predicate in ggml-opencl-tile32-host.cpp), so the scheduler's 1.off question and this
+    // answer cannot disagree; only the ops the leg admits reach the device half below.
+    const ggml_tensor * host_w = nullptr;
+    switch (ggml_opencl_host_leg_weight(dev, op, &host_w)) {
+        case GGML_OPENCL_HOST_LEG_REFUSE:
+            return false;
+        case GGML_OPENCL_HOST_LEG_WEIGHT:
+            return ggml_opencl_host_weight_admitted(backend_ctx, host_w);
+        case GGML_OPENCL_HOST_LEG_OTHER:
+            break;
     }
 
     switch (op->op) {
@@ -14884,6 +15187,21 @@ static ggml_backend_t ggml_backend_opencl_device_init(ggml_backend_dev_t dev, co
     GGML_UNUSED(params);
 }
 
+// The scheduler's 1.off hand-off (ggml-backend.cpp): an op whose WEIGHTS src is in a host
+// buffer goes to a backend only if it both supports the op and wants it here. A host weight
+// lives in the Hexagon weights buft, so the HTP is asked first, but it does not win every op it
+// supports: this answers for exactly the ops the HOST leg admits over an imported HOST-W weight,
+// so the norm MUL, the f32 SSM_CONV and the flat Q6_K mat-vec reach OpenCL when the HTP declines
+// them, and nothing else changes: an op whose weights are in OpenCL's own buffers never reaches
+// this call (the 1.off loop is gated on ggml_backend_buffer_is_host).
+// WHY: 1.off needs supports_op && offload_op, and Hexagon offloads MUL_MAT only by default, so a HOST-W MUL the HTP supports but declines still reaches OpenCL.
+static bool ggml_backend_opencl_device_offload_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *)dev->context;
+    const ggml_tensor * host_w = nullptr;
+    return ggml_opencl_host_leg_offload(dev, op, &host_w) &&
+           ggml_opencl_host_weight_admitted(dev_ctx->backend_ctx, host_w);
+}
+
 static ggml_backend_buffer_type_t ggml_backend_opencl_device_get_buffer_type(ggml_backend_dev_t dev) {
     auto * dev_ctx = static_cast<ggml_backend_opencl_device_context *>(dev->context);
 
@@ -14910,6 +15228,38 @@ static bool ggml_backend_opencl_device_supports_op(ggml_backend_dev_t dev, const
 }
 
 static bool ggml_backend_opencl_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+    // TILE32 weight leg (Amendment E1): claim the Hexagon TILE32 buft when the R2 gate is
+    // green. Checked before the foreign-buft refusal and before ggml_cl_init on buft's
+    // device: a TILE32 buft belongs to a Hexagon device, whose context is not ours to init.
+    if (ggml_backend_buft_weight_layout(buft) == GGML_WEIGHT_LAYOUT_Q4_0_TILE32) {
+        ggml_backend_opencl_context * backend_ctx = ggml_cl_init(dev);
+        struct ggml_opencl_tile32_env env;
+        // env_fill loads the kernel set on first use, so the build failure is known after it
+        ggml_opencl_tile32_env_fill(backend_ctx, &env);
+        if (backend_ctx->kernel_build_failed) {
+            return false;
+        }
+        return ggml_opencl_tile32_ready(&env);
+    }
+
+    // HOST weight leg (Amendment G, narrowed by Amendment I): claim the weights host buft - a
+    // host buft that is not the device's own host buffer type (llama gives that one to the CPU
+    // for its compute and output buffers) and whose registry exposes the generic dma-buf
+    // accessor - under the same R2 gate as TILE32. The OpenCL buft has no is_host, the plain
+    // CPU buft has no accessor, and the device's own host buft fails the identity test, so none
+    // of them is claimed by mistake; like the TILE32 buft, this one belongs to a Hexagon
+    // device, whose context is not ours to init.
+    if (ggml_opencl_host_weights_buft(buft)) {
+        ggml_backend_opencl_context * backend_ctx = ggml_cl_init(dev);
+        struct ggml_opencl_tile32_env env;
+        // env_fill loads the kernel set on first use, so the build failure is known after it
+        ggml_opencl_tile32_env_fill(backend_ctx, &env);
+        if (backend_ctx->kernel_build_failed) {
+            return false;
+        }
+        return ggml_opencl_tile32_ready(&env);
+    }
+
     // Check 'dev' and 'buffer_type' are not objects belonging to this backend.
     if (dev->iface.get_name != ggml_backend_opencl_device_get_name ||
         buft->iface.get_name != ggml_backend_opencl_buffer_type_get_name) {
@@ -14936,7 +15286,7 @@ struct ggml_backend_device_i ggml_backend_opencl_device_i = {
     /* .buffer_from_host_ptr = */ ggml_backend_opencl_device_buffer_from_ptr,
     /* .supports_op          = */ ggml_backend_opencl_device_supports_op,
     /* .supports_buft        = */ ggml_backend_opencl_device_supports_buft,
-    /* .offload_op           = */ NULL,
+    /* .offload_op           = */ ggml_backend_opencl_device_offload_op,
     /* .event_new            = */ NULL,
     /* .event_free           = */ NULL,
     /* .event_synchronize    = */ NULL,
@@ -14966,11 +15316,21 @@ static ggml_backend_dev_t ggml_backend_opencl_reg_device_get(ggml_backend_reg_t 
     GGML_UNUSED(index);
 }
 
+// Release path for the TILE32 imports (Amendment E1): the binding calls this, via the
+// registry proc address, before llama_model_free.
+static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_opencl_release_imports") == 0) {
+        return (void *) ggml_backend_opencl_release_imports;
+    }
+    return NULL;
+}
+
 static struct ggml_backend_reg_i ggml_backend_opencl_reg_i = {
     /* .get_name         = */ ggml_backend_opencl_reg_get_name,
     /* .device_count     = */ ggml_backend_opencl_reg_device_count,
     /* .device_get       = */ ggml_backend_opencl_reg_device_get,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_opencl_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_opencl_reg(void) {
@@ -15812,12 +16172,34 @@ static void ggml_cl_mul(ggml_backend_t backend, const ggml_tensor * src0, const 
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
+    // Amendment I (G10): only an admitted HOST-W weight is substituted below. Every other
+    // tensor in a host buffer carries its backend's extra, so the refusal must run before the
+    // casts that follow - the leg substitutes src0/src1, never the dst.
+    ggml_opencl_reject_foreign_host(src0);
+    ggml_opencl_reject_foreign_host(src1);
+    ggml_opencl_reject_foreign_host(dst);
+
     ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
     ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
 
-    cl_ulong offset0 = extra0->offset + src0->view_offs;
-    cl_ulong offset1 = extra1->offset + src1->view_offs;
+    // HOST weight leg (Amendment G1): a norm weight in the imported HOST buffer reads
+    // through a plain extra served from the import map; tensor->extra stays Hexagon's.
+    ggml_tensor_extra_cl host0 = {};
+    ggml_tensor_extra_cl host1 = {};
+    const bool host0_sub = ggml_opencl_host_extra(backend_ctx, src0, &host0);
+    const bool host1_sub = ggml_opencl_host_extra(backend_ctx, src1, &host1);
+    if (host0_sub) {
+        extra0 = &host0;
+    }
+    if (host1_sub) {
+        extra1 = &host1;
+    }
+
+    // a HOST slot carries no view_offs: the predicate refuses a HOST weight with a view_src,
+    // and the import address is data - dma-buf base, which already includes view_offs
+    cl_ulong offset0 = extra0->offset + (host0_sub ? 0 : src0->view_offs);
+    cl_ulong offset1 = extra1->offset + (host1_sub ? 0 : src1->view_offs);
     cl_ulong offsetd = extrad->offset + dst->view_offs;
 
     bool bcast_row = false;
@@ -16456,12 +16838,33 @@ static void ggml_cl_ssm_conv(ggml_backend_t backend, const ggml_tensor * src0, c
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
+    // Amendment I (G10): the conv weight is src1 (the leg substitutes src0/src1, never the
+    // dst); a host tensor in any other slot must abort before the casts below, not after.
+    ggml_opencl_reject_foreign_host(src0);
+    ggml_opencl_reject_foreign_host(src1);
+    ggml_opencl_reject_foreign_host(dst);
+
     ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
     ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
 
-    cl_ulong offset0 = extra0->offset + src0->view_offs;
-    cl_ulong offset1 = extra1->offset + src1->view_offs;
+    // HOST weight leg (Amendment G1): the conv weight is src1 (src0 is the conv input), read
+    // through a plain extra served from the import map; tensor->extra stays Hexagon's.
+    // Admission requires src0 addressable and the single-sequence form (see the predicate).
+    ggml_tensor_extra_cl host0 = {};
+    ggml_tensor_extra_cl host1 = {};
+    const bool host0_sub = ggml_opencl_host_extra(backend_ctx, src0, &host0);
+    const bool host1_sub = ggml_opencl_host_extra(backend_ctx, src1, &host1);
+    if (host0_sub) {
+        extra0 = &host0;
+    }
+    if (host1_sub) {
+        extra1 = &host1;
+    }
+
+    // a HOST slot carries no view_offs: see the same note in ggml_cl_mul
+    cl_ulong offset0 = extra0->offset + (host0_sub ? 0 : src0->view_offs);
+    cl_ulong offset1 = extra1->offset + (host1_sub ? 0 : src1->view_offs);
     cl_ulong offsetd = extrad->offset + dst->view_offs;
 
     int ne01 = src0->ne[1];
@@ -17005,15 +17408,20 @@ static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * 
     GGML_ASSERT(dst);
     GGML_ASSERT(dst->extra);
 
-    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
-    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
-    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
-
-    cl_ulong offset0 = extra0->offset + src0->view_offs;
-    cl_ulong offset1 = extra1->offset + src1->view_offs;
-    cl_ulong offsetd = extrad->offset + dst->view_offs;
-
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    // the weight slot goes through the import when it is an admitted HOST-W weight; the dst is
+    // never substituted, so a host one aborts here (the same G10 rule as the per-op paths)
+    ggml_opencl_reject_foreign_host(dst);
+
+    ggml_tensor_extra_cl host0 = {};
+    ggml_tensor_extra_cl host1 = {};
+    ggml_tensor_extra_cl * extra0 = nullptr;
+    ggml_tensor_extra_cl * extra1 = nullptr;
+    const cl_ulong offset0 = ggml_opencl_fused_src(backend_ctx, src0, &host0, &extra0);
+    const cl_ulong offset1 = ggml_opencl_fused_src(backend_ctx, src1, &host1, &extra1);
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *) dst->extra;
+    const cl_ulong offsetd = extrad->offset + dst->view_offs;
 
     float eps;
     memcpy(&eps, rms_norm_tensor->op_params, sizeof(float));
@@ -17101,17 +17509,23 @@ static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm
     const ggml_tensor * src2 = add_tensor->src[0] == mul_tensor ? add_tensor->src[1] : add_tensor->src[0];
     const ggml_tensor * dst = add_tensor;
 
-    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
-    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
-    ggml_tensor_extra_cl * extra2 = (ggml_tensor_extra_cl *)src2->extra;
-    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
-
-    cl_ulong offset0 = extra0->offset + src0->view_offs;
-    cl_ulong offset1 = extra1->offset + src1->view_offs;
-    cl_ulong offset2 = extra2->offset + src2->view_offs;
-    cl_ulong offsetd = extrad->offset + dst->view_offs;
-
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    // the weight slots go through the import when they are admitted HOST-W weights; the dst is
+    // never substituted, so a host one aborts here (the same G10 rule as the per-op paths)
+    ggml_opencl_reject_foreign_host(dst);
+
+    ggml_tensor_extra_cl host0 = {};
+    ggml_tensor_extra_cl host1 = {};
+    ggml_tensor_extra_cl host2 = {};
+    ggml_tensor_extra_cl * extra0 = nullptr;
+    ggml_tensor_extra_cl * extra1 = nullptr;
+    ggml_tensor_extra_cl * extra2 = nullptr;
+    const cl_ulong offset0 = ggml_opencl_fused_src(backend_ctx, src0, &host0, &extra0);
+    const cl_ulong offset1 = ggml_opencl_fused_src(backend_ctx, src1, &host1, &extra1);
+    const cl_ulong offset2 = ggml_opencl_fused_src(backend_ctx, src2, &host2, &extra2);
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+    const cl_ulong offsetd = extrad->offset + dst->view_offs;
 
     float eps;
     memcpy(&eps, norm_tensor->op_params, sizeof(float));
@@ -17187,17 +17601,23 @@ static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor 
     const ggml_tensor * src2 = add_tensor->src[0] == mul_tensor ? add_tensor->src[1] : add_tensor->src[0];
     const ggml_tensor * dst = add_tensor;
 
-    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
-    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
-    ggml_tensor_extra_cl * extra2 = (ggml_tensor_extra_cl *)src2->extra;
-    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
-
-    cl_ulong offset0 = extra0->offset + src0->view_offs;
-    cl_ulong offset1 = extra1->offset + src1->view_offs;
-    cl_ulong offset2 = extra2->offset + src2->view_offs;
-    cl_ulong offsetd = extrad->offset + dst->view_offs;
-
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    // the weight slots go through the import when they are admitted HOST-W weights; the dst is
+    // never substituted, so a host one aborts here (the same G10 rule as the per-op paths)
+    ggml_opencl_reject_foreign_host(dst);
+
+    ggml_tensor_extra_cl host0 = {};
+    ggml_tensor_extra_cl host1 = {};
+    ggml_tensor_extra_cl host2 = {};
+    ggml_tensor_extra_cl * extra0 = nullptr;
+    ggml_tensor_extra_cl * extra1 = nullptr;
+    ggml_tensor_extra_cl * extra2 = nullptr;
+    const cl_ulong offset0 = ggml_opencl_fused_src(backend_ctx, src0, &host0, &extra0);
+    const cl_ulong offset1 = ggml_opencl_fused_src(backend_ctx, src1, &host1, &extra1);
+    const cl_ulong offset2 = ggml_opencl_fused_src(backend_ctx, src2, &host2, &extra2);
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+    const cl_ulong offsetd = extrad->offset + dst->view_offs;
 
     int groups;
     float eps;
@@ -25327,6 +25747,97 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     const enum ggml_type src1t = src1->type;
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    // TILE32 weight leg (Amendment E2): decode mat-vec over the lazily imported buffer.
+    // src0->extra is Hexagon's here and is never cast; the leg addresses the weights by
+    // (data - dma-buf base). Placed before every path that would.
+    if (ggml_backend_tensor_weight_layout(src0) == GGML_WEIGHT_LAYOUT_Q4_0_TILE32) {
+        // Amendment I (G10, P2-10): the activation and the result are cast and read in the
+        // call below, so the foreign-host refusal runs here, before those reads - the leg's
+        // own guards are past the point where the caller has already dereferenced the extras.
+        ggml_opencl_reject_foreign_host(src1);
+        ggml_opencl_reject_foreign_host(dst);
+        ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
+        ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+        struct ggml_opencl_tile32_env env;
+        ggml_opencl_tile32_env_fill(backend_ctx, &env);
+        ggml_cl_mul_mat_tile32(&env, src0, src1, dst,
+                               extra1->data_device, extra1->offset + src1->view_offs,
+                               extrad->data_device, extrad->offset + dst->view_offs);
+        return;
+    }
+
+    // HOST weight leg (Amendment G1): the lm_head Q6_K mat-vec over the imported HOST block,
+    // through the planned Q6_K kernel (the AoS GEMV by default, the plain
+    // kernel_mul_mv_q6_K_f32 as the fallback and the A/B arm) - the two Q6_K kernels that read a
+    // flat {cl_mem, offset} weight. GGML_OPENCL_SOA_Q is always on in this build, so the generic
+    // dispatch below would cast src0->extra (Hexagon's here) to the SoA q6_K extra: this
+    // branch must stay above every path that reads src0->extra. Only what supports_op
+    // admitted reaches here; a scheduler override that pinned anything else aborts (G10).
+    if (ggml_opencl_in_host_leg_buffer(src0)) {
+        GGML_ASSERT(src0->type == GGML_TYPE_Q6_K && src0->ne[2] == 1 && src0->ne[3] == 1);
+        GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(dst));
+        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+        GGML_ASSERT(src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1);
+        GGML_ASSERT(src1->nb[0] == sizeof(float));
+        GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+        ggml_tensor_extra_cl extra0h = {};
+        ggml_opencl_host_extra(backend_ctx, src0, &extra0h);
+        // the same refusal for the slots this branch does not substitute, before their casts
+        ggml_opencl_reject_foreign_host(src1);
+        ggml_opencl_reject_foreign_host(dst);
+        ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
+        ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+
+        // The plan carries the kernel the self-check validated and its geometry, so this launch
+        // cannot drift from the checked one.
+        struct ggml_opencl_tile32_env env;
+        ggml_opencl_tile32_env_fill(backend_ctx, &env);
+        struct ggml_opencl_host_q6k_plan plan;
+        if (!ggml_opencl_host_q6k_plan(&env, backend_ctx->kernel_mul_mv_q6_K_f32, src0->ne[1], src1->ne[1], &plan)) {
+            GGML_ABORT("ggml-opencl: the HOST leg's Q6_K kernel is not loaded for %s", src0->name);
+        }
+        cl_kernel kernel = plan.kernel;
+        // the import address is data - dma-buf base and the predicate refuses a viewed weight,
+        // so the tensor base is the whole offset: adding view_offs would count it twice
+        cl_ulong offset0 = extra0h.offset;
+        cl_ulong offset1 = extra1->offset + src1->view_offs;
+        cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+        const int ne00 = (int) src0->ne[0], ne01 = (int) src0->ne[1], ne02 = (int) src0->ne[2];
+        const int ne10 = (int) src1->ne[0];
+        const int ne12 = (int) src1->ne[2], ne13 = (int) src1->ne[3];
+        const int ne0  = (int) dst->ne[0],  ne1  = (int) dst->ne[1];
+        const int r2 = ne12/ne02, r3 = ne13;   // admitted shape: ne03 == ne13 == 1
+
+        // The args are bound and the launch enqueued with no lock, the rule every other kernel
+        // in this backend follows: the scheduler issues a graph's splits in a serial loop, and
+        // nothing in this backend locks a kernel. A lock here would be stronger than the
+        // engine's own rule; what this branch needed was the handle's owner - the AoS kernel is
+        // the context's (env.host_q6k_aos), so no binding can reach another context's kernel,
+        // or one a released context no longer owns.
+        CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0h.data_device));
+        CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
+        CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
+        CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
+        CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extrad->data_device));
+        CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offsetd));
+        CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &ne00));
+        CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne01));
+        CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne02));
+        CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne10));
+        CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne12));
+        CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &ne0));
+        CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne1));
+        CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &r2));
+        CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &r3));
+
+        // the launch geometry the plan handed the self-check, so the validated kernel and the
+        // running kernel cannot drift
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, plan.gws, plan.lws, dst);
+        return;
+    }
 
     // quant kv without FA
     // used for non-contiguous src0 (the usual head-major permuted K view when n_head_kv>1)

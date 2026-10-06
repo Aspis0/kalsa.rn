@@ -86,6 +86,28 @@ bool ggml_backend_buft_is_host(ggml_backend_buffer_type_t buft) {
     return false;
 }
 
+enum ggml_backend_weight_layout ggml_backend_buft_weight_layout(ggml_backend_buffer_type_t buft) {
+    GGML_ASSERT(buft);
+    // get_weight_layout is optional, defaults to GGML_WEIGHT_LAYOUT_NATIVE
+    if (buft->iface.get_weight_layout) {
+        return buft->iface.get_weight_layout(buft);
+    }
+    return GGML_WEIGHT_LAYOUT_NATIVE;
+}
+
+enum ggml_backend_weight_layout ggml_backend_tensor_weight_layout(const struct ggml_tensor * tensor) {
+    GGML_ASSERT(tensor);
+    // a view owns no buffer: its bytes live in the root's storage
+    while (tensor->view_src) {
+        tensor = tensor->view_src;
+    }
+    if (tensor->buffer == NULL) {
+        // unallocated tensor (the placement probes): nothing to read yet
+        return GGML_WEIGHT_LAYOUT_NATIVE;
+    }
+    return ggml_backend_buft_weight_layout(tensor->buffer->buft);
+}
+
 ggml_backend_dev_t ggml_backend_buft_get_device(ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(buft);
     return buft->device;
@@ -786,6 +808,7 @@ struct ggml_backend_sched_split {
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
+    bool split_failed; // a non-NATIVE weight had to be copied (see the weight-copy guard in split_graph)
 
     int n_backends;
 
@@ -966,13 +989,19 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
             }
             if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
-                // check if a backend with higher prio wants to offload the op
-                if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
-                    for (int b = 0; b < src_backend_id; b++) {
+                // Host bufts can be read directly by CPU; let devices opt in per op and batch.
+                if (sched->op_offload && ggml_backend_buffer_is_host(src->buffer)) {
+                    for (int b = 0; b < sched->n_backends; b++) {
                         if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
                             SET_CAUSE(tensor, "1.off");
                             return b;
                         }
+                    }
+                    if (src_backend_id != sched->n_backends - 1 &&
+                        ggml_backend_supports_buft(sched->backends[sched->n_backends - 1], src->buffer->buft) &&
+                        ggml_backend_supports_op(sched->backends[sched->n_backends - 1], tensor)) {
+                        SET_CAUSE(tensor, "1.host");
+                        return sched->n_backends - 1;
                     }
                 }
                 SET_CAUSE(tensor, "1.wgt%d", i);
@@ -1068,6 +1097,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
     sched->is_reset = false;
+    sched->split_failed = false;
 
     struct ggml_init_params params = {
         /* .mem_size =   */ sched->context_buffer_size,
@@ -1373,6 +1403,21 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 GGML_ASSERT(src_backend_id != -1); // all inputs should be assigned by now
 
                 if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                    // a weight in a non-NATIVE layout cannot be duplicated into this split: the copy
+                    // would either unpack (a silent second copy of the weight) or read the foreign
+                    // bytes as native. Native weights keep the copy: that is how partial offload
+                    // moves them between splits. Views resolve to the root buffer, matching
+                    // sched_buffer_supported above.
+                    if (ggml_backend_tensor_weight_layout(src) != GGML_WEIGHT_LAYOUT_NATIVE) {
+                        const struct ggml_tensor * root = src;
+                        while (root->view_src) {
+                            root = root->view_src;
+                        }
+                        GGML_LOG_ERROR("%s: weight %s (%s) has no backend for %s in this scheduler and cannot be copied\n",
+                            __func__, src->name, ggml_backend_buft_name(root->buffer->buft), ggml_op_desc(node));
+                        sched->split_failed = true;
+                        continue;
+                    }
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
@@ -1996,6 +2041,10 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
 
     ggml_backend_sched_split_graph(sched, measure_graph);
 
+    if (sched->split_failed) {
+        return false;
+    }
+
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
     }
@@ -2014,6 +2063,10 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
     ggml_backend_sched_split_graph(sched, graph);
+
+    if (sched->split_failed) {
+        return false;
+    }
 
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;

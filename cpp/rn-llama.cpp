@@ -23,7 +23,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <stdexcept>
+#include <string>
 
 #if defined(__ANDROID__)
 #include <android/set_abort_message.h>
@@ -134,7 +136,9 @@ governor_lane_kv_plan decide_governor_lane_kv(
 // The OpenCL leg holds cl_mem imports of the model's Hexagon dma-bufs; they
 // must be released after the contexts that use them are gone and before the
 // model's buffers free. A build without the OpenCL backend (or an idle one,
-// no imports) is a no-op.
+// no imports) is a no-op. F1: the import cache is process-wide, so this runs
+// ONLY in a one-copy teardown - never on plain reloads, where another owner's
+// in-flight compute could still hold an imported cl_mem.
 void release_opencl_imports() {
     ggml_backend_reg_t reg = ggml_backend_reg_by_name("OpenCL");
     if (reg == nullptr) {
@@ -147,9 +151,52 @@ void release_opencl_imports() {
     }
 }
 
-// One teardown for every governor load, both forms: the governor's leg
-// contexts free first, then the OpenCL imports, then the models.
-void teardown_governor_load(llama_rn_context & owner) {
+// F3: the shared-weights setter changes unsynchronized backend globals
+// (ggml-hexagon.h caller contract) and JSI loads run on pool workers, so the
+// one-copy load (setter through governor init) and the one-copy teardown
+// (through the restore) serialize process-wide on this one mutex.
+std::mutex & onecopy_load_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+// The hexagon shared-weights setter, looked up once per use; null when the
+// build has no Hexagon backend or it predates the proc.
+ggml_backend_hexagon_set_shared_weights_t hexagon_shared_weights_setter() {
+    ggml_backend_reg_t htp_reg = ggml_backend_reg_by_name("HTP");
+    return htp_reg == nullptr ? nullptr :
+        reinterpret_cast<ggml_backend_hexagon_set_shared_weights_t>(
+            ggml_backend_reg_get_proc_address(htp_reg,
+                                              "ggml_backend_hexagon_set_shared_weights"));
+}
+
+// F2: restore the Hexagon globals the one-copy setter changed (shared weights
+// off, buffer cap back). No getter exists (ggml-hexagon.h), so the prior value
+// is the engine's documented state, reconstructed exactly as the process
+// started: opt_mbuf defaults to 1 GiB (vendored ggml-hexagon.cpp:100) and
+// GGML_HEXAGON_MBUF seeds it at init as strtoul(value, NULL, 0) MiB (vendored
+// ggml-hexagon.cpp:8756). Returns false when the setter refused - a shared
+// buffer is still alive - which the callers must not ignore.
+bool restore_hexagon_shared_weights() {
+    auto set_shared_weights = hexagon_shared_weights_setter();
+    if (set_shared_weights == nullptr) {
+        return true;  // nothing was ever changed in this build
+    }
+    size_t max_buffer_bytes = 1ull * 1024 * 1024 * 1024;
+    if (const char * mbuf = std::getenv("GGML_HEXAGON_MBUF")) {
+        const unsigned long mib = std::strtoul(mbuf, nullptr, 0);
+        if (mib > 0) {
+            max_buffer_bytes = (size_t) mib * 1024 * 1024;
+        }
+    }
+    const ggml_hexagon_shared_weights restore { false, max_buffer_bytes };
+    return set_shared_weights(&restore) == 0;
+}
+
+// The one-copy teardown, caller holds onecopy_load_mutex (F3): the governor's
+// leg contexts free first, then the process-wide OpenCL imports (F1), then
+// the models.
+void teardown_onecopy_unlocked(llama_rn_context & owner) {
     owner.governor.reset();
     release_opencl_imports();
     owner.governor_onecopy_init.reset();
@@ -158,6 +205,29 @@ void teardown_governor_load(llama_rn_context & owner) {
     owner.llama_init.reset();
     owner.model = nullptr;
     owner.ctx = nullptr;
+}
+
+// One teardown for every governor load, both forms. A one-copy owner adds the
+// OpenCL import release and the Hexagon globals restore (F1/F2), the whole
+// sequence under the one-copy mutex (F3); the restore can be refused only
+// when another owner still holds shared Hexagon buffers, in which case the
+// globals stay as that live load needs them - logged, nothing of this owner's
+// is left alive.
+void teardown_governor_load(llama_rn_context & owner) {
+    if (owner.governor_onecopy_init == nullptr) {
+        owner.governor.reset();
+        owner.governor_decode_init.reset();
+        owner.governor_prefill_init.reset();
+        owner.llama_init.reset();
+        owner.model = nullptr;
+        owner.ctx = nullptr;
+        return;
+    }
+    const std::lock_guard<std::mutex> lock(onecopy_load_mutex());
+    teardown_onecopy_unlocked(owner);
+    if (!restore_hexagon_shared_weights()) {
+        LOG_ERROR("KALSA_ONECOPY_RESTORE_REFUSED {reason:\"shared Hexagon buffers still live\"}");
+    }
 }
 
 // F-12: the legs pick the accelerators by their EXACT registered names -
@@ -181,12 +251,13 @@ constexpr size_t k_onecopy_shared_mbuf_bytes = (size_t) 832 * 1024 * 1024;
 
 enum class onecopy_load_result {
     loaded,
-    // Refused before anything was allocated: the caller falls through to the
-    // two-model branch in this process.
-    demoted_pre_load,
-    // Failed with model or governor state alive (or after it was torn down):
-    // the caller fails the load like any governor failure - piling a
-    // two-copy load onto whatever just failed is the wrong way down.
+    // The two-model branch runs instead in this process - either refused
+    // before anything was allocated, or torn down and restored after the
+    // setter (F7).
+    demoted,
+    // The one-copy attempt failed AND the Hexagon globals could not be
+    // restored (a shared buffer is still live): fail the load - never load
+    // two-copy on top of a live shared buffer.
     failed,
 };
 
@@ -208,7 +279,7 @@ onecopy_load_result load_governor_one_model(
     ggml_backend_dev_t gpu = find_registered_device("GPUOpenCL");
     if (npu == nullptr || gpu == nullptr) {
         demote(npu == nullptr ? "HTP0 not registered" : "GPUOpenCL not registered");
-        return onecopy_load_result::demoted_pre_load;
+        return onecopy_load_result::demoted;
     }
 
     // The step-2 setter: offer the device's TILE32/HOST buffer types to the
@@ -217,21 +288,37 @@ onecopy_load_result load_governor_one_model(
     // load or context creation - here, before anything reads the Hexagon
     // buffer types. Nonzero = refused (a shared buffer is still alive in
     // this process).
-    ggml_backend_reg_t htp_reg = ggml_backend_reg_by_name("HTP");
-    auto set_shared_weights = htp_reg == nullptr ? nullptr :
-        reinterpret_cast<ggml_backend_hexagon_set_shared_weights_t>(
-            ggml_backend_reg_get_proc_address(htp_reg,
-                                              "ggml_backend_hexagon_set_shared_weights"));
+    auto set_shared_weights = hexagon_shared_weights_setter();
     if (set_shared_weights == nullptr) {
         demote("hexagon shared-weights setter missing");
-        return onecopy_load_result::demoted_pre_load;
+        return onecopy_load_result::demoted;
     }
+    // F3: the setter's globals are unsynchronized engine state; from here to
+    // the governor's construction (and on every failure path, through the
+    // teardown and restore) this load owns them under one process-wide lock.
+    const std::lock_guard<std::mutex> onecopy_guard(onecopy_load_mutex());
     const ggml_hexagon_shared_weights shared_weights {
         true, k_onecopy_shared_mbuf_bytes };
     if (set_shared_weights(&shared_weights) != 0) {
         demote("shared weights refused (a shared buffer is alive)");
-        return onecopy_load_result::demoted_pre_load;
+        return onecopy_load_result::demoted;
     }
+    // F7: a failure after the setter is still recoverable - tear down, restore
+    // the globals, and let the two-model branch load instead. Only a refused
+    // restore escalates to failed: two-copy on top of a live shared buffer is
+    // the one unrecoverable state.
+    auto fail_onecopy = [&](const std::string & reason) -> onecopy_load_result {
+        teardown_onecopy_unlocked(owner);
+        if (!restore_hexagon_shared_weights()) {
+            LOG_ERROR(
+                "KALSA_GOVERNOR_FALLBACK {stage:\"onecopy\", models_loaded:0, "
+                "reason:\"restore refused after '%s' (shared buffers live)\"}",
+                reason.c_str());
+            return onecopy_load_result::failed;
+        }
+        demote(reason.c_str());
+        return onecopy_load_result::demoted;
+    };
 
     // The load contract (llama-ext.h): devices {HTP0, GPUOpenCL} with every
     // layer on HTP0 via tensor_split {1,0}, no mmap (the shared buffers are
@@ -277,14 +364,10 @@ onecopy_load_result load_governor_one_model(
     try {
         owner.governor_onecopy_init = common_init_from_params(params, true);
     } catch (const std::exception & error) {
-        teardown_governor_load(owner);
-        demote(error.what());
-        return onecopy_load_result::failed;
+        return fail_onecopy(error.what());
     }
     if (owner.governor_onecopy_init == nullptr || owner.governor_onecopy_init->model() == nullptr) {
-        teardown_governor_load(owner);
-        demote("one-copy model load failed");
-        return onecopy_load_result::failed;
+        return fail_onecopy("one-copy model load failed");
     }
 
     // The legs (owner decision J(1)): the NPU leg lists GPUOpenCL second, so
@@ -304,25 +387,23 @@ onecopy_load_result load_governor_one_model(
         { llama_governor_engine::GPU, gpu_leg_devices, gpu_leg_params },
         { llama_governor_engine::CPU, nullptr, leg_params },
     };
-    // The lane is what the table proved; the policy inputs follow the
-    // governor-bench one-model arm (arm L) that passed the S23 gate.
-    llama_governor_params policy_params = governor_params;
-    policy_params.npu_lane_enabled = true;
-    policy_params.htp_trunk_readable = true;
-    policy_params.htp_experts_readable = true;
+    // F4: the caller's governor params pass through untouched. The one-copy
+    // branch already required npu_lane_enabled (the kill switch), and the
+    // readability facts are not synthesized because the engine's one-model
+    // governor proves them by construction: its ctor sets npu_lane_capable
+    // when the NPU leg exists, and the policy reads that flag BEFORE the
+    // fit / htp_trunk_readable / htp_experts_readable facts (vendored
+    // llama-governor-policy.cpp:230-243) - with the NPU leg absent those
+    // caller facts decide as they always did.
     try {
         owner.governor = std::make_unique<rn_governor>(
-            owner.governor_onecopy_init->model(), legs, 3, policy_params);
+            owner.governor_onecopy_init->model(), legs, 3, governor_params);
     } catch (const std::exception & error) {
-        teardown_governor_load(owner);
-        demote(error.what());
-        return onecopy_load_result::failed;
+        return fail_onecopy(error.what());
     }
 
     if (!owner.governor->set_thermo_profile(governor_thermo)) {
-        teardown_governor_load(owner);
-        demote("thermo profile invalid");
-        return onecopy_load_result::failed;
+        return fail_onecopy("thermo profile invalid");
     }
 
     owner.model = owner.governor_onecopy_init->model();
@@ -336,9 +417,7 @@ onecopy_load_result load_governor_one_model(
         ggml_type_name(params.cache_type_k), ggml_type_name(params.cache_type_v),
         params.no_kv_offload ? "host" : "device");
     if (owner.model == nullptr || owner.ctx == nullptr) {
-        teardown_governor_load(owner);
-        demote("one-copy governor without an active context");
-        return onecopy_load_result::failed;
+        return fail_onecopy("one-copy governor without an active context");
     }
     return onecopy_load_result::loaded;
 }
@@ -358,7 +437,11 @@ bool load_governor_models(llama_rn_context & owner,
         hw_facts.soc_model.c_str(), hw_facts.hexagon_arch.c_str(), hw_facts.gpu_name.c_str(),
         hw_facts.gpu_version.c_str(), hw_facts.gpu_driver.c_str(),
         (int) hw_facts.dotprod, (int) leg_set.one_copy);
-    if (leg_set.one_copy) {
+    // F4: the caller's NPU kill switch gates the one-copy branch too - the
+    // table proves the hardware, npu_lane_enabled says this caller wants the
+    // NPU lane at all. With it off, today's path runs (two-model where its
+    // own lane logic resolves, the plain load elsewhere).
+    if (leg_set.one_copy && governor_params.npu_lane_enabled) {
         // A runtime HTP failure downgrades every later load of this process
         // (note_htp_runtime_fallback): the one-copy prefill IS the HTP lane,
         // so the downgrade applies here too and the two-model branch below
@@ -373,7 +456,7 @@ bool load_governor_models(llama_rn_context & owner,
                                             load_options)) {
             case onecopy_load_result::loaded:
                 return true;
-            case onecopy_load_result::demoted_pre_load:
+            case onecopy_load_result::demoted:
                 break; // fall through to the two-model load below
             case onecopy_load_result::failed:
                 return false;

@@ -84,7 +84,8 @@ rn_thermal_legs::rn_thermal_legs(const std::string & sysfs_root) {
         }
         const bool is_cpu = type.rfind("cpu", 0) == 0;
         const bool is_npu = type.rfind("nsp", 0) == 0;
-        if (!is_cpu && !is_npu) {
+        const bool is_gpu = type.rfind("gpu", 0) == 0;
+        if (!is_cpu && !is_npu && !is_gpu) {
             continue;
         }
         long trip_mc = 0;
@@ -92,7 +93,7 @@ rn_thermal_legs::rn_thermal_legs(const std::string & sysfs_root) {
         if (!lowest_passive_trip_mc(dir, &trip_mc) || !read_long(dir + "/temp", &temp_mc)) {
             continue;
         }
-        auto & leg = is_cpu ? cpu_zones_ : npu_zones_;
+        auto & leg = is_cpu ? cpu_zones_ : (is_npu ? npu_zones_ : gpu_zones_);
         leg.push_back({dir + "/temp", trip_mc});
     }
     ::closedir(root);
@@ -113,7 +114,7 @@ rn_thermal_legs::headroom rn_thermal_legs::sample() const {
         }
         return best;
     };
-    return {leg_headroom(cpu_zones_), leg_headroom(npu_zones_)};
+    return {leg_headroom(cpu_zones_), leg_headroom(npu_zones_), leg_headroom(gpu_zones_)};
 }
 
 } // namespace rnllama

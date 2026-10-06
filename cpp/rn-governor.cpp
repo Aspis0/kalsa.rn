@@ -62,8 +62,9 @@ void rn_governor::init_hop_reader(const llama_governor_params & params) {
     if (params.decode_hop_tokens > 0) {
         decode_hop_tokens_ = params.decode_hop_tokens;
         decode_legs_ = std::make_unique<rn_thermal_legs>("/sys/class/thermal");
-        LOG_INFO("governor: decode hop thermal legs cpu=%d npu=%d zones",
-                 decode_legs_->cpu_zone_count(), decode_legs_->npu_zone_count());
+        LOG_INFO("governor: decode hop thermal legs cpu=%d npu=%d gpu=%d zones",
+                 decode_legs_->cpu_zone_count(), decode_legs_->npu_zone_count(),
+                 decode_legs_->gpu_zone_count());
     }
 }
 
@@ -151,7 +152,11 @@ void rn_governor::feed_decode_headroom() {
         return;
     }
     const rn_thermal_legs::headroom legs = decode_legs_->sample();
-    llama_governor_set_decode_headroom(governor_, legs.cpu_headroom_c, legs.npu_headroom_c);
+    // The GPU value is NaN without gpu zones (no GPU leg): the engine's hop
+    // treats an unknown leg as unavailable, which is exactly the two-model
+    // and Jelly behaviour.
+    llama_governor_set_decode_headroom(governor_, legs.cpu_headroom_c, legs.npu_headroom_c,
+                                       legs.gpu_headroom_c);
 }
 
 bool rn_governor::set_thermo_profile(const llama_governor_thermo_profile & profile) {

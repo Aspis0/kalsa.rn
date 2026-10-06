@@ -25,6 +25,12 @@ public:
     rn_governor(llama_model * prefill_model, llama_model * decode_model,
                 llama_context_params prefill_params, llama_context_params decode_params,
                 const llama_governor_params & params);
+    // The one-model form: one shared llama_model, one context per leg spec
+    // (llama_governor_init_one_model_with_params). Absent legs (no devices,
+    // or a device the model does not list) are the engine's call; the CPU
+    // leg is required by the engine.
+    rn_governor(llama_model * model, const llama_governor_leg * legs, uint32_t n_legs,
+                const llama_governor_params & params);
     ~rn_governor();
 
     llama_context * active_ctx() const;
@@ -56,7 +62,10 @@ public:
     const std::string & failure_reason() const { return failure_reason_; }
 
 private:
-    // Samples both legs and hands the headroom to the engine; a no-op when
+    // The decode-hop thermal-leg reader both constructors share: built only
+    // when decode_hop_tokens > 0, so a hop-less governor does no sysfs work.
+    void init_hop_reader(const llama_governor_params & params);
+    // Samples the legs and hands the headroom to the engine; a no-op when
     // there is no reader (decode_hop_tokens == 0).
     void feed_decode_headroom();
 

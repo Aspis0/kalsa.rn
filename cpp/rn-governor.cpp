@@ -23,6 +23,38 @@ rn_governor::rn_governor(llama_model * prefill_model, llama_model * decode_model
             : failure_reason;
         throw std::runtime_error(failure_reason_);
     }
+    init_hop_reader(params);
+}
+
+rn_governor::rn_governor(llama_model * model, const llama_governor_leg * legs, uint32_t n_legs,
+                         const llama_governor_params & params)
+    : gpu_fit_(params.gpu_fit) {
+    // One shared llama_model, one context per leg (F1). A null engine
+    // governor logged its reason on the engine side (no out-param in the
+    // one-model form); the caller falls back to the two-model load.
+    governor_ = llama_governor_init_one_model_with_params(model, legs, n_legs, params);
+    if (governor_ == nullptr) {
+        failure_reason_ = "llama_governor_init_one_model_with_params returned null";
+        throw std::runtime_error(failure_reason_);
+    }
+    // A present leg the engine did not build (its device refused, e.g. the
+    // OpenCL import) is a runtime demotion: logged once here, the hop simply
+    // never uses that leg, and the load stays one-copy on the legs that did
+    // build. The CPU leg cannot be absent - the engine refuses without it.
+    for (uint32_t i = 0; i < n_legs; ++i) {
+        if (legs[i].engine == llama_governor_engine::CPU) {
+            continue;
+        }
+        if (llama_governor_leg_ctx(governor_, legs[i].engine) == nullptr) {
+            LOG_ERROR(
+                "KALSA_GOVERNOR_FALLBACK {stage:\"onecopy_leg_absent\", models_loaded:1, engine:\"%s\"}",
+                legs[i].engine == llama_governor_engine::NPU ? "NPU" : "GPU");
+        }
+    }
+    init_hop_reader(params);
+}
+
+void rn_governor::init_hop_reader(const llama_governor_params & params) {
     // The leg reader exists only when the hop is configured, so a hop-less
     // governor does no sysfs work; the one-time counts say which legs the
     // headroom rule can decide (both zero -> the engine's alternation

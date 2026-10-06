@@ -6,7 +6,9 @@
 #include "rn-completion.h"
 #include "rn-governor.h"
 #include "rn-governor-params.h"
+#include "rn-legs-table.h"
 #include "llama-governor-device.h"
+#include "ggml-hexagon.h"
 #include "rn-slot-manager.h"
 #include "rn-common.hpp"
 
@@ -19,6 +21,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <stdexcept>
 
@@ -128,10 +131,252 @@ governor_lane_kv_plan decide_governor_lane_kv(
     };
 }
 
+// The OpenCL leg holds cl_mem imports of the model's Hexagon dma-bufs; they
+// must be released after the contexts that use them are gone and before the
+// model's buffers free. A build without the OpenCL backend (or an idle one,
+// no imports) is a no-op.
+void release_opencl_imports() {
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("OpenCL");
+    if (reg == nullptr) {
+        return;
+    }
+    auto release = reinterpret_cast<void (*)()>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_release_imports"));
+    if (release != nullptr) {
+        release();
+    }
+}
+
+// One teardown for every governor load, both forms: the governor's leg
+// contexts free first, then the OpenCL imports, then the models.
+void teardown_governor_load(llama_rn_context & owner) {
+    owner.governor.reset();
+    release_opencl_imports();
+    owner.governor_onecopy_init.reset();
+    owner.governor_decode_init.reset();
+    owner.governor_prefill_init.reset();
+    owner.llama_init.reset();
+    owner.model = nullptr;
+    owner.ctx = nullptr;
+}
+
+// F-12: the legs pick the accelerators by their EXACT registered names -
+// never a prefix or "first other GPU" match, which could load the wrong
+// backend.
+ggml_backend_dev_t find_registered_device(const char * wanted) {
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (std::strcmp(ggml_backend_dev_name(dev), wanted) == 0) {
+            return dev;
+        }
+    }
+    return nullptr;
+}
+
+// Cap for the shared Hexagon buffers: every TILE32/HOST buffer becomes one
+// dma-buf the OpenCL leg imports, so each must stay under the S23's
+// CL_DEVICE_MAX_MEM_ALLOC_SIZE (884 MB). The lab arms ran
+// GGML_HEXAGON_MBUF=832 (one-copy REPORT, step 4 buffer census).
+constexpr size_t k_onecopy_shared_mbuf_bytes = (size_t) 832 * 1024 * 1024;
+
+enum class onecopy_load_result {
+    loaded,
+    // Refused before anything was allocated: the caller falls through to the
+    // two-model branch in this process.
+    demoted_pre_load,
+    // Failed with model or governor state alive (or after it was torn down):
+    // the caller fails the load like any governor failure - piling a
+    // two-copy load onto whatever just failed is the wrong way down.
+    failed,
+};
+
+// The one-copy three-leg load (FABLE (b), step 6): ONE model load per the
+// engine's load contract, legs built through the one-model governor. Every
+// refusal here demotes to today's loads - never to an NPU load without the
+// OpenCL HOST leg (J(1)).
+onecopy_load_result load_governor_one_model(
+        llama_rn_context & owner,
+        const llama_governor_params & governor_params,
+        const llama_governor_thermo_profile & governor_thermo,
+        const governor_load_options & load_options) {
+    auto demote = [](const char * reason) {
+        LOG_ERROR("KALSA_GOVERNOR_FALLBACK {stage:\"onecopy\", models_loaded:0, reason:\"%s\"}",
+                  reason);
+    };
+
+    ggml_backend_dev_t npu = find_registered_device("HTP0");
+    ggml_backend_dev_t gpu = find_registered_device("GPUOpenCL");
+    if (npu == nullptr || gpu == nullptr) {
+        demote(npu == nullptr ? "HTP0 not registered" : "GPUOpenCL not registered");
+        return onecopy_load_result::demoted_pre_load;
+    }
+
+    // The step-2 setter: offer the device's TILE32/HOST buffer types to the
+    // weight placement (one weights copy for the HTP, CPU and GPU legs) and
+    // cap the Hexagon buffer size. It takes effect only before any model
+    // load or context creation - here, before anything reads the Hexagon
+    // buffer types. Nonzero = refused (a shared buffer is still alive in
+    // this process).
+    ggml_backend_reg_t htp_reg = ggml_backend_reg_by_name("HTP");
+    auto set_shared_weights = htp_reg == nullptr ? nullptr :
+        reinterpret_cast<ggml_backend_hexagon_set_shared_weights_t>(
+            ggml_backend_reg_get_proc_address(htp_reg,
+                                              "ggml_backend_hexagon_set_shared_weights"));
+    if (set_shared_weights == nullptr) {
+        demote("hexagon shared-weights setter missing");
+        return onecopy_load_result::demoted_pre_load;
+    }
+    const ggml_hexagon_shared_weights shared_weights {
+        true, k_onecopy_shared_mbuf_bytes };
+    if (set_shared_weights(&shared_weights) != 0) {
+        demote("shared weights refused (a shared buffer is alive)");
+        return onecopy_load_result::demoted_pre_load;
+    }
+
+    // The load contract (llama-ext.h): devices {HTP0, GPUOpenCL} with every
+    // layer on HTP0 via tensor_split {1,0}, no mmap (the shared buffers are
+    // rpcmem, not file pages), no extra buffer types (no CPU_REPACK second
+    // copy). The decode_repack knob has no decode model to repack here.
+    if (!load_options.decode_repack) {
+        LOG_INFO("KALSA_ONECOPY_NOTE {decode_repack:\"ignored (one model, no decode copy)\"}");
+    }
+    common_params params = owner.params;
+    params.devices = { npu, gpu };
+    params.tensor_split[0] = 1.0f;
+    params.tensor_split[1] = 0.0f;
+    params.n_gpu_layers = 99;
+    params.n_parallel = 1;
+    // No mmap: the shared buffers are rpcmem, not file pages - explicit, not
+    // left to the loader's per-device AUTO demotion.
+    params.load_mode = LLAMA_LOAD_MODE_NONE;
+    params.lazy_mode = LLAMA_LAZY_MODE_OFF;
+    params.no_extra_bufts = true;
+    // One KV decision for every leg: llama_kv_route_query::compatible
+    // refuses mismatched cache types across leg contexts, the way the
+    // two-model lane keeps its pair identical.
+    const ggml_type requested_k = params.cache_type_k;
+    const ggml_type requested_v = params.cache_type_v;
+    const auto lane_kv = decide_governor_lane_kv(requested_k, requested_v, params.flash_attn_type);
+    if (lane_kv.kv_on_device) {
+        params.cache_type_k = lane_kv.type_k;
+        params.cache_type_v = lane_kv.type_v;
+        if (params.cache_type_k != requested_k || params.cache_type_v != requested_v) {
+            LOG_INFO(
+                "KALSA_KV_TYPE_OVERRIDE {requested_k:\"%s\", requested_v:\"%s\", "
+                "effective_k:\"%s\", effective_v:\"%s\", reason:\"htp-prefill-kv\"}",
+                ggml_type_name(requested_k), ggml_type_name(requested_v),
+                ggml_type_name(params.cache_type_k), ggml_type_name(params.cache_type_v));
+        }
+    } else {
+        params.no_kv_offload = true;
+        LOG_INFO(
+            "KALSA_KV_HOST_PIN {requested_k:\"%s\", requested_v:\"%s\", reason:\"flash-attn-off\"}",
+            ggml_type_name(requested_k), ggml_type_name(requested_v));
+    }
+
+    try {
+        owner.governor_onecopy_init = common_init_from_params(params, true);
+    } catch (const std::exception & error) {
+        teardown_governor_load(owner);
+        demote(error.what());
+        return onecopy_load_result::failed;
+    }
+    if (owner.governor_onecopy_init == nullptr || owner.governor_onecopy_init->model() == nullptr) {
+        teardown_governor_load(owner);
+        demote("one-copy model load failed");
+        return onecopy_load_result::failed;
+    }
+
+    // The legs (owner decision J(1)): the NPU leg lists GPUOpenCL second, so
+    // OpenCL takes what the HTP refuses - the tied Q6_K output read in
+    // place. Host threads: the NPU and CPU legs take the caller's counts
+    // (one host thread starved the J(1) NPU decode to 12-13 tok/s), the GPU
+    // leg one (F1). The engine drops an absent leg; the governor ctor logs
+    // one fallback line per dropped accelerator leg.
+    llama_context_params leg_params = common_context_params_to_llama(params);
+    llama_context_params gpu_leg_params = leg_params;
+    gpu_leg_params.n_threads = 1;
+    gpu_leg_params.n_threads_batch = 1;
+    const ggml_backend_dev_t npu_leg_devices[] = { npu, gpu, nullptr };
+    const ggml_backend_dev_t gpu_leg_devices[] = { gpu, nullptr };
+    const llama_governor_leg legs[] = {
+        { llama_governor_engine::NPU, npu_leg_devices, leg_params },
+        { llama_governor_engine::GPU, gpu_leg_devices, gpu_leg_params },
+        { llama_governor_engine::CPU, nullptr, leg_params },
+    };
+    // The lane is what the table proved; the policy inputs follow the
+    // governor-bench one-model arm (arm L) that passed the S23 gate.
+    llama_governor_params policy_params = governor_params;
+    policy_params.npu_lane_enabled = true;
+    policy_params.htp_trunk_readable = true;
+    policy_params.htp_experts_readable = true;
+    try {
+        owner.governor = std::make_unique<rn_governor>(
+            owner.governor_onecopy_init->model(), legs, 3, policy_params);
+    } catch (const std::exception & error) {
+        teardown_governor_load(owner);
+        demote(error.what());
+        return onecopy_load_result::failed;
+    }
+
+    if (!owner.governor->set_thermo_profile(governor_thermo)) {
+        teardown_governor_load(owner);
+        demote("thermo profile invalid");
+        return onecopy_load_result::failed;
+    }
+
+    owner.model = owner.governor_onecopy_init->model();
+    owner.ctx = owner.governor->prefill_ctx();
+    owner.params.n_gpu_layers = 99;
+    owner.setGovernorKvCache(
+        ggml_type_name(params.cache_type_k), ggml_type_name(params.cache_type_v),
+        params.no_kv_offload ? "host" : "device");
+    if (owner.model == nullptr || owner.ctx == nullptr) {
+        teardown_governor_load(owner);
+        demote("one-copy governor without an active context");
+        return onecopy_load_result::failed;
+    }
+    return onecopy_load_result::loaded;
+}
+
 bool load_governor_models(llama_rn_context & owner,
                           const llama_governor_params & governor_params,
                           const llama_governor_thermo_profile & governor_thermo,
                           const governor_load_options & load_options) {
+    // The capability table is the only allow-list for the one-copy load:
+    // exactly the validated devices get it, everything else - including any
+    // fact that did not read - keeps today's loads byte for byte (R2).
+    const rn_hw_facts hw_facts = rn_read_hw_facts();
+    const rn_leg_set leg_set = rn_legs_for(hw_facts);
+    LOG_INFO(
+        "KALSA_LEGS_TABLE {soc:\"%s\", hexagon:\"%s\", gpu_name:\"%s\", gpu_version:\"%s\", "
+        "gpu_driver:\"%s\", dotprod:%d, one_copy:%d}",
+        hw_facts.soc_model.c_str(), hw_facts.hexagon_arch.c_str(), hw_facts.gpu_name.c_str(),
+        hw_facts.gpu_version.c_str(), hw_facts.gpu_driver.c_str(),
+        (int) hw_facts.dotprod, (int) leg_set.one_copy);
+    if (leg_set.one_copy) {
+        // A runtime HTP failure downgrades every later load of this process
+        // (note_htp_runtime_fallback): the one-copy prefill IS the HTP lane,
+        // so the downgrade applies here too and the two-model branch below
+        // handles it.
+        const char * htp_init_reason = std::getenv("KALSA_HTP_FALLBACK");
+        if (htp_init_reason != nullptr && htp_init_reason[0] != '\0') {
+            LOG_ERROR(
+                "KALSA_GOVERNOR_FALLBACK {stage:\"onecopy\", models_loaded:0, reason:\"%s\"}",
+                htp_init_reason);
+        } else {
+            switch (load_governor_one_model(owner, governor_params, governor_thermo,
+                                            load_options)) {
+            case onecopy_load_result::loaded:
+                return true;
+            case onecopy_load_result::demoted_pre_load:
+                break; // fall through to the two-model load below
+            case onecopy_load_result::failed:
+                return false;
+            }
+        }
+    }
+
     // Backend registration already happened in this SAME load step: the JSI
     // task called ensureBackendInitialized() (jsi/RNLlamaJSI.cpp:660) before
     // us, and the resolver never registers itself — the ggml registry is
@@ -260,11 +505,7 @@ bool load_governor_models(llama_rn_context & owner,
 
     const bool profile_valid = governor_thermo_profile_is_valid(governor_thermo);
     auto cleanup = [&owner]() {
-        owner.governor.reset();
-        owner.governor_decode_init.reset();
-        owner.governor_prefill_init.reset();
-        owner.model = nullptr;
-        owner.ctx = nullptr;
+        teardown_governor_load(owner);
     };
     auto fail = [&](const char * stage, int models_loaded,
                     const std::string & reason) {
@@ -811,6 +1052,10 @@ llama_rn_context::~llama_rn_context() {
         lora.clear();
         clear_init_lora_ownership(llama_init);
         owned_lora.clear();
+        // Explicit: release_opencl_imports must run between the governor's
+        // leg contexts freeing and the model freeing, which member
+        // destruction cannot order.
+        teardown_governor_load(*this);
     } else {
         removeLoraAdapters();
     }
@@ -1073,12 +1318,7 @@ bool llama_rn_context::loadModel(
     // context, then the hook. Inverse of this order dangling-cb_eval or UAF on reload.
     if (moe_stream) moe_stream->shutdown();
     moe_stream.reset();
-    governor.reset();
-    governor_decode_init.reset();
-    governor_prefill_init.reset();
-    llama_init.reset();
-    model = nullptr;
-    ctx = nullptr;
+    teardown_governor_load(*this);
 
     // The CLI layer this fork does not ship is what resolves the cpu params
     // (kalsallama common/arg.cpp:891-892); nothing else does, and this pin's
@@ -1179,8 +1419,13 @@ bool llama_rn_context::loadModel(
     }
 
     if (governor_enabled) {
-        templates = common_chat_templates_init(
-            governor_decode_init->model(), params.chat_template);
+        // Both governor forms carry the same GGUF; the two-model inits are
+        // the historical source and keep precedence.
+        llama_model * governor_model = governor_decode_init != nullptr
+            ? governor_decode_init->model()
+            : (governor_prefill_init != nullptr ? governor_prefill_init->model()
+                                                : governor_onecopy_init->model());
+        templates = common_chat_templates_init(governor_model, params.chat_template);
         n_ctx = llama_n_ctx(active_ctx());
     } else {
         templates = common_chat_templates_init(model, params.chat_template);

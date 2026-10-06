@@ -131,6 +131,10 @@ struct llama_rn_context {
     std::unique_ptr<kalsa::MoeStream> moe_stream;
     common_init_result_ptr governor_prefill_init;
     common_init_result_ptr governor_decode_init;
+    // The one-copy load's single model (declared before governor so reverse
+    // destruction order frees the governor's leg contexts first, as with the
+    // two-model inits above).
+    common_init_result_ptr governor_onecopy_init;
     std::unique_ptr<rn_governor> governor;
     // Literal strings only (see governorPause): the last decode()'s
     // flow-control pause classification, cleared at decode entry.

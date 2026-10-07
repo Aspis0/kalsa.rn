@@ -55,8 +55,31 @@ bool none(const rn_leg_set & legs) {
     return !legs.one_copy && !legs.npu && !legs.gpu && !legs.cpu;
 }
 
+bool tuning_is(const rn_leg_set & legs, float tau_s, float heat_weight, float npu, float gpu,
+               float cpu) {
+    return legs.decode_headroom_tau_s == tau_s && legs.decode_heat_weight == heat_weight &&
+           legs.decode_heat_per_token_npu == npu && legs.decode_heat_per_token_gpu == gpu &&
+           legs.decode_heat_per_token_cpu == cpu;
+}
+
 bool test_row_matches() {
     return all_three(rn_legs_for(s23_facts()));
+}
+
+// The matched row ships its measured hop tuning (owner decision 2026-10-07):
+// tau 10 s smoothing, heat weight 7, skin C per 1k decode tokens per leg.
+bool test_row_returns_tuning() {
+    return all_three(rn_legs_for(s23_facts())) &&
+           tuning_is(rn_legs_for(s23_facts()), 10.0f, 7.0f, 2.8f, 3.2f, 4.7f);
+}
+
+// Zero = off when no row matched: today's raw headroom rule on every
+// non-validated device.
+bool test_no_match_tuning_is_zero() {
+    if (!tuning_is(rn_legs_for(rn_hw_facts{}), 0, 0, 0, 0, 0)) { return false; }
+    auto facts = s23_facts();
+    facts.gpu_driver = "OpenCL 3.0 QUALCOMM build: 9999.99 Compiler E031.50.00.00";
+    return tuning_is(rn_legs_for(facts), 0, 0, 0, 0, 0);
 }
 
 bool test_model_token_boundaries() {
@@ -133,6 +156,8 @@ bool test_other_phones() {
 int main() {
     TestResults results;
     results.run_test("S23 row matches", test_row_matches());
+    results.run_test("S23 row returns the hop tuning", test_row_returns_tuning());
+    results.run_test("no row matched returns zero tuning", test_no_match_tuning_is_zero());
     results.run_test("model token boundaries", test_model_token_boundaries());
     results.run_test("driver compiler major.minor line", test_driver_compiler_line());
     results.run_test("non-Adreno 740 refused (Adreno identity required)",

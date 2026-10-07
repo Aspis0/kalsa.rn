@@ -28,6 +28,16 @@ struct rn_leg_set {
     bool npu = false;
     bool gpu = false;
     bool cpu = false;
+    // The decode-hop tuning of the matched row (owner decision 2026-10-07):
+    // headroom EMA time constant in seconds, then the skin-C heat weighting
+    // measured on that device per leg (S23 ABBA: -15 % skin rise at equal
+    // speed vs the raw rule). Per-device constants live in the row, never in
+    // global defaults; all zero when no row matched = the raw rule, off.
+    float decode_headroom_tau_s = 0.0f;
+    float decode_heat_weight = 0.0f;
+    float decode_heat_per_token_npu = 0.0f;
+    float decode_heat_per_token_gpu = 0.0f;
+    float decode_heat_per_token_cpu = 0.0f;
 };
 
 // The capability table: one pure, host-tested match against the validated

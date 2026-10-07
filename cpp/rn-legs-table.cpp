@@ -54,10 +54,19 @@ struct rn_legs_row {
     const char * gpu_vendor_token;
     const char * gpu_model_token;
     const char * gpu_compiler;
+    // The decode-hop tuning this row ships (owner decision 2026-10-07,
+    // lab PLAN.md raw/session13 + session14): measured on THIS device per
+    // leg, so it moves only with a new lab report on that hardware.
+    float decode_headroom_tau_s;
+    float decode_heat_weight;
+    float decode_heat_per_token_npu;
+    float decode_heat_per_token_gpu;
+    float decode_heat_per_token_cpu;
 };
 
 const rn_legs_row k_rows[] = {
-    { "SM8550", "Hexagon v73", "Adreno", "740", "E031.41." },
+    { "SM8550", "Hexagon v73", "Adreno", "740", "E031.41.",
+      10.0f, 7.0f, 2.8f, 3.2f, 4.7f },
 };
 
 bool row_matches(const rn_legs_row & row, const rn_hw_facts & facts) {
@@ -148,8 +157,18 @@ rn_leg_set rn_legs_for(const rn_hw_facts & facts) {
             // All three legs or nothing (J(1)/R2): the NPU decode on the
             // shared copy reads the tied Q6_K output through the OpenCL HOST
             // leg, so one-copy without a validated GPU leg is not a state
-            // this table can produce.
-            return { true, true, true, true };
+            // this table can produce. The row's hop tuning rides along.
+            rn_leg_set match;
+            match.one_copy = true;
+            match.npu = true;
+            match.gpu = true;
+            match.cpu = true;
+            match.decode_headroom_tau_s = row.decode_headroom_tau_s;
+            match.decode_heat_weight = row.decode_heat_weight;
+            match.decode_heat_per_token_npu = row.decode_heat_per_token_npu;
+            match.decode_heat_per_token_gpu = row.decode_heat_per_token_gpu;
+            match.decode_heat_per_token_cpu = row.decode_heat_per_token_cpu;
+            return match;
         }
     }
     return {};

@@ -269,7 +269,8 @@ onecopy_load_result load_governor_one_model(
         llama_rn_context & owner,
         const llama_governor_params & governor_params,
         const llama_governor_thermo_profile & governor_thermo,
-        const governor_load_options & load_options) {
+        const governor_load_options & load_options,
+        const rn_leg_set & leg_set) {
     auto demote = [](const char * reason) {
         LOG_ERROR("KALSA_GOVERNOR_FALLBACK {stage:\"onecopy\", models_loaded:0, reason:\"%s\"}",
                   reason);
@@ -387,7 +388,10 @@ onecopy_load_result load_governor_one_model(
         { llama_governor_engine::GPU, gpu_leg_devices, gpu_leg_params },
         { llama_governor_engine::CPU, nullptr, leg_params },
     };
-    // F4: the caller's governor params pass through untouched. The one-copy
+    // F4: the caller's governor params pass through, with the matched row's
+    // decode-hop tuning filled in (owner decision 2026-10-07): the copy is
+    // local to this branch, so the two-model path below keeps the caller's
+    // params (tau 0, weight 0) whatever happens here. The one-copy
     // branch already required npu_lane_enabled (the kill switch), and the
     // readability facts are not synthesized because the engine's one-model
     // governor proves them by construction: its ctor sets npu_lane_capable
@@ -395,9 +399,15 @@ onecopy_load_result load_governor_one_model(
     // fit / htp_trunk_readable / htp_experts_readable facts (vendored
     // llama-governor-policy.cpp:230-243) - with the NPU leg absent those
     // caller facts decide as they always did.
+    llama_governor_params onecopy_params = governor_params;
+    onecopy_params.decode_headroom_tau_s = leg_set.decode_headroom_tau_s;
+    onecopy_params.decode_heat_weight = leg_set.decode_heat_weight;
+    onecopy_params.decode_heat_per_token_npu = leg_set.decode_heat_per_token_npu;
+    onecopy_params.decode_heat_per_token_gpu = leg_set.decode_heat_per_token_gpu;
+    onecopy_params.decode_heat_per_token_cpu = leg_set.decode_heat_per_token_cpu;
     try {
         owner.governor = std::make_unique<rn_governor>(
-            owner.governor_onecopy_init->model(), legs, 3, governor_params);
+            owner.governor_onecopy_init->model(), legs, 3, onecopy_params);
     } catch (const std::exception & error) {
         return fail_onecopy(error.what());
     }
@@ -433,10 +443,13 @@ bool load_governor_models(llama_rn_context & owner,
     const rn_leg_set leg_set = rn_legs_for(hw_facts);
     LOG_INFO(
         "KALSA_LEGS_TABLE {soc:\"%s\", hexagon:\"%s\", gpu_name:\"%s\", gpu_version:\"%s\", "
-        "gpu_driver:\"%s\", dotprod:%d, one_copy:%d}",
+        "gpu_driver:\"%s\", dotprod:%d, one_copy:%d, tau_s:%g, heat_w:%g, "
+        "heat_tok_npu:%g, heat_tok_gpu:%g, heat_tok_cpu:%g}",
         hw_facts.soc_model.c_str(), hw_facts.hexagon_arch.c_str(), hw_facts.gpu_name.c_str(),
         hw_facts.gpu_version.c_str(), hw_facts.gpu_driver.c_str(),
-        (int) hw_facts.dotprod, (int) leg_set.one_copy);
+        (int) hw_facts.dotprod, (int) leg_set.one_copy, leg_set.decode_headroom_tau_s,
+        leg_set.decode_heat_weight, leg_set.decode_heat_per_token_npu,
+        leg_set.decode_heat_per_token_gpu, leg_set.decode_heat_per_token_cpu);
     // F4: the caller's NPU kill switch gates the one-copy branch too - the
     // table proves the hardware, npu_lane_enabled says this caller wants the
     // NPU lane at all. With it off, today's path runs (two-model where its
@@ -453,7 +466,7 @@ bool load_governor_models(llama_rn_context & owner,
                 htp_init_reason);
         } else {
             switch (load_governor_one_model(owner, governor_params, governor_thermo,
-                                            load_options)) {
+                                            load_options, leg_set)) {
             case onecopy_load_result::loaded:
                 return true;
             case onecopy_load_result::demoted:

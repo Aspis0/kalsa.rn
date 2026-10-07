@@ -1,7 +1,8 @@
 // The decode-hop leg rule (FABLE Amendment F, F3 rule v2) and its inputs:
-// which legs may hop and each leg's thermal headroom. select_decode calls
-// hop_decide() only at window boundaries while the hop is active; the safety
-// and lane gates around it stay in select_decode.
+// which legs may hop, each leg's thermal headroom (raw, or the EMA behind
+// decode_headroom_tau_s), and the owner's selectable leg weighting.
+// select_decode calls hop_decide() only at window boundaries while the hop
+// is active; the safety and lane gates around it stay in select_decode.
 //
 // Owner constraints (F6d + owner vision 2026-10-03, "the governor is a
 // three-legged surfer"): open every decode on the NPU; per window, move to
@@ -35,9 +36,46 @@ const char * leg_label(llama_governor_engine engine) {
 
 void llama_governor_policy::set_decode_headroom(float cpu_headroom_c, float npu_headroom_c,
                                                  float gpu_headroom_c) {
+    set_decode_headroom(cpu_headroom_c, npu_headroom_c, gpu_headroom_c, ggml_time_us());
+}
+
+void llama_governor_policy::set_decode_headroom(float cpu_headroom_c, float npu_headroom_c,
+                                                 float gpu_headroom_c, int64_t now_us) {
     decode_cpu_headroom_c_ = cpu_headroom_c;
     decode_npu_headroom_c_ = npu_headroom_c;
     decode_gpu_headroom_c_ = gpu_headroom_c;
+    if (params_.decode_headroom_tau_s <= 0.0f) {
+        return; // smoothing off: hop_decide reads the raw samples (today)
+    }
+    // Per-leg EMA, alpha = 1 - exp(-dt/tau) over the monotonic gap between
+    // samples: the S23's min-zone headroom jumps tens of C between 32-token
+    // windows (single-core spikes), which flipped the pure rule almost every
+    // window. A finite sample whose leg average is not finite seeds it
+    // instead of blending (first sample, or the one after a NaN - a NaN
+    // parks the leg at NaN so the rule falls back until it re-seeds).
+    const float raw[3] = { cpu_headroom_c, gpu_headroom_c, npu_headroom_c };
+    double dt_s = 0.0;
+    if (!decode_headroom_have_last_us_) {
+        decode_headroom_last_us_ = now_us;
+    } else if (now_us > decode_headroom_last_us_) {
+        // Compare before subtracting: on a backwards (or equal) step keep
+        // the last accepted timestamp and dt 0, so the next forward sample
+        // measures real elapsed time from it instead of a stretched one.
+        dt_s = static_cast<double>(static_cast<uint64_t>(now_us) -
+                                   static_cast<uint64_t>(decode_headroom_last_us_)) / 1e6;
+        decode_headroom_last_us_ = now_us;
+    }
+    const float alpha = static_cast<float>(1.0 - std::exp(-dt_s / params_.decode_headroom_tau_s));
+    for (int i = 0; i < 3; ++i) {
+        if (!std::isfinite(raw[i])) {
+            decode_headroom_smooth_[i] = std::numeric_limits<float>::quiet_NaN();
+        } else if (!std::isfinite(decode_headroom_smooth_[i])) {
+            decode_headroom_smooth_[i] = raw[i];
+        } else {
+            decode_headroom_smooth_[i] += alpha * (raw[i] - decode_headroom_smooth_[i]);
+        }
+    }
+    decode_headroom_have_last_us_ = true;
 }
 
 void llama_governor_policy::set_decode_legs(bool npu, bool gpu, bool cpu) {
@@ -70,11 +108,20 @@ const char * llama_governor_policy::hop_decide(uint32_t window, uint32_t tokens_
         return nullptr;
     }
 
+    // What the rule reads: the EMA once smoothing is on, the raw sample
+    // otherwise - tau 0 must stay byte-identical to the shipped path.
     const auto headroom_of = [this](llama_governor_engine engine) {
+        const bool smoothed = params_.decode_headroom_tau_s > 0.0f;
         switch (engine) {
-            case llama_governor_engine::CPU: return decode_cpu_headroom_c_;
-            case llama_governor_engine::GPU: return decode_gpu_headroom_c_;
-            case llama_governor_engine::NPU: return decode_npu_headroom_c_;
+            case llama_governor_engine::CPU:
+                return smoothed ? decode_headroom_smooth_[static_cast<int>(llama_governor_engine::CPU)]
+                                : decode_cpu_headroom_c_;
+            case llama_governor_engine::GPU:
+                return smoothed ? decode_headroom_smooth_[static_cast<int>(llama_governor_engine::GPU)]
+                                : decode_gpu_headroom_c_;
+            case llama_governor_engine::NPU:
+                return smoothed ? decode_headroom_smooth_[static_cast<int>(llama_governor_engine::NPU)]
+                                : decode_npu_headroom_c_;
             case llama_governor_engine::GPU_COOLMODE: break;
         }
         return decode_cpu_headroom_c_;
@@ -109,8 +156,9 @@ const char * llama_governor_policy::hop_decide(uint32_t window, uint32_t tokens_
             // a candidate this falls to the next leg in preference order)
             decode_hop_leg_ = present[0];
         } else {
-            // best other leg by effective headroom; the strict compare keeps
-            // the earlier index on exact ties, which is the NPU preference
+            // NPU_FIRST's loop (the shipped path, unchanged): best other
+            // leg by effective headroom; the strict compare keeps the
+            // earlier index on exact ties, which is the NPU preference
             int best = -1;
             for (int i = 0; i < n_present; ++i) {
                 if (present[i] == decode_hop_leg_) { continue; }
@@ -122,6 +170,25 @@ const char * llama_governor_policy::hop_decide(uint32_t window, uint32_t tokens_
                 effective_of(present[best]) - effective_of(decode_hop_leg_) >= k_hop_hysteresis_c) {
                 decode_hop_leg_ = present[best];
             }
+            if (params_.decode_leg_weighting == llama_governor_leg_weighting::GPU_BURST) {
+                // GPU_BURST: a window the loop above keeps on the CPU goes
+                // to the GPU instead when the GPU is a candidate with at
+                // least the CPU's effective headroom - exactly one window:
+                // the substitution makes GPU the incumbent, and from there
+                // the CPU can only win by beating the GPU, which contradicts
+                // gpu >= cpu, so no second substitution is reachable
+                // back-to-back. The hold below states that wait; every
+                // completed non-GPU window releases it.
+                const bool wanted = decode_hop_leg_ == llama_governor_engine::CPU &&
+                    decode_leg_present_[static_cast<int>(llama_governor_engine::GPU)] &&
+                    effective_of(llama_governor_engine::GPU) >=
+                        effective_of(llama_governor_engine::CPU);
+                if (wanted && !decode_gpu_burst_blocked_) {
+                    decode_hop_leg_ = llama_governor_engine::GPU;
+                    hop_rule = "gpu_burst";
+                    decode_gpu_burst_blocked_ = true;
+                }
+            }
         }
     } else {
         // v1's fixed alternation extended to the present legs: cycle the
@@ -129,15 +196,24 @@ const char * llama_governor_policy::hop_decide(uint32_t window, uint32_t tokens_
         // exactly v1's odd/even window map
         decode_hop_leg_ = present[(window + n_present - 1) % n_present];
     }
+    // Every completed non-GPU window - headroom, alternation or a burst
+    // the hold suppressed - releases the burst hold, so the no-back-to-
+    // back wait is exactly one such window, whatever decided it.
+    if (decode_hop_leg_ != llama_governor_engine::GPU) {
+        decode_gpu_burst_blocked_ = false;
+    }
 
-    // One line per leg change - when and why the work moved, naming all
-    // three headrooms (nan = leg absent or no zones), never a per-window tick.
+    // One line per leg change - when and why the work moved, naming the
+    // three headrooms the rule used (the EMA values when tau > 0; nan = leg
+    // absent or no zones), never a per-window tick.
     if (decode_hop_leg_ != prev_leg) {
         if (all_known) {
             LLAMA_LOG_INFO("governor: decode hop %s->%s at token %u (headroom cpu %.1f C,"
                            " npu %.1f C, gpu %.1f C, hysteresis %.0f C)\n",
                            leg_label(prev_leg), leg_label(decode_hop_leg_), tokens_since_prefill,
-                           decode_cpu_headroom_c_, decode_npu_headroom_c_, decode_gpu_headroom_c_,
+                           headroom_of(llama_governor_engine::CPU),
+                           headroom_of(llama_governor_engine::NPU),
+                           headroom_of(llama_governor_engine::GPU),
                            k_hop_hysteresis_c);
         } else {
             LLAMA_LOG_INFO("governor: decode hop %s->%s at token %u (alternation, zones unknown)\n",

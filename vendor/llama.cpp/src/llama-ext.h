@@ -277,6 +277,21 @@ enum class llama_governor_cool_pays {
     Yes,
 };
 
+/** Which present leg the decode-hop window rule prefers when effective
+ *  headroom decides (rule v2 owner knob, llama-governor-policy-hop.cpp). */
+enum class llama_governor_leg_weighting {
+    // Today's shipped rule: every decode opens on the NPU, and a later
+    // window moves to the best other leg only when it leads the current
+    // leg's effective headroom by the hysteresis (exact ties keep the
+    // NPU > GPU > CPU order).
+    NPU_FIRST,
+    // NPU_FIRST, except a window it keeps on the CPU goes to the GPU when
+    // the GPU's effective headroom is at least the CPU's - a burst is
+    // exactly one window, and the next burst may start only after a
+    // non-GPU window has run.
+    GPU_BURST,
+};
+
 enum class llama_governor_thermal_state {
     Unknown,
     FAST,
@@ -343,6 +358,14 @@ struct llama_governor_params {
     const llama_governor_engine * forced_leg_sequence = nullptr;
     uint32_t forced_leg_sequence_n = 0;
     uint32_t forced_leg_tokens = 0;
+    // Decode-hop rule v2 owner knobs (llama-governor-policy-hop.cpp):
+    // decode_headroom_tau_s > 0 smooths each per-leg headroom sample with
+    // an exponential moving average over the monotonic gap between samples
+    // (seconds; 0 = raw samples, the shipped behaviour; invalid values are
+    // rejected to raw at construction), and decode_leg_weighting selects
+    // the window rule.
+    float decode_headroom_tau_s = 0;
+    llama_governor_leg_weighting decode_leg_weighting = llama_governor_leg_weighting::NPU_FIRST;
 };
 
 /** One successful battery poll. Temperature is the dumpsys tenths-of-degrees-C

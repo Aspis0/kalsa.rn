@@ -56,9 +56,9 @@ struct llama_governor_decode_selection {
     bool wait = false;
     uint32_t rule = 0;
     // While the hop owns decode: static string naming what decided the
-    // current window's leg ("headroom" / "alternation"); null on every
-    // non-hop path, so a safety exit that moves the work labels itself
-    // with no hop rule.
+    // current window's leg ("headroom" / "gpu_burst" / "alternation");
+    // null on every non-hop path, so a safety exit that moves the work
+    // labels itself with no hop rule.
     const char * hop_rule = nullptr;
 };
 
@@ -72,6 +72,12 @@ public:
     // one-model governor's third leg and stays NaN for the two-model form.
     void set_decode_headroom(float cpu_headroom_c, float npu_headroom_c,
                              float gpu_headroom_c = std::numeric_limits<float>::quiet_NaN());
+    // The same setter with an injected monotonic sample time in us: the
+    // clock behind decode_headroom_tau_s's EMA. The public form calls it
+    // with ggml_time_us(); host tests drive it directly to make the
+    // smoothing deterministic.
+    void set_decode_headroom(float cpu_headroom_c, float npu_headroom_c,
+                             float gpu_headroom_c, int64_t now_us);
     // Which decode legs exist and may hop (rule v2): the one-model governor
     // pushes its leg table here (floors may drop a leg); the default
     // NPU+CPU is the two-model form's set, so v1 decisions are unchanged.
@@ -147,8 +153,8 @@ private:
 
     // Rule 4's leg choice (llama-governor-policy-hop.cpp): called only at
     // window boundaries while the hop is active; decides decode_hop_leg_,
-    // returns the hop-rule label ("headroom"/"alternation") and logs one
-    // line per leg change.
+    // returns the hop-rule label ("headroom"/"gpu_burst"/"alternation")
+    // and logs one line per leg change.
     const char * hop_decide(uint32_t window, uint32_t tokens_since_prefill);
 
     llama_governor_params params_;
@@ -182,6 +188,21 @@ private:
     float decode_cpu_headroom_c_ = std::numeric_limits<float>::quiet_NaN();
     float decode_npu_headroom_c_ = std::numeric_limits<float>::quiet_NaN();
     float decode_gpu_headroom_c_ = std::numeric_limits<float>::quiet_NaN();
+    // Per-leg EMA of those samples while decode_headroom_tau_s > 0,
+    // indexed like llama_governor_engine (CPU, GPU, NPU); NaN = no finite
+    // sample yet (or a NaN sample), so the next finite sample seeds rather
+    // than blends. The timestamp pair is valid once a sample has been
+    // smoothed - hop_decide reads exactly this array when tau > 0.
+    float decode_headroom_smooth_[3] = {
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::quiet_NaN() };
+    bool decode_headroom_have_last_us_ = false;
+    int64_t decode_headroom_last_us_ = 0;
+    // GPU_BURST mode: the hold set when a burst fires its one window and
+    // cleared by every completed non-GPU window - that wait is the
+    // no-back-to-back rule.
+    bool decode_gpu_burst_blocked_ = false;
     // indexed like llama_governor_engine (CPU, GPU, NPU); the default is the
     // two-model form's set, so v1 decisions are byte-identical
     bool decode_leg_present_[3] = { true, false, true };

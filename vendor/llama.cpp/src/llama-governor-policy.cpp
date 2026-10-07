@@ -73,6 +73,15 @@ bool llama_governor_expert_substitution_would_displace(
 llama_governor_policy::llama_governor_policy(const llama_governor_params & params) : params_(params) {
     cache_budget_warning_ = params_.cache_budget_bytes != 0 && params_.expert_cycle_bytes != 0 &&
                            params_.cache_budget_bytes < params_.expert_cycle_bytes;
+    // An invalid tau must not silently become a third mode: NaN poisons
+    // the EMA, +inf freezes it, negative would silently mean raw. Only 0
+    // is raw by contract; anything else invalid is rejected to 0, here.
+    if (!std::isfinite(params_.decode_headroom_tau_s) || params_.decode_headroom_tau_s < 0.0f) {
+        LLAMA_LOG_WARN("governor: invalid decode_headroom_tau_s %.6g; "
+                       "headroom smoothing is off (raw samples)\n",
+                       static_cast<double>(params_.decode_headroom_tau_s));
+        params_.decode_headroom_tau_s = 0.0f;
+    }
 }
 
 llama_governor_policy::thresholds llama_governor_policy::get_thresholds() const {
@@ -466,6 +475,9 @@ llama_governor_decode_selection llama_governor_policy::select_decode(
     // the interrupted window's leg silently.
     decode_hop_leg_ = llama_governor_engine::CPU;
     decode_hop_window_ = UINT32_MAX;
+    // This window runs on the CPU without the rule, so it is a completed
+    // non-GPU window: it releases a spent GPU-burst hold like any other.
+    decode_gpu_burst_blocked_ = false;
     const bool budget_ok = last_gpu_engagement_ms_ < 0 || now_ms < last_gpu_engagement_ms_ ||
                            now_ms - last_gpu_engagement_ms_ >= k_flip_window_ms;
     // GPU_COOLMODE is the hottest decode backend per token on the owner's
@@ -497,9 +509,16 @@ void llama_governor_policy::reset_decode_hop() {
     // The headroom sample is per-turn state like the window: dropped with it,
     // so window 0 of the next turn never decides on the previous turn's
     // reading (the binding samples before the first decode of each turn).
+    // The smoothed average rides with the samples for the same reason, and
+    // the GPU-burst hold starts fresh per decode.
     decode_cpu_headroom_c_ = std::numeric_limits<float>::quiet_NaN();
     decode_npu_headroom_c_ = std::numeric_limits<float>::quiet_NaN();
     decode_gpu_headroom_c_ = std::numeric_limits<float>::quiet_NaN();
+    for (float & smooth : decode_headroom_smooth_) {
+        smooth = std::numeric_limits<float>::quiet_NaN();
+    }
+    decode_headroom_have_last_us_ = false;
+    decode_gpu_burst_blocked_ = false;
 }
 
 llama_governor_thermal_state llama_governor_policy::thermal_state() const { return state_; }

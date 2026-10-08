@@ -943,14 +943,15 @@ namespace rnllama_jsi {
                             result.setProperty(rt, "engine_decode", governorEngineName(stats.decode_engine));
                             result.setProperty(rt, "commit_bytes", (double) stats.commit_bytes);
                             result.setProperty(rt, "commit_ms", (double) stats.commit_us / 1000.0);
-                            // Decode-hop counters: 0 everywhere while
-                            // decode_hop_tokens is off.
+                            // Decode counters: 0 while decode_hop_tokens is off
+                            // (this bridge never sets the forced-leg proof hook)
+                            // and cumulative since the governor's clear_cache,
+                            // never per completion. decode_tokens_gpu is the
+                            // one-model legs' GPU windows: 0 on the two-model
+                            // hop (CPU/NPU only).
                             result.setProperty(rt, "decode_hops", (double) stats.decode_hops);
                             result.setProperty(rt, "decode_tokens_cpu", (double) stats.decode_tokens_cpu);
                             result.setProperty(rt, "decode_tokens_npu", (double) stats.decode_tokens_npu);
-                            // Third leg of the one-model three-leg rotation,
-                            // not a hop counter: the engine reports 0 on the
-                            // two-model path.
                             result.setProperty(rt, "decode_tokens_gpu", (double) stats.decode_tokens_gpu);
                             result.setProperty(rt, "decode_hop_commit_bytes", (double) stats.decode_hop_commit_bytes);
                             result.setProperty(rt, "decode_hop_commit_ms", (double) stats.decode_hop_commit_us / 1000.0);

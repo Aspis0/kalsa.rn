@@ -229,8 +229,9 @@ export type GovernorStats = {
     decode_hops: number;
     decode_tokens_cpu: number;
     decode_tokens_npu: number;
-    /** GPU decode leg of the one-model three-leg rotation (llama-ext.h),
-     *  not a hop counter; 0 on the two-model path. */
+    /** GPU decode leg tokens: the one-model legs' GPU windows, so 0 on the
+     *  two-model hop (CPU/NPU only). Cumulative since clear_cache, not reset
+     *  per completion. */
     decode_tokens_gpu: number;
     decode_hop_commit_bytes: number;
     decode_hop_commit_ms: number;

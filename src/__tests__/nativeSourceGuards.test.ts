@@ -87,3 +87,11 @@ test('logToJsCallback never forwards DEBUG', () => {
   expect(gate).toBeGreaterThan(-1)
   expect(gate).toBeLessThan(fn![0].indexOf('llama_log_callback_default'))
 })
+
+test('governor stats wire decode_tokens_gpu beside the cpu/npu counters', () => {
+  // The KALSA_GOVERNOR GPU leg evidence is this property; a dropped or
+  // relocated setProperty still passes tsc, so pin the adjacency on the wire.
+  expect(cpp('jsi/RNLlamaJSI.cpp')).toMatch(
+    /result\.setProperty\(rt, "decode_tokens_cpu"[^\n]*\n[^\n]*"decode_tokens_npu"[^\n]*\n[^\n]*"decode_tokens_gpu"/,
+  )
+})

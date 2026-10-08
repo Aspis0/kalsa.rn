@@ -266,6 +266,9 @@ export type GovernorStats = {
   decode_hops: number
   decode_tokens_cpu: number
   decode_tokens_npu: number
+  /** GPU decode leg of the one-model three-leg rotation (llama-ext.h),
+   *  not a hop counter; 0 on the two-model path. */
+  decode_tokens_gpu: number
   decode_hop_commit_bytes: number
   decode_hop_commit_ms: number
   /** Hop windows the headroom rule decided; zero while the alternation

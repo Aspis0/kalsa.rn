@@ -948,6 +948,10 @@ namespace rnllama_jsi {
                             result.setProperty(rt, "decode_hops", (double) stats.decode_hops);
                             result.setProperty(rt, "decode_tokens_cpu", (double) stats.decode_tokens_cpu);
                             result.setProperty(rt, "decode_tokens_npu", (double) stats.decode_tokens_npu);
+                            // Third leg of the one-model three-leg rotation,
+                            // not a hop counter: the engine reports 0 on the
+                            // two-model path.
+                            result.setProperty(rt, "decode_tokens_gpu", (double) stats.decode_tokens_gpu);
                             result.setProperty(rt, "decode_hop_commit_bytes", (double) stats.decode_hop_commit_bytes);
                             result.setProperty(rt, "decode_hop_commit_ms", (double) stats.decode_hop_commit_us / 1000.0);
                             result.setProperty(rt, "decode_hop_headroom_windows", (double) stats.decode_hop_headroom_windows);

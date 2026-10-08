@@ -88,6 +88,50 @@ test('logToJsCallback never forwards DEBUG', () => {
   expect(gate).toBeLessThan(fn![0].indexOf('llama_log_callback_default'))
 })
 
+// Every assignment to a common_params devices list in the loader file. The
+// vector is handed to the engine as a raw array and the walk stops at the
+// first nullptr (vendor/llama.cpp/src/llama.cpp llama_prepare_model_devices);
+// common_model_params_to_llama only skips an EMPTY list, so any non-empty
+// list built here must carry its own terminator.
+const devicesListSites = (
+  source: string,
+): Array<{ site: string; terminated: boolean }> => {
+  const sites: Array<{ site: string; terminated: boolean }> = []
+  const assignment = /(\w+)\.devices\s*=\s*([^;]+);/g
+  for (let hit = assignment.exec(source); hit !== null; hit = assignment.exec(source)) {
+    const statement = hit[0]!
+    const target = hit[1]!
+    const rhs = hit[2]!.trim()
+    if (rhs.startsWith('{')) {
+      // Brace initializer: nullptr must be the last element.
+      sites.push({ site: statement, terminated: /nullptr\s*}$/.test(rhs) })
+    } else if (rhs.includes('.devices')) {
+      // Copy of another devices list: it inherits that list's state (the
+      // draft list is filled only by upstream's nullptr-terminated
+      // parse_device_list, or left empty, which the loader skips), so a
+      // pushed terminator here would turn "default device selection" into
+      // an explicit no-offload list.
+      sites.push({ site: statement, terminated: true })
+    } else {
+      // A fresh vector must push the terminator as the very next statement.
+      const after = source.slice(hit.index + statement.length).trimStart()
+      sites.push({
+        site: statement,
+        terminated: after.startsWith(`${target}.devices.push_back(nullptr)`),
+      })
+    }
+  }
+  return sites
+}
+
+test('every devices list in rn-llama.cpp is nullptr-terminated', () => {
+  // Non-empty lists are walked element by element with no bounds check, so a
+  // missing terminator reads past the vector (one-copy load SIGSEGV).
+  const sites = devicesListSites(cpp('rn-llama.cpp'))
+  expect(sites.length).toBeGreaterThan(0)
+  expect(sites.filter((site) => !site.terminated)).toEqual([])
+})
+
 test('governor stats wire decode_tokens_gpu beside the cpu/npu counters', () => {
   // The KALSA_GOVERNOR GPU leg evidence is this property; a dropped or
   // relocated setProperty still passes tsc, so pin the adjacency on the wire.

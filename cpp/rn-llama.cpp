@@ -329,7 +329,8 @@ onecopy_load_result load_governor_one_model(
         LOG_INFO("KALSA_ONECOPY_NOTE {decode_repack:\"ignored (one model, no decode copy)\"}");
     }
     common_params params = owner.params;
-    params.devices = { npu, gpu };
+    // Raw array contract: the loader stops at the first nullptr (llama_prepare_model_devices), never past this vector's storage.
+    params.devices = { npu, gpu, nullptr };
     params.tensor_split[0] = 1.0f;
     params.tensor_split[1] = 0.0f;
     params.n_gpu_layers = 99;

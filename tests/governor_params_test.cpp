@@ -462,6 +462,55 @@ static bool test_platform_thermal_status_parses() {
     return thermo.platform_thermal_status == 9;
 }
 
+static bool test_decode_rule_v3_parser_contract() {
+    llama_governor_params params{};
+    llama_governor_thermo_profile thermo{};
+    governor_load_options options{};
+    auto governor = base_governor();
+    if (!parse_governor_params(governor, params, thermo, options) ||
+        params.decode_guard_headroom_c != 5.0f) {
+        std::cerr << "engine decode_guard_headroom_c default did not pass through" << std::endl;
+        return false;
+    }
+    governor["decode_leg_weighting"] = "gpu_burst";
+    if (!parse_governor_params(governor, params, thermo, options) ||
+        params.decode_leg_weighting != llama_governor_leg_weighting::GPU_BURST) {
+        std::cerr << "gpu_burst did not parse" << std::endl;
+        return false;
+    }
+    governor["decode_leg_weighting"] = "cheapest";
+    if (parses(governor)) {
+        std::cerr << "unknown decode_leg_weighting parsed" << std::endl;
+        return false;
+    }
+    governor["decode_leg_weighting"] = "npu_first";
+    governor["decode_hop_tokens"] = -1;
+    if (parses(governor)) {
+        std::cerr << "negative decode_hop_tokens parsed" << std::endl;
+        return false;
+    }
+    return true;
+}
+
+static bool test_leg_object_leaf_errors_name_the_failure() {
+    auto governor = base_governor();
+    governor["decode_heat_per_token"] = {{"npu", 0.1}, {"gpu", 0.2}};
+    auto error_is = [&governor](const std::string & expected) {
+        llama_governor_params params{};
+        llama_governor_thermo_profile thermo{};
+        governor_load_options options{};
+        try {
+            parse_governor_params(governor, params, thermo, options);
+        } catch (const std::invalid_argument & error) {
+            return expected == error.what();
+        }
+        return false;
+    };
+    if (!error_is("governor.decode_heat_per_token.cpu is required")) return false;
+    governor["decode_heat_per_token"]["cpu"] = nullptr;
+    return error_is("governor.decode_heat_per_token.cpu must be a number");
+}
+
 int main() {
     TestResults results;
     results.run_test("dead sensor refused at parse", test_dead_sensor_refused());
@@ -478,6 +527,8 @@ int main() {
     results.run_test("only a batch the HTP device ran kills the lane", test_htp_runtime_failure_attribution());
     results.run_test("registry exclusion keeps non-HTP order", test_devices_excluding_registry());
     results.run_test("platform_thermal_status optional, engine owns range", test_platform_thermal_status_parses());
+    results.run_test("decode rule v3 parser contract", test_decode_rule_v3_parser_contract());
+    results.run_test("leg object errors distinguish absent from non-numeric", test_leg_object_leaf_errors_name_the_failure());
     results.print_summary();
     return (results.passed_tests == results.total_tests) ? 0 : 1;
 }

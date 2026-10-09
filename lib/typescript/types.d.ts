@@ -210,10 +210,11 @@ export type NativeContextParams = {
         decode_repack?: boolean;
         /**
          * Decode-hop prototype: alternate CPU / live NPU lane every N generated
-         * tokens, no reload. 0 (default) keeps CPU-only decode. On a device with
-         * a validated legs-table row the binding supplies the row's measured
-         * values for every rule v3 key this payload omits; an explicitly sent
-         * key always wins.
+         * tokens, no reload. 0 (default) keeps CPU-only decode. On the one-copy
+         * load (matched legs-table row plus npu_lane_enabled), the binding uses
+         * row values for omitted rule v3 keys; explicitly sent keys win. Legs
+         * objects must contain all three numeric legs (npu, gpu, cpu); null is
+         * accepted only for the whole key, where it means absent.
          */
         decode_hop_tokens?: number;
         /** Decode-hop window rule; default "npu_first" (shipped). Hops run only
@@ -271,8 +272,8 @@ export type GovernorStats = {
      *  increment it; zero while the alternation fallback (no usable leg
      *  zones) decides every window. */
     decode_hop_headroom_windows: number;
-    /** Last decode-hop window rule: "alternation", "headroom", "heat_rank",
-     *  or "gpu_burst"; null until the engine decides a hop window. */
+    /** Rule used by the last decode-hop window that made a decision; it stays
+     *  until the next decision or clear_cache. */
     decode_hop_rule: string | null;
     prefill_ms: number;
     prefill_chunks: string;

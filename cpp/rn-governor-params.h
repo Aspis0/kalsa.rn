@@ -11,8 +11,8 @@
 namespace rnllama {
 
 // Which rule v3 governor keys the app JSON explicitly carried (audit F1/P1).
-// On the one-copy load the matched legs-table row supplies the DEFAULT for
-// every rule v3 field; a key the app sent wins, so bench keys /
+// On the one-copy load (matched row plus npu_lane_enabled), the row supplies
+// the DEFAULT for every rule v3 field; a key the app sent wins, so bench keys /
 // kalsa.bench.* overrides keep working. Produced by parse_governor_params -
 // no globals.
 struct governor_v3_keys {
@@ -44,10 +44,9 @@ bool parse_governor_params(
     llama_governor_thermo_profile & thermo,
     governor_load_options & options);
 
-/** The effective decode params of the one-copy load (audit F1/P1): the
- *  matched row supplies the default for every rule v3 field, a key the app
- *  JSON explicitly sent wins. Only ever applied on the one-copy branch -
- *  with no row matched the caller's params pass through untouched. Pure. */
+/** The effective decode params of the one-copy load (matched row plus
+ *  npu_lane_enabled): the row supplies each rule v3 default, and an explicitly
+ *  sent app key wins. Only applied on the one-copy branch; pure. */
 llama_governor_params merge_leg_row_defaults(
     const llama_governor_params & params,
     const governor_v3_keys & sent,

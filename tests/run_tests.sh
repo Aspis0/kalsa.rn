@@ -40,6 +40,18 @@ if [ ! -f "governor_params_test" ]; then
     exit 1
 fi
 
+if [ ! -f "governor_v3_precedence_test" ]; then
+    echo "Error: governor_v3_precedence_test executable not found"
+    echo "Please run ./build_and_test.sh first"
+    exit 1
+fi
+
+if [ ! -f "legs_table_test" ]; then
+    echo "Error: legs_table_test executable not found"
+    echo "Please run ./build_and_test.sh first"
+    exit 1
+fi
+
 echo "Found all test executables"
 
 TESTS_PASSED=0
@@ -92,11 +104,31 @@ else
 fi
 
 echo ""
+echo "--- Running Governor v3 Precedence Tests ---"
+if ./governor_v3_precedence_test; then
+    echo "✓ Governor v3 precedence tests passed"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ Governor v3 precedence tests failed"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+echo ""
+echo "--- Running Legs Table Tests ---"
+if ./legs_table_test; then
+    echo "✓ Legs table tests passed"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ Legs table tests failed"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+echo ""
 
 # Run KV-cache-reuse tests (only if the GGUF models have been downloaded)
-TOTAL_SUITES=4
+TOTAL_SUITES=6
 if [ -f "kv_cache_reuse_test" ] && ls ../models/*.gguf >/dev/null 2>&1; then
-    TOTAL_SUITES=5
+    TOTAL_SUITES=7
     echo "--- Running KV-cache-reuse Tests ---"
     if ./kv_cache_reuse_test; then
         echo "✓ KV-cache-reuse tests passed"

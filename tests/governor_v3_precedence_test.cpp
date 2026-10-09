@@ -4,6 +4,7 @@
 #include "rn-legs-table.h"
 
 #include <cmath>
+#include <cfloat>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -120,6 +121,25 @@ bool test_sent_values_win_for_each_v3_key() {
         merged.decode_headroom_tau_s == 2.0f;
 }
 
+bool test_partial_v3_payload_merges_unsent_leg_knobs() {
+    const rn_leg_set row = rn_legs_for(s23_facts());
+    auto json = base_governor();
+    json["decode_hop_tokens"] = 0;
+    llama_governor_params parsed{};
+    governor_load_options options{};
+    if (!row.one_copy || !parse(json, parsed, options) ||
+        !options.v3_sent.hop_tokens || options.v3_sent.heat_per_token ||
+        options.v3_sent.load_step) return false;
+    const auto merged = merge_leg_row_defaults(parsed, options.v3_sent, row);
+    return merged.decode_hop_tokens == 0 &&
+        merged.decode_heat_per_token_npu == row.decode_heat_per_token_npu &&
+        merged.decode_heat_per_token_gpu == row.decode_heat_per_token_gpu &&
+        merged.decode_heat_per_token_cpu == row.decode_heat_per_token_cpu &&
+        merged.decode_load_step_npu_c == row.decode_load_step_npu_c &&
+        merged.decode_load_step_gpu_c == row.decode_load_step_gpu_c &&
+        merged.decode_load_step_cpu_c == row.decode_load_step_cpu_c;
+}
+
 bool test_invalid_v3_values_refuse() {
     llama_governor_params params{};
     governor_load_options options{};
@@ -127,7 +147,8 @@ bool test_invalid_v3_values_refuse() {
     json["decode_leg_weighting"] = "";
     if (parse(json, params, options)) return false;
     json["decode_leg_weighting"] = "heat_rank";
-    json["decode_heat_weight"] = static_cast<double>(std::numeric_limits<float>::max()) * 2.0;
+    json["decode_heat_weight"] = std::nextafter(
+        static_cast<double>(FLT_MAX), std::numeric_limits<double>::infinity());
     if (parse(json, params, options)) return false;
     json["decode_heat_weight"] = 0.25;
     json["decode_heat_per_token"] = {{"npu", 0.15}, {"gpu", 0.35}};
@@ -150,6 +171,7 @@ int main() {
     TestResults results;
     results.run("null v3 keys are absent and take the real S23 row", test_null_v3_keys_use_real_row_defaults());
     results.run("sent v3 values win, including hop_tokens zero", test_sent_values_win_for_each_v3_key());
+    results.run("sent hop zero keeps absent heat and load knobs on the row", test_partial_v3_payload_merges_unsent_leg_knobs());
     results.run("empty weighting, float overflow, and partial legs refuse", test_invalid_v3_values_refuse());
     results.run("presence is recorded only after thermo validation", test_presence_waits_for_thermo_validation());
     std::cout << "Passed " << results.passed << '/' << results.total << '\n';

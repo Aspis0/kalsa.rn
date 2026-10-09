@@ -91,7 +91,7 @@ llama_governor_leg_weighting leg_weighting_from(const std::string & value) {
 // steps and the guard at construction (llama-governor-policy.cpp) - the
 // heat weight and the per-token costs reach the policy unsanitized (the
 // bench's parse_nonneg_float is their only other gate), so the binding
-// refuses anything but finite >= 0 here. NaN fails the >= compare.
+// refuses anything outside finite [0, FLT_MAX]. NaN fails the >= compare.
 bool valid_heat_knob(double raw) {
     return raw >= 0.0 && raw <= FLT_MAX && std::isfinite(raw);
 }
@@ -112,8 +112,8 @@ float nonneg_float_or(const nlohmann::ordered_json & object, const char * name, 
 // {"npu", "gpu", "cpu"} - the bench's "--heat-per-token NPU,GPU,CPU" order.
 // All three legs are required and unknown keys refuse (audit F3, like the
 // bench's parse_per_leg_nonneg): a partial object would half-apply a row's
-// measured triple, and a typo'd leg would silently vanish. A wrong-typed
-// leaf names the parent key (audit F6).
+// measured triple, and a typo'd leg would silently vanish. Missing leaves
+// are reported as required; nonnumeric leaves are reported as nonnumeric.
 void nonneg_legs_or(const nlohmann::ordered_json & object, const char * name,
                     float & npu, float & gpu, float & cpu) {
     const auto knob = object.find(name);
@@ -129,7 +129,11 @@ void nonneg_legs_or(const nlohmann::ordered_json & object, const char * name,
     float parsed_cpu = 0.0f;
     const auto leg = [&](const char * key, float & out) {
         const auto leaf = knob->find(key);
-        if (leaf == knob->end() || !leaf->is_number()) {
+        if (leaf == knob->end()) {
+            throw std::invalid_argument(
+                std::string("governor.") + name + "." + key + " is required");
+        }
+        if (!leaf->is_number()) {
             throw std::invalid_argument(
                 std::string("governor.") + name + "." + key + " must be a number");
         }

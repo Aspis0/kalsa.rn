@@ -23,7 +23,7 @@ fi
 echo "Configuring with CMake..."
 cmake "$SCRIPT_DIR" -DCMAKE_BUILD_TYPE=Release $CMAKE_OSX_SYSROOT
 
-# Build both test executables
+# Build the selected CI test executables
 echo ""
 echo "Building test executables..."
 echo "Building rnllama_tests..."
@@ -59,6 +59,22 @@ if [ ! -f "governor_params_test" ]; then
 fi
 echo "✓ governor_params_test built successfully"
 
+echo "Building governor_v3_precedence_test..."
+make governor_v3_precedence_test -j4
+if [ ! -f "governor_v3_precedence_test" ]; then
+    echo "Error: Failed to build governor_v3_precedence_test"
+    exit 1
+fi
+echo "✓ governor_v3_precedence_test built successfully"
+
+echo "Building legs_table_test..."
+make legs_table_test -j4
+if [ ! -f "legs_table_test" ]; then
+    echo "Error: Failed to build legs_table_test"
+    exit 1
+fi
+echo "✓ legs_table_test built successfully"
+
 echo ""
 echo "=== Build Successful ==="
 echo ""
@@ -67,6 +83,8 @@ echo "  - rnllama_tests (basic integration tests)"
 echo "  - parallel_decoding_test (parallel decoding tests)"
 echo "  - chat_parse_utf8_test (chat parse UTF-8 robustness tests)"
 echo "  - governor_params_test (governor thermo parse tests)"
+echo "  - governor_v3_precedence_test (decode rule v3 precedence tests)"
+echo "  - legs_table_test (one-copy capability table tests)"
 echo ""
 echo "To run the tests:"
 echo "  cd tests/build"
@@ -74,7 +92,9 @@ echo "  ./rnllama_tests           # Run basic tests"
 echo "  ./parallel_decoding_test  # Run parallel decoding tests"
 echo "  ./chat_parse_utf8_test    # Run chat parse UTF-8 tests"
 echo "  ./governor_params_test    # Run governor thermo parse tests"
+echo "  ./governor_v3_precedence_test # Run decode rule v3 precedence tests"
+echo "  ./legs_table_test         # Run one-copy capability table tests"
 echo ""
 echo "Or run all:"
-echo "  ./rnllama_tests && ./parallel_decoding_test && ./chat_parse_utf8_test && ./governor_params_test"
+echo "  ./rnllama_tests && ./parallel_decoding_test && ./chat_parse_utf8_test && ./governor_params_test && ./governor_v3_precedence_test && ./legs_table_test"
 echo ""

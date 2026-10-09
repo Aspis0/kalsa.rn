@@ -441,8 +441,8 @@ bool load_governor_models(llama_rn_context & owner,
     // fact that did not read - keeps today's loads byte for byte (R2).
     const rn_hw_facts hw_facts = rn_read_hw_facts();
     const rn_leg_set leg_set = rn_legs_for(hw_facts);
-    const bool merge_applied = leg_set.one_copy && governor_params.npu_lane_enabled;
-    const llama_governor_params effective_v3 = merge_applied
+    const bool onecopy_requested = leg_set.one_copy && governor_params.npu_lane_enabled;
+    const llama_governor_params effective_v3 = onecopy_requested
         ? merge_leg_row_defaults(governor_params, load_options.v3_sent, leg_set)
         : governor_params;
     std::string sent_v3;
@@ -464,7 +464,7 @@ bool load_governor_models(llama_rn_context & owner,
         "gpu_driver:\"%s\", dotprod:%d, one_copy:%d, tau_s:%g, heat_w:%g, "
         "heat_tok_npu:%g, heat_tok_gpu:%g, heat_tok_cpu:%g, hop_tokens:%u, weighting:\"%s\", "
         "load_step_npu:%g, load_step_gpu:%g, load_step_cpu:%g, guard_headroom_c:%g, "
-        "applied:%d, sent:\"%s\"}",
+        "merged:%d, sent:\"%s\"}",
         hw_facts.soc_model.c_str(), hw_facts.hexagon_arch.c_str(), hw_facts.gpu_name.c_str(),
         hw_facts.gpu_version.c_str(), hw_facts.gpu_driver.c_str(),
         (int) hw_facts.dotprod, (int) leg_set.one_copy, effective_v3.decode_headroom_tau_s,
@@ -474,12 +474,16 @@ bool load_governor_models(llama_rn_context & owner,
         leg_weighting_name(effective_v3.decode_leg_weighting),
         effective_v3.decode_load_step_npu_c, effective_v3.decode_load_step_gpu_c,
         effective_v3.decode_load_step_cpu_c, effective_v3.decode_guard_headroom_c,
-        (int) merge_applied, sent_v3.c_str());
+        (int) onecopy_requested, sent_v3.c_str());
+    const auto log_legs_outcome = [](const char * mode, bool row_tuning) {
+        LOG_INFO("KALSA_LEGS_TABLE_OUTCOME {mode:\"%s\", row_tuning:%d}",
+                 mode, (int) row_tuning);
+    };
     // F4: the caller's NPU kill switch gates the one-copy branch too - the
     // table proves the hardware, npu_lane_enabled says this caller wants the
     // NPU lane at all. With it off, today's path runs (two-model where its
     // own lane logic resolves, the plain load elsewhere).
-    if (leg_set.one_copy && governor_params.npu_lane_enabled) {
+    if (onecopy_requested) {
         // A runtime HTP failure downgrades every later load of this process
         // (note_htp_runtime_fallback): the one-copy prefill IS the HTP lane,
         // so the downgrade applies here too and the two-model branch below
@@ -493,10 +497,12 @@ bool load_governor_models(llama_rn_context & owner,
             switch (load_governor_one_model(owner, effective_v3, governor_thermo,
                                             load_options, leg_set)) {
             case onecopy_load_result::loaded:
+                log_legs_outcome("onecopy", true);
                 return true;
             case onecopy_load_result::demoted:
                 break; // fall through to the two-model load below
             case onecopy_load_result::failed:
+                log_legs_outcome("plain", false);
                 return false;
             }
         }
@@ -637,6 +643,7 @@ bool load_governor_models(llama_rn_context & owner,
         log_governor_fallback(stage, models_loaded, reason,
                               governor_params.gpu_fit, profile_valid);
         cleanup();
+        log_legs_outcome("plain", false);
         return false;
     };
 
@@ -678,6 +685,7 @@ bool load_governor_models(llama_rn_context & owner,
         // CPU retry belongs to LlamaService/S4. Native owns only cleanup and
         // returns failure so that retry can recreate the single-context path.
         cleanup();
+        log_legs_outcome("plain", false);
         return false;
     }
 
@@ -689,8 +697,10 @@ bool load_governor_models(llama_rn_context & owner,
                               "governor initialized without an active context",
                               governor_params.gpu_fit, profile_valid);
         cleanup();
+        log_legs_outcome("plain", false);
         return false;
     }
+    log_legs_outcome("two_model", false);
     return true;
 }
 

@@ -44,8 +44,8 @@ bool has_model_token(const std::string & s, const char * model) {
 // One validated row: exact SoC and Hexagon arch, the Adreno identity - vendor
 // token AND model token, each whole, in the CL name/version strings of the
 // device the GPUOpenCL backend selected - and the GPU driver compiler's
-// major.minor with the trailing dot (accepts the E031.41.x patch line,
-// rejects E031.45, and "E031.41." cannot match "E031.411"). A firmware update
+// major.minor with the trailing dot (accepts patches within a row's compiler
+// line, and "E031.41." cannot match "E031.411"). A firmware update
 // off this compiler line must demote to two-copy, because J(1) makes the NPU
 // decode depend on the OpenCL HOST leg that gate validates.
 struct rn_legs_row {
@@ -70,8 +70,8 @@ struct rn_legs_row {
     float decode_guard_headroom_c;
 };
 
-// A new SoC (e.g. SM8650) appends here with its own lab report's measured
-// values - never inferred from the SM8550 row, never in global defaults.
+// New SoCs append here with their own lab measurements - never inferred
+// from another row, never in global defaults.
 const rn_legs_row k_rows[] = {
     // S23 (SM8550 / Hexagon v73 / Adreno 740), rule v3 round 4
     // (scratchpad onecopy-three-legs/step5-s23, run-step5-vsleg4.sh +
@@ -80,6 +80,15 @@ const rn_legs_row k_rows[] = {
     { "SM8550", "Hexagon v73", "Adreno", "740", "E031.41.",
       10.0f, 7.0f, 2.8f, 3.2f, 4.7f,
       32, llama_governor_leg_weighting::HEAT_RANK, 19.0f, 9.0f, 22.0f, 5.0f },
+    // Xiaomi 14 (SM8650 / Hexagon v75 / Adreno 750), measured unplugged in
+    // scratchpad/agents/xiaomi-endur-npu-gpu-75/REPORT.md (heat) and
+    // scratchpad/agents/xiaomi-legheat-76/REPORT.md (heat and load steps):
+    // 1.1/3.2/7.3 skin C per 1k tokens (npu/gpu/cpu); load steps 5/11/26 C
+    // (NPU/GPU lower bounds). Hop 32, HEAT_RANK, guard 5 C, tau 10 s and
+    // heat weight 7 are rule constants, not SM8650 measurements.
+    { "SM8650", "Hexagon v75", "Adreno", "750", "E031.45.",
+      10.0f, 7.0f, 1.1f, 3.2f, 7.3f,
+      32, llama_governor_leg_weighting::HEAT_RANK, 5.0f, 11.0f, 26.0f, 5.0f },
 };
 
 bool row_matches(const rn_legs_row & row, const rn_hw_facts & facts) {

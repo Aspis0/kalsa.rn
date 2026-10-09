@@ -1,9 +1,9 @@
 // One-copy capability table tests (host-only: the pure row match).
 //
-// Pins cpp/rn-legs-table.cpp rn_legs_for: the one validated S23 row (FABLE
-// (c)), every negative that must keep today's loads (R2), and the J(1)
-// consequence - a fact set whose GPU clause fails is two-copy, never an
-// NPU-shared load without the OpenCL HOST leg.
+// Pins cpp/rn-legs-table.cpp rn_legs_for: validated SoC rows, every negative
+// that must keep today's loads (R2), and the J(1) consequence - a fact set
+// whose GPU clause fails is two-copy, never an NPU-shared load without the
+// OpenCL HOST leg.
 
 #include "rn-legs-table.h"
 
@@ -47,6 +47,17 @@ rn_hw_facts s23_facts() {
     return facts;
 }
 
+rn_hw_facts sm8650_facts() {
+    rn_hw_facts facts;
+    facts.soc_model = "SM8650";
+    facts.hexagon_arch = "Hexagon v75";
+    facts.gpu_name = "QUALCOMM Adreno(TM) 750";
+    facts.gpu_version = "OpenCL 3.0 Adreno(TM) 750";
+    facts.gpu_driver = "OpenCL 3.0 QUALCOMM Compiler E031.45.02.25";
+    facts.dotprod = true;
+    return facts;
+}
+
 bool all_three(const rn_leg_set & legs) {
     return legs.one_copy && legs.npu && legs.gpu && legs.cpu;
 }
@@ -83,6 +94,23 @@ bool test_row_returns_tuning() {
            tuning_is(rn_legs_for(s23_facts()), 10.0f, 7.0f, 2.8f, 3.2f, 4.7f) &&
            rule_v3_is(rn_legs_for(s23_facts()), 32,
                       llama_governor_leg_weighting::HEAT_RANK, 19.0f, 9.0f, 22.0f, 5.0f);
+}
+
+bool test_sm8650_row_and_driver_gate() {
+    const rn_leg_set sm8650 = rn_legs_for(sm8650_facts());
+    if (!all_three(sm8650) ||
+        !tuning_is(sm8650, 10.0f, 7.0f, 1.1f, 3.2f, 7.3f) ||
+        !rule_v3_is(sm8650, 32, llama_governor_leg_weighting::HEAT_RANK,
+                    5.0f, 11.0f, 26.0f, 5.0f)) {
+        return false;
+    }
+    auto wrong_driver = sm8650_facts();
+    wrong_driver.gpu_driver = "OpenCL 3.0 QUALCOMM Compiler E031.41.02.25";
+    if (!none(rn_legs_for(wrong_driver))) { return false; }
+    const rn_leg_set s23 = rn_legs_for(s23_facts());
+    return all_three(s23) && tuning_is(s23, 10.0f, 7.0f, 2.8f, 3.2f, 4.7f) &&
+        rule_v3_is(s23, 32, llama_governor_leg_weighting::HEAT_RANK,
+                   19.0f, 9.0f, 22.0f, 5.0f);
 }
 
 // Zero = off when no row matched: today's raw headroom rule on every
@@ -158,7 +186,7 @@ bool test_unreadable_fact_is_two_copy() {
 
 bool test_other_phones() {
     auto facts = s23_facts();
-    facts.soc_model = "SM8650";  // Xiaomi 14: a row only with a lab report
+    facts.soc_model = "SM8650";
     if (!none(rn_legs_for(facts))) { return false; }
     facts = s23_facts();
     facts.hexagon_arch = "Hexagon v79";
@@ -174,6 +202,7 @@ int main() {
     TestResults results;
     results.run_test("S23 row matches", test_row_matches());
     results.run_test("S23 row returns the hop tuning", test_row_returns_tuning());
+    results.run_test("SM8650 row, compiler gate, and S23 row", test_sm8650_row_and_driver_gate());
     results.run_test("no row matched returns zero tuning", test_no_match_tuning_is_zero());
     results.run_test("model token boundaries", test_model_token_boundaries());
     results.run_test("driver compiler major.minor line", test_driver_compiler_line());

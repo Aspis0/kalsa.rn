@@ -31,12 +31,10 @@ struct rn_leg_set {
     bool gpu = false;
     bool cpu = false;
     // The decode-hop tuning of the matched row (owner decisions 2026-10-07
-    // and 2026-10-09): rule v3 as measured on that device - S23 round 4
-    // (step5-vsleg4, 2026-10-08) - so a matched device hops with HEAT_RANK
-    // without the app sending anything. Per-device constants live in the
-    // row, never in global defaults; all zero / NPU_FIRST when no row
-    // matched = the raw rule, off. These are DEFAULTS, not overrides: the
-    // one-copy load applies them through merge_leg_row_defaults
+    // and 2026-10-09): measurements and rule constants live in each row,
+    // never in global defaults. All zero / NPU_FIRST when no row matched =
+    // the raw rule, off. These are DEFAULTS, not overrides: the one-copy
+    // load applies them through merge_leg_row_defaults
     // (rn-governor-params.h), where a key the app JSON explicitly sent wins.
     float decode_headroom_tau_s = 0.0f;
     float decode_heat_weight = 0.0f;
@@ -52,9 +50,9 @@ struct rn_leg_set {
     float decode_guard_headroom_c = 0.0f;
 };
 
-// The capability table: one pure, host-tested match against the validated
-// rows. Exactly one row today (FABLE (c)); a row is added only with a lab
-// report on that hardware - the table never infers from a family.
+// The capability table: one pure, host-tested match against validated rows.
+// A row is added only with a lab report on that hardware; the table never
+// infers from a family.
 rn_leg_set rn_legs_for(const rn_hw_facts & facts);
 
 // The device-side fact readers: system properties, the registered HTP device

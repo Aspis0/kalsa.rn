@@ -43,8 +43,10 @@ export type GovernorThermoProfile = {
     trend_c_per_min?: number;
     /** Android PowerManager.getCurrentThermalStatus(): 0..6. Absent,
      *  non-integer or out-of-range reads as -1: no app vote. On Android the
-     *  binding then keeps the status its native reader confirmed in the last
-     *  10 s; otherwise the platform does not vote. */
+     *  binding then keeps the last accepted status if its native reader
+     *  returned one within the last 10 s (native reads run only during a
+     *  completion); otherwise the platform does not vote until the reader
+     *  confirms a status again. */
     platform_thermal_status?: number;
 };
 export type NativeContextParams = {

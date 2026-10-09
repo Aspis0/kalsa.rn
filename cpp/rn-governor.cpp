@@ -179,11 +179,12 @@ bool rn_governor::set_thermo_profile(const llama_governor_thermo_profile & profi
         return false;
     }
     std::lock_guard<std::mutex> lock(profile_mutex_);
-    // The app leaves platform_thermal_status at -1 when its own read failed.
-    // A failed read is a gap, not a cool-down, so the remembered status
-    // survives it while a native read has confirmed one recently; carried
-    // without that bound, a dark thermal service after a hot moment would
-    // hold COOLMODE indefinitely.
+    // -1 is "no app vote" (key absent, malformed, or the app's read failed).
+    // That is a gap, not a cool-down, so the remembered status survives it
+    // while a native read returned a status in the last 10 s. Native reads
+    // run only inside a completion, so a profile sent after a longer pause
+    // drops the carry and the native reader re-escalates (5 s debounce);
+    // the engine's COOLMODE dwell keeps an entered COOLMODE meanwhile.
     llama_governor_thermo_profile merged = profile;
     const bool native_recent = platform_native_valid_us_ > 0 &&
         ggml_time_us() - platform_native_valid_us_ <= k_platform_thermal_carry_us;

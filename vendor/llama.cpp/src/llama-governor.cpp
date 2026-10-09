@@ -495,9 +495,11 @@ int32_t llama_governor::decode_impl(llama_batch batch, bool allow_chunking) {
         failed = true;
         return rc;
     }
-
+    // Read once, right after llama_decode: pacing and the per-leg decode time
+    // must exclude the bookkeeping below.
+    const uint64_t engine_us = static_cast<uint64_t>(ggml_time_us() - t0);
     if (is_prefill) {
-        stats_.prefill_us += static_cast<uint64_t>(ggml_time_us() - t0);
+        stats_.prefill_us += engine_us;
         // One route fact per executed prefill chunk (bench hook evidence),
         // stamped from the snapshot taken with the route latch: one latch,
         // one mode. A prefill -> decode -> prefill sequence inside one reset
@@ -532,22 +534,24 @@ int32_t llama_governor::decode_impl(llama_batch batch, bool allow_chunking) {
     }
     if (!is_prefill) {
         ++decode_tokens_since_prefill_;
-        const uint64_t decode_us = static_cast<uint64_t>(ggml_time_us() - t0);
+        if (policy_enabled_) {
+            pace_decode(static_cast<uint32_t>(batch.n_tokens), engine_us);
+        }
         // GPU is a decode engine only in the one-model form (the v2 hop rule
         // or forced rotation); the two-model router never selects it for
         // decode without a reload, so its counting is unchanged.
         switch (decode_engine_) {
             case llama_governor_engine::NPU:
                 stats_.decode_tokens_npu += batch.n_tokens;
-                stats_.decode_us_npu += decode_us;
+                stats_.decode_us_npu += engine_us;
                 break;
             case llama_governor_engine::GPU:
                 stats_.decode_tokens_gpu += batch.n_tokens;
-                stats_.decode_us_gpu += decode_us;
+                stats_.decode_us_gpu += engine_us;
                 break;
             default:
                 stats_.decode_tokens_cpu += batch.n_tokens;
-                stats_.decode_us_cpu += decode_us;
+                stats_.decode_us_cpu += engine_us;
                 break;
         }
     }

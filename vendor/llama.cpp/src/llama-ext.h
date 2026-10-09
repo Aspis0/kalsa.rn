@@ -366,6 +366,8 @@ struct llama_governor_params {
     float decode_floor_tps_npu = 0;
     float decode_floor_tps_gpu = 0;
     float decode_floor_tps_cpu = 0;
+    // Decode duty cycle as a fraction in COOLMODE; 1.0 disables pacing.
+    float decode_coolmode_duty = 1.0f;
     float decode_heat_weight = 0;
     float decode_heat_per_token_npu = 0;
     float decode_heat_per_token_gpu = 0;
@@ -536,6 +538,12 @@ struct llama_governor_stats {
     uint64_t decode_us_cpu = 0;       // per-leg decode time (one-model legs / rotation)
     uint64_t decode_us_npu = 0;
     uint64_t decode_us_gpu = 0;
+    // Decode pacing (engine compute only): ms and single-token steps, reset
+    // with decode_tokens_* / decode_us_* by clear_cache. The duty covers
+    // llama_decode time; hop commit, sampling, and callbacks are outside it.
+    uint64_t decode_paced_ms = 0;
+    uint64_t decode_paced_tokens = 0;
+    uint64_t decode_paced_capped = 0;
     // hops and their commit cost per leg PAIR (unordered): 0 = NPU<->GPU,
     // 1 = NPU<->CPU, 2 = GPU<->CPU
     struct llama_governor_hop_pair {

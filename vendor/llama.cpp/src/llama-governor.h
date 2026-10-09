@@ -81,6 +81,7 @@ struct llama_governor {
     llama_context * leg_ctx(llama_governor_engine engine) const;
 
 private:
+    friend struct llama_governor_pacing_test;
     friend llama_governor * llama_governor_init_with_params_internal(
             llama_model *, llama_model *, llama_context_params, llama_context_params,
             llama_governor_params, std::string * failure_reason);
@@ -112,6 +113,7 @@ private:
     void record_side(llama_context * ctx, side_state & side, bool prefill, uint32_t n_tokens);
     void record_tally();
     void refresh_policy_stats();
+    void pace_decode(uint32_t n_tokens, uint64_t compute_us);
     int32_t admit_prefill(llama_batch batch, bool allow_chunking);
     int32_t select_decode();
     int32_t decode_impl(llama_batch batch, bool allow_chunking);
@@ -177,6 +179,8 @@ private:
     llama_governor_policy policy_;
     bool policy_enabled_ = false;
     llama_governor_stats stats_;
+    uint64_t decode_paced_us_ = 0;
+    void (*decode_sleep_fn_)(uint64_t) = nullptr;
     llama_governor_counter_sample telemetry_;
     llama_governor_prefill_tally prefill_tally_;
     llama_governor_stall_union stall_union_;

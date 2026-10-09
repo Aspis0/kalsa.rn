@@ -111,10 +111,17 @@ commit=$(sed -n 's/^char const \* LLAMA_COMMIT *= *"\([^"]*\)";$/\1/p' "$build_i
 # 4. the engine itself is ours, not just the two patched files. The governor
 # sources exist only in the kalsallama fork -- no patch under scripts/patches/
 # creates them -- so a plain ggml-org tree with our patches applied fails here.
+# The list is the fork's own LLAMA_CORE_SOURCES governor entries plus their
+# headers (vendor/llama.cpp/src/CMakeLists.txt): an entry the fork renames,
+# splits or drops is a bump that must be reviewed here, not silently passed.
 for f in llama-governor.cpp llama-governor.h \
          llama-governor-metrics.cpp llama-governor-metrics.h \
          llama-governor-policy.cpp llama-governor-policy.h \
-         llama-governor-runtime.cpp; do
+         llama-governor-runtime.cpp \
+         llama-governor-legs.cpp \
+         llama-governor-pacing.cpp \
+         llama-governor-policy-hop.cpp \
+         llama-governor-device.cpp llama-governor-device.h; do
   p="$LLAMA/src/$f"
   # -f follows symlinks, and an empty file has no content to be wrong. The
   # claim being made is "this engine is our fork", and a filename does not

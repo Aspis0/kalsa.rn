@@ -127,6 +127,7 @@ public:
     uint32_t prefill_token_cap() const;
     uint64_t cpu_to_gpu_engagements() const;
     bool cache_budget_warning() const;
+    float decode_coolmode_duty() const { return params_.decode_coolmode_duty; }
     bool hot_plugged() const;
 
 private:

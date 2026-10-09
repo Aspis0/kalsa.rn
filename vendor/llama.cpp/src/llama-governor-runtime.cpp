@@ -266,6 +266,10 @@ void llama_governor::clear_cache(bool clear_data) {
     stats_.decode_us_cpu = 0;
     stats_.decode_us_npu = 0;
     stats_.decode_us_gpu = 0;
+    stats_.decode_paced_ms = 0;
+    stats_.decode_paced_tokens = 0;
+    stats_.decode_paced_capped = 0;
+    decode_paced_us_ = 0;
     for (auto & pair : stats_.decode_hop_pairs) {
         pair = llama_governor_stats::llama_governor_hop_pair{};
     }

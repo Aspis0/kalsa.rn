@@ -83,6 +83,15 @@ float sanitize_guard_headroom(float value) {
     return value;
 }
 
+float sanitize_coolmode_duty(float value) {
+    if (!std::isfinite(value) || value <= 0.0f || value > 1.0f) {
+        LLAMA_LOG_WARN("governor: invalid decode_coolmode_duty %.6g; pacing is off (duty reset to 1)\n",
+                       static_cast<double>(value));
+        return 1.0f;
+    }
+    return value;
+}
+
 } // namespace
 
 bool llama_governor_expert_substitution_would_displace(
@@ -95,6 +104,7 @@ bool llama_governor_expert_substitution_would_displace(
 }
 
 llama_governor_policy::llama_governor_policy(const llama_governor_params & params) : params_(params) {
+    params_.decode_coolmode_duty = sanitize_coolmode_duty(params_.decode_coolmode_duty);
     cache_budget_warning_ = params_.cache_budget_bytes != 0 && params_.expert_cycle_bytes != 0 &&
                            params_.cache_budget_bytes < params_.expert_cycle_bytes;
     // An invalid tau must not silently become a third mode: NaN poisons

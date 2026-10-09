@@ -108,6 +108,26 @@ float nonneg_float_or(const nlohmann::ordered_json & object, const char * name, 
     return static_cast<float>(raw);
 }
 
+// COOLMODE decode duty is the fraction of wall time the engine spends
+// decoding in COOLMODE (llama-governor-pacing.cpp: the added idle is
+// compute_us * (1 / duty - 1)), so its range is (0, 1]: 0 divides by zero in
+// the engine and a duty above 1 asks for a rate the device cannot sustain.
+// The engine resets anything outside that range to 1 -- pacing off -- with a
+// warning (llama-governor-policy.cpp sanitize_coolmode_duty); the binding
+// refuses instead, so a typo'd 1.5 is an error the app sees rather than a
+// silent change of thermal behaviour. NaN fails the > compare, as above.
+float duty_or(const nlohmann::ordered_json & object, const char * name, float fallback) {
+    if (!object.contains(name) || object.at(name).is_null()) {
+        return fallback;
+    }
+    const double raw = value_or(object, name, static_cast<double>(fallback));
+    if (!(raw > 0.0 && raw <= 1.0 && std::isfinite(raw))) {
+        throw std::invalid_argument(
+            std::string("governor.") + name + " must be greater than 0 and at most 1");
+    }
+    return static_cast<float>(raw);
+}
+
 // The per-leg knobs mirror the engine's three fields with one JSON object
 // {"npu", "gpu", "cpu"} - the bench's "--heat-per-token NPU,GPU,CPU" order.
 // All three legs are required and unknown keys refuse (audit F3, like the
@@ -282,6 +302,13 @@ bool parse_governor_params(
         governor, "decode_guard_headroom_c", params.decode_guard_headroom_c);
     params.decode_headroom_tau_s = nonneg_float_or(
         governor, "decode_headroom_tau_s", params.decode_headroom_tau_s);
+    // COOLMODE paces decode to a sustainable rate, and the binding's default is
+    // the duty measured on the S23 (7.5 tok/s paced NPU decode); the engine
+    // default of 1.0 means pacing off. Not a legs-table field: COOLMODE is the
+    // governor's thermal state, so the duty applies on every device whose
+    // policy is on, not only the validated one-copy rows.
+    params.decode_coolmode_duty = duty_or(
+        governor, "decode_coolmode_duty", 0.5f);
     // Audit F1/P1: record which rule v3 keys the app JSON explicitly sent -
     // on the one-copy load the matched row only fills the absent ones
     // (merge_leg_row_defaults). An invalid key throws above, so a completed

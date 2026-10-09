@@ -490,6 +490,66 @@ static bool test_decode_rule_v3_parser_contract() {
     return true;
 }
 
+// COOLMODE decode duty is the fraction of wall time the engine spends decoding
+// in COOLMODE (vendor/llama.cpp/src/llama-governor-pacing.cpp: the added idle
+// is compute_us * (1 / duty - 1)), so the valid range is (0, 1]: 0 divides by
+// zero and a duty above 1 asks for a rate the device cannot sustain. The
+// engine's own sanitiser resets those to 1 - pacing off - with a warning
+// (llama-governor-policy.cpp sanitize_coolmode_duty); the binding refuses
+// them instead, so a typo'd value reaches the app as an error rather than a
+// silent change of thermal behaviour. Absent and null are the binding default
+// measured on the S23, where duty 0.5 paced NPU decode to 7.5 tok/s.
+static bool test_decode_coolmode_duty_range() {
+    constexpr float k_refused = -1.0f;
+    const auto with_duty = [](nlohmann::ordered_json value) {
+        auto governor = base_governor();
+        governor["decode_coolmode_duty"] = std::move(value);
+        return governor;
+    };
+    struct duty_case {
+        const char * name;
+        nlohmann::ordered_json governor;
+        float expected;  // k_refused when the case must throw
+    };
+    const duty_case cases[] = {
+        {"absent keeps the binding default", base_governor(), 0.5f},
+        {"null means absent", with_duty(nullptr), 0.5f},
+        {"duty 1 is pacing off", with_duty(1.0), 1.0f},
+        {"duty 0.8", with_duty(0.8), 0.8f},
+        {"duty 0 divides by zero", with_duty(0.0), k_refused},
+        {"duty 1.5 is faster than the device", with_duty(1.5), k_refused},
+        {"negative duty", with_duty(-0.5), k_refused},
+        {"a string duty is not a number", with_duty("NaN"), k_refused},
+    };
+    for (const auto & c : cases) {
+        llama_governor_params params{};
+        llama_governor_thermo_profile thermo{};
+        governor_load_options options{};
+        bool thrown = false;
+        try {
+            parse_governor_params(c.governor, params, thermo, options);
+        } catch (const std::invalid_argument &) {
+            thrown = true;
+        }
+        const float got = thrown ? k_refused : params.decode_coolmode_duty;
+        if (thrown != (c.expected == k_refused) || got != c.expected) {
+            std::cerr << c.name << ": got " << got << ", want " << c.expected << std::endl;
+            return false;
+        }
+    }
+    // The refusal names the key and its range, like every neighbouring knob.
+    llama_governor_params params{};
+    llama_governor_thermo_profile thermo{};
+    governor_load_options options{};
+    try {
+        parse_governor_params(with_duty(1.5), params, thermo, options);
+    } catch (const std::invalid_argument & error) {
+        return std::string(error.what()) ==
+            "governor.decode_coolmode_duty must be greater than 0 and at most 1";
+    }
+    return false;
+}
+
 static bool test_leg_object_leaf_errors_name_the_failure() {
     auto governor = base_governor();
     governor["decode_heat_per_token"] = {{"npu", 0.1}, {"gpu", 0.2}};
@@ -526,6 +586,7 @@ int main() {
     results.run_test("registry exclusion keeps non-HTP order", test_devices_excluding_registry());
     results.run_test("platform_thermal_status normalizes to -1..6", test_platform_thermal_status_parses());
     results.run_test("decode rule v3 parser contract", test_decode_rule_v3_parser_contract());
+    results.run_test("decode_coolmode_duty range and default", test_decode_coolmode_duty_range());
     results.run_test("leg object errors distinguish absent from non-numeric", test_leg_object_leaf_errors_name_the_failure());
     results.print_summary();
     return (results.passed_tests == results.total_tests) ? 0 : 1;

@@ -10,7 +10,9 @@
 #include "rn-governor-params.h"
 #include "rn-governor.h"
 
+#include <cmath>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -484,6 +486,141 @@ static bool test_decode_hop_tokens_parses() {
     return false;
 }
 
+// Rule v3 decode knobs (llama-ext.h decode_leg_weighting and friends):
+// absent keys must land on the engine's fresh defaults, so a payload
+// written before rule v3 keeps today's behaviour byte for byte.
+static bool test_decode_rule_v3_defaults() {
+    llama_governor_params params{};
+    llama_governor_thermo_profile thermo{};
+    governor_load_options options{};
+    try {
+        if (!parse_governor_params(base_governor(), params, thermo, options)) {
+            std::cerr << "base payload returned false" << std::endl;
+            return false;
+        }
+    } catch (const std::exception & e) {
+        std::cerr << "unexpected throw: " << e.what() << std::endl;
+        return false;
+    }
+    return params.decode_leg_weighting == llama_governor_leg_weighting::NPU_FIRST &&
+        params.decode_heat_weight == 0.0f &&
+        params.decode_heat_per_token_npu == 0.0f &&
+        params.decode_heat_per_token_gpu == 0.0f &&
+        params.decode_heat_per_token_cpu == 0.0f &&
+        params.decode_load_step_npu_c == 0.0f &&
+        params.decode_load_step_gpu_c == 0.0f &&
+        params.decode_load_step_cpu_c == 0.0f &&
+        params.decode_guard_headroom_c == 5.0f &&
+        params.decode_headroom_tau_s == 0.0f;
+}
+
+// heat_rank plus a value on every new key parses through to the engine
+// fields; the same payload then re-parses with gpu_burst and a partial
+// legs object whose missing legs keep the engine default (0).
+static bool test_decode_rule_v3_parses() {
+    llama_governor_params params{};
+    llama_governor_thermo_profile thermo{};
+    governor_load_options options{};
+    auto governor = base_governor();
+    governor["decode_leg_weighting"] = "heat_rank";
+    governor["decode_heat_weight"] = 0.25;
+    governor["decode_heat_per_token"] = {{"npu", 0.15}, {"gpu", 0.35}, {"cpu", 0.30}};
+    governor["decode_load_step"] = {{"npu", 1.0}, {"gpu", 2.0}, {"cpu", 1.5}};
+    governor["decode_guard_headroom_c"] = 6.5;
+    governor["decode_headroom_tau_s"] = 2.0;
+    try {
+        if (!parse_governor_params(governor, params, thermo, options)) {
+            std::cerr << "rule v3 payload returned false" << std::endl;
+            return false;
+        }
+    } catch (const std::exception & e) {
+        std::cerr << "unexpected throw: " << e.what() << std::endl;
+        return false;
+    }
+    if (params.decode_leg_weighting != llama_governor_leg_weighting::HEAT_RANK ||
+        params.decode_heat_weight != 0.25f ||
+        params.decode_heat_per_token_npu != 0.15f ||
+        params.decode_heat_per_token_gpu != 0.35f ||
+        params.decode_heat_per_token_cpu != 0.30f ||
+        params.decode_load_step_npu_c != 1.0f ||
+        params.decode_load_step_gpu_c != 2.0f ||
+        params.decode_load_step_cpu_c != 1.5f ||
+        params.decode_guard_headroom_c != 6.5f ||
+        params.decode_headroom_tau_s != 2.0f) {
+        std::cerr << "rule v3 values did not reach the engine fields" << std::endl;
+        return false;
+    }
+    governor["decode_leg_weighting"] = "gpu_burst";
+    governor["decode_heat_per_token"] = {{"cpu", 0.30}};
+    if (!parse_governor_params(governor, params, thermo, options) ||
+        params.decode_leg_weighting != llama_governor_leg_weighting::GPU_BURST ||
+        params.decode_heat_per_token_cpu != 0.30f ||
+        params.decode_heat_per_token_npu != 0.0f) {
+        std::cerr << "gpu_burst or partial legs object did not parse" << std::endl;
+        return false;
+    }
+    return true;
+}
+
+// Out-of-range refuses instead of sanitizing: the heat weight and the
+// per-token costs reach the policy unsanitized (only tau, the load steps
+// and the guard get an engine-side net), and a silently zeroed weight
+// would look like the v1 rule in the telemetry.
+static bool test_decode_rule_v3_refuses_invalid() {
+    auto governor = base_governor();
+    governor["decode_leg_weighting"] = "cheapest";
+    if (parses(governor)) {
+        std::cerr << "unknown decode_leg_weighting parsed" << std::endl;
+        return false;
+    }
+    governor["decode_leg_weighting"] = 3;
+    if (parses(governor)) {
+        std::cerr << "non-string decode_leg_weighting parsed" << std::endl;
+        return false;
+    }
+    governor["decode_leg_weighting"] = "heat_rank";
+    governor["decode_heat_weight"] = -0.1;
+    if (parses(governor)) {
+        std::cerr << "negative decode_heat_weight parsed" << std::endl;
+        return false;
+    }
+    governor["decode_heat_weight"] = std::nan("");
+    if (parses(governor)) {
+        std::cerr << "NaN decode_heat_weight parsed" << std::endl;
+        return false;
+    }
+    governor["decode_heat_weight"] = 0.25;
+    governor["decode_heat_per_token"] = "0.15,0.35,0.30";
+    if (parses(governor)) {
+        std::cerr << "non-object decode_heat_per_token parsed" << std::endl;
+        return false;
+    }
+    governor["decode_heat_per_token"] = {{"npu", 0.15}, {"gpu", -1.0}, {"cpu", 0.30}};
+    if (parses(governor)) {
+        std::cerr << "negative decode_heat_per_token leg parsed" << std::endl;
+        return false;
+    }
+    governor["decode_heat_per_token"] = {{"npu", 0.15}, {"gpu", 0.35}, {"cpu", 0.30}};
+    governor["decode_load_step"] = {{"cpu", std::nan("")}};
+    if (parses(governor)) {
+        std::cerr << "NaN decode_load_step leg parsed" << std::endl;
+        return false;
+    }
+    governor["decode_load_step"] = {{"npu", 1.0}, {"gpu", 2.0}, {"cpu", 1.5}};
+    governor["decode_guard_headroom_c"] = std::numeric_limits<double>::infinity();
+    if (parses(governor)) {
+        std::cerr << "infinite decode_guard_headroom_c parsed" << std::endl;
+        return false;
+    }
+    governor["decode_guard_headroom_c"] = 6.5;
+    governor["decode_headroom_tau_s"] = -1.0;
+    if (parses(governor)) {
+        std::cerr << "negative decode_headroom_tau_s parsed" << std::endl;
+        return false;
+    }
+    return true;
+}
+
 int main() {
     TestResults results;
     results.run_test("dead sensor refused at parse", test_dead_sensor_refused());
@@ -501,6 +638,9 @@ int main() {
     results.run_test("registry exclusion keeps non-HTP order", test_devices_excluding_registry());
     results.run_test("platform_thermal_status optional, engine owns range", test_platform_thermal_status_parses());
     results.run_test("decode_hop_tokens non-negative integer, 0 off", test_decode_hop_tokens_parses());
+    results.run_test("decode rule v3 absent keys keep engine defaults", test_decode_rule_v3_defaults());
+    results.run_test("decode rule v3 heat_rank values parse", test_decode_rule_v3_parses());
+    results.run_test("decode rule v3 out-of-range keys refuse", test_decode_rule_v3_refuses_invalid());
     results.print_summary();
     return (results.passed_tests == results.total_tests) ? 0 : 1;
 }

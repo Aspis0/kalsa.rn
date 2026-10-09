@@ -76,6 +76,60 @@ llama_governor_cool_pays cool_pays_from(const std::string & value) {
     throw std::invalid_argument("Unsupported governor.cool_pays: " + value);
 }
 
+// Same lowercase names the engine's CLI reference maps from --hop-mode
+// (governor-bench.cpp); empty means the key was absent -> the engine default.
+llama_governor_leg_weighting leg_weighting_from(const std::string & value) {
+    if (value.empty() || value == "npu_first") return llama_governor_leg_weighting::NPU_FIRST;
+    if (value == "gpu_burst") return llama_governor_leg_weighting::GPU_BURST;
+    if (value == "heat_rank") return llama_governor_leg_weighting::HEAT_RANK;
+    throw std::invalid_argument("Unsupported governor.decode_leg_weighting: " + value);
+}
+
+// A decode heat knob is a float the engine multiplies straight into
+// effective headroom, and the engine sanitizes only the tau, the load
+// steps and the guard at construction (llama-governor-policy.cpp) - the
+// heat weight and the per-token costs reach the policy unsanitized (the
+// bench's parse_nonneg_float is their only other gate), so the binding
+// refuses anything but finite >= 0 here. NaN fails the >= compare.
+bool valid_heat_knob(double raw) {
+    return raw >= 0.0 && std::isfinite(raw) && std::isfinite(static_cast<float>(raw));
+}
+
+float nonneg_float_or(const nlohmann::ordered_json & object, const char * name, float fallback) {
+    const double raw = value_or(object, name, static_cast<double>(fallback));
+    if (!valid_heat_knob(raw)) {
+        throw std::invalid_argument(
+            std::string("governor.") + name + " must be a non-negative finite number");
+    }
+    return static_cast<float>(raw);
+}
+
+// The per-leg knobs mirror the engine's three fields with one JSON object
+// {"npu", "gpu", "cpu"} - the bench's "--heat-per-token NPU,GPU,CPU" order.
+// An absent leg keeps the engine default, so a partial object parses.
+void nonneg_legs_or(const nlohmann::ordered_json & object, const char * name,
+                    float & npu, float & gpu, float & cpu) {
+    if (!object.contains(name)) {
+        return;
+    }
+    const auto & legs = object.at(name);
+    if (!legs.is_object()) {
+        throw std::invalid_argument(
+            std::string("governor.") + name + " must be an object with npu, gpu, cpu");
+    }
+    const auto leg = [&](const char * key, float & out) {
+        const double raw = value_or(legs, key, static_cast<double>(out));
+        if (!valid_heat_knob(raw)) {
+            throw std::invalid_argument(
+                std::string("governor.") + name + "." + key + " must be a non-negative finite number");
+        }
+        out = static_cast<float>(raw);
+    };
+    leg("npu", npu);
+    leg("gpu", gpu);
+    leg("cpu", cpu);
+}
+
 } // namespace
 
 llama_governor_thermo_profile parse_governor_thermo(
@@ -173,6 +227,22 @@ bool parse_governor_params(
         throw std::invalid_argument("governor.decode_hop_tokens must be a non-negative uint32");
     }
     params.decode_hop_tokens = static_cast<uint32_t>(hop);
+    // Rule v3 decode knobs (llama-ext.h decode_leg_weighting and friends):
+    // absent keys keep the fresh llama_governor_params defaults above, so
+    // today's payloads parse to today's behaviour.
+    params.decode_leg_weighting = leg_weighting_from(string_or(governor, "decode_leg_weighting"));
+    params.decode_heat_weight = nonneg_float_or(
+        governor, "decode_heat_weight", params.decode_heat_weight);
+    nonneg_legs_or(governor, "decode_heat_per_token",
+                   params.decode_heat_per_token_npu, params.decode_heat_per_token_gpu,
+                   params.decode_heat_per_token_cpu);
+    nonneg_legs_or(governor, "decode_load_step",
+                   params.decode_load_step_npu_c, params.decode_load_step_gpu_c,
+                   params.decode_load_step_cpu_c);
+    params.decode_guard_headroom_c = nonneg_float_or(
+        governor, "decode_guard_headroom_c", params.decode_guard_headroom_c);
+    params.decode_headroom_tau_s = nonneg_float_or(
+        governor, "decode_headroom_tau_s", params.decode_headroom_tau_s);
     // npu_lane_enabled is forwarded: the engine's prefill_engine owns the
     // lane (owner rule 2026-09-28) and load_governor_models decides the
     // device with llama_governor_resolve_prefill_device + degrade.

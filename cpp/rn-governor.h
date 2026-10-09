@@ -91,7 +91,7 @@ private:
     // The last profile accepted by the engine.
     llama_governor_thermo_profile thermo_profile_;
     // Native platform thermal reader, one per governor lifetime, and the
-    // Wall-clock stamp of the last platform read.
+    // monotonic-clock stamp (ggml_time_us) of the last platform read.
     rn_platform_thermal platform_thermal_;
     int64_t platform_thermal_read_us_ = 0;
     rn_platform_thermal_send_state platform_thermal_send_state_;

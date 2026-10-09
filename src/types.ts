@@ -273,6 +273,8 @@ export type NativeContextParams = {
     decode_guard_headroom_c?: number
     /** Headroom EMA time constant in seconds; 0 (default) = raw samples. */
     decode_headroom_tau_s?: number
+    /** COOLMODE decode duty in (0,1]; binding default 0.5; 1 = no pacing. */
+    decode_coolmode_duty?: number
     thermo: GovernorThermoProfile
   }
 }
@@ -301,6 +303,12 @@ export type GovernorStats = {
    *  increment it; zero while the alternation fallback (no usable leg
    *  zones) decides every window. */
   decode_hop_headroom_windows: number
+  /** Decode pacing (engine compute only): paced wall ms, single-token steps
+   *  paced, and steps that hit the pacing cap; reset with the decode
+   *  counters by clear_cache. */
+  decode_paced_ms: number
+  decode_paced_tokens: number
+  decode_paced_capped: number
   /** Rule used by the last decode-hop window that made a decision; it stays
    *  until the next decision or clear_cache. */
   decode_hop_rule: string | null

@@ -956,6 +956,9 @@ namespace rnllama_jsi {
                             result.setProperty(rt, "decode_hop_commit_bytes", (double) stats.decode_hop_commit_bytes);
                             result.setProperty(rt, "decode_hop_commit_ms", (double) stats.decode_hop_commit_us / 1000.0);
                             result.setProperty(rt, "decode_hop_headroom_windows", (double) stats.decode_hop_headroom_windows);
+                            result.setProperty(rt, "decode_paced_ms", (double) stats.decode_paced_ms);
+                            result.setProperty(rt, "decode_paced_tokens", (double) stats.decode_paced_tokens);
+                            result.setProperty(rt, "decode_paced_capped", (double) stats.decode_paced_capped);
                             if (stats.decode_hop_rule != nullptr) {
                                 result.setProperty(rt, "decode_hop_rule",
                                     jsi::String::createFromUtf8(rt, stats.decode_hop_rule));

@@ -179,10 +179,22 @@ bool rn_governor::set_thermo_profile(const llama_governor_thermo_profile & profi
         return false;
     }
     std::lock_guard<std::mutex> lock(profile_mutex_);
-    profile_valid_ = llama_governor_set_thermo_profile(governor_, profile, ggml_time_us() / 1000);
+    // The app leaves platform_thermal_status at -1 when its own read failed:
+    // a failed read is a gap, not a cool-down, and must not erase the
+    // native reading.
+    llama_governor_thermo_profile merged = profile;
+    if (merged.platform_thermal_status < 0) {
+        merged.platform_thermal_status = thermo_profile_.platform_thermal_status;
+    }
+    const bool status_changed =
+        merged.platform_thermal_status != thermo_profile_.platform_thermal_status;
+    profile_valid_ = llama_governor_set_thermo_profile(governor_, merged, ggml_time_us() / 1000);
     if (profile_valid_) {
-        thermo_profile_ = profile;
-        platform_thermal_send_state_ = {};
+        thermo_profile_ = merged;
+        // Only a status change may cancel a pending native escalation.
+        if (status_changed) {
+            platform_thermal_send_state_ = {};
+        }
         platform_refusal_logged_ = false;
     }
     return profile_valid_;

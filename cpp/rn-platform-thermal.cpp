@@ -37,7 +37,12 @@ rn_platform_thermal_send_decision rn_platform_thermal_should_send(
     rn_platform_thermal_send_state state) {
     rn_platform_thermal_send_decision result;
     result.next_state = state;
-    if (native_status == k_platform_thermal_absent || native_status == remembered_status) {
+    // An absent read is a gap, not a cool-down: it must not reset a pending
+    // escalation (the read-gap rule below restarts one after a real pause).
+    if (native_status == k_platform_thermal_absent) {
+        return result;
+    }
+    if (native_status == remembered_status) {
         result.next_state = {};
         return result;
     }

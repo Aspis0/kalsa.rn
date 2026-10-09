@@ -464,7 +464,7 @@ bool load_governor_models(llama_rn_context & owner,
         "gpu_driver:\"%s\", dotprod:%d, one_copy:%d, tau_s:%g, heat_w:%g, "
         "heat_tok_npu:%g, heat_tok_gpu:%g, heat_tok_cpu:%g, hop_tokens:%u, weighting:\"%s\", "
         "load_step_npu:%g, load_step_gpu:%g, load_step_cpu:%g, guard_headroom_c:%g, "
-        "merged:%d, sent:\"%s\"}",
+        "coolmode_duty:%g, merged:%d, sent:\"%s\"}",
         hw_facts.soc_model.c_str(), hw_facts.hexagon_arch.c_str(), hw_facts.gpu_name.c_str(),
         hw_facts.gpu_version.c_str(), hw_facts.gpu_driver.c_str(),
         (int) hw_facts.dotprod, (int) leg_set.one_copy, effective_v3.decode_headroom_tau_s,
@@ -474,7 +474,7 @@ bool load_governor_models(llama_rn_context & owner,
         leg_weighting_name(effective_v3.decode_leg_weighting),
         effective_v3.decode_load_step_npu_c, effective_v3.decode_load_step_gpu_c,
         effective_v3.decode_load_step_cpu_c, effective_v3.decode_guard_headroom_c,
-        (int) onecopy_requested, sent_v3.c_str());
+        effective_v3.decode_coolmode_duty, (int) onecopy_requested, sent_v3.c_str());
     const auto log_legs_outcome = [](const char * mode, bool row_tuning) {
         LOG_INFO("KALSA_LEGS_TABLE_OUTCOME {mode:\"%s\", row_tuning:%d}",
                  mode, (int) row_tuning);

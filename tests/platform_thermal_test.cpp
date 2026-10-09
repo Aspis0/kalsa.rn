@@ -74,6 +74,27 @@ bool test_escalation_restarts_after_a_read_gap() {
     return decision.send;
 }
 
+bool test_absent_read_keeps_pending_escalation() {
+    rn_platform_thermal_send_state state;
+    auto decision = rn_platform_thermal_should_send(t0, 3, 1, state);
+    if (decision.send || !decision.pending_started) return false;
+    state = decision.next_state;
+    // Absent read within the cadence: the pending escalation survives it.
+    decision = rn_platform_thermal_should_send(t0 + k_platform_thermal_interval_us,
+                                                k_platform_thermal_absent, 1, state);
+    if (decision.send || decision.pending_started ||
+        decision.next_state.pending_since_us != t0) return false;
+    state = decision.next_state;
+    for (int second = 2; second < 5; ++second) {
+        decision = rn_platform_thermal_should_send(t0 + second * 1000000, 3, 1, state);
+        if (decision.send) return false;
+        state = decision.next_state;
+    }
+    decision = rn_platform_thermal_should_send(t0 + k_platform_thermal_escalation_debounce_us,
+                                                3, 1, state);
+    return decision.send;
+}
+
 bool test_deescalation_is_immediate() {
     const auto decision = rn_platform_thermal_should_send(t0, 2, 4, {});
     return decision.send && decision.next_state.pending_status == k_platform_thermal_absent;
@@ -113,6 +134,7 @@ int main() {
     results.run("escalation requires five seconds of reads", test_escalation_requires_five_seconds_of_reads());
     results.run("higher reads sustain the pending escalation", test_escalation_keeps_consecutive_reads_at_or_above_pending_level());
     results.run("escalation restarts after a read gap", test_escalation_restarts_after_a_read_gap());
+    results.run("absent read keeps a pending escalation", test_absent_read_keeps_pending_escalation());
     results.run("de-escalation is immediate", test_deescalation_is_immediate());
     results.run("absent never overwrites", test_absent_never_overwrites());
     results.run("unchanged status does not resend", test_unchanged_status_does_not_resend());

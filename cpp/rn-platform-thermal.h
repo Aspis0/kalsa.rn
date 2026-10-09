@@ -72,7 +72,11 @@ bool rn_platform_thermal_should_read(int64_t now_us, int64_t & last_read_us);
 
 /** Pure send decision. Escalations to status >= 2 need five seconds of
  *  consecutive reads at or above the pending level; lower statuses apply
- *  immediately. Absent never replaces the remembered status. */
+ *  immediately. Two rules govern the gaps: an absent read sends nothing and
+ *  leaves the pending state unchanged (a real read gap of more than
+ *  2 * k_platform_thermal_interval_us restarts a pending escalation instead),
+ *  while a read equal to the remembered status resets the pending escalation
+ *  without sending. Absent never replaces the remembered status. */
 rn_platform_thermal_send_decision rn_platform_thermal_should_send(
     int64_t now_us, int32_t native_status, int32_t remembered_status,
     rn_platform_thermal_send_state state);

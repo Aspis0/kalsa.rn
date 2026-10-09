@@ -252,23 +252,23 @@ export type NativeContextParams = {
      * key always wins.
      */
     decode_hop_tokens?: number
-    /** Decode-hop window rule; default "npu_first" (shipped). Read only by
-     *  the decode hop, so "heat_rank" is inert unless decode_hop_tokens > 0
-     *  and the NPU lane is live. */
+    /** Decode-hop window rule; default "npu_first" (shipped). Hops run only
+     *  while decode_hop_tokens > 0, the NPU lane is live, and the governor is
+     *  outside a safety state. */
     decode_leg_weighting?: 'npu_first' | 'gpu_burst' | 'heat_rank'
     /** Heat weight multiplied into each leg's heat_per_token and docked from
-     *  its headroom; 0 (default) = pure headroom. Only the no-fit fallback
-     *  loop reads it - "heat_rank" orders legs by heat_per_token alone. */
+     *  its headroom; 0 (default) = pure headroom. The primary loop reads it
+     *  under "npu_first" and "gpu_burst"; only "heat_rank" uses it in the
+     *  no-fit fallback, while its primary loop ranks by heat_per_token. */
     decode_heat_weight?: number
-    /** Skin-C heat weight per leg on the S23 scale (a validated device's
-     *  row carries the measured values for it), one object {npu, gpu, cpu}
-     *  mirroring the engine's three fields; default all 0. */
+    /** Skin temperature rise in C per 1,000 decoded tokens, measured unplugged
+     *  per SoC in the lab; one object {npu, gpu, cpu}. A validated device's
+     *  row carries its measurements; default all 0. */
     decode_heat_per_token?: { npu: number; gpu: number; cpu: number }
     /** Degrees C docked from every leg that is not the current one, one object {npu, gpu, cpu}; default all 0. */
     decode_load_step?: { npu: number; gpu: number; cpu: number }
-    /** HEAT_RANK only: the engine leaves the current leg once its headroom
-     *  drops below this guard (C), returning only when an idle candidate
-     *  clears it plus the hysteresis; default 5. */
+    /** HEAT_RANK guard in C. An idle candidate must clear this guard, the
+     *  hop hysteresis, and its load step; default 5. */
     decode_guard_headroom_c?: number
     /** Headroom EMA time constant in seconds; 0 (default) = raw samples. */
     decode_headroom_tau_s?: number
@@ -300,6 +300,9 @@ export type GovernorStats = {
    *  increment it; zero while the alternation fallback (no usable leg
    *  zones) decides every window. */
   decode_hop_headroom_windows: number
+  /** Last decode-hop window rule: "alternation", "headroom", "heat_rank",
+   *  or "gpu_burst"; null until the engine decides a hop window. */
+  decode_hop_rule: string | null
   prefill_ms: number
   prefill_chunks: string
   prefill_ctx_ngl: number

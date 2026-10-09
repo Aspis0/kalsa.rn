@@ -171,11 +171,9 @@ ggml_backend_hexagon_set_shared_weights_t hexagon_shared_weights_setter() {
 }
 
 // F2: turn the one-copy shared-weights mode back off. No getter exists
-// (ggml-hexagon.h), and since the engine split opt_mbuf into dyn (default
-// 512 MiB) and static (default 1 GiB), its setter writes ONE cap to both or
-// keeps both on 0 - the asymmetric pre-one-copy caps are not expressible, so
-// max_buffer_bytes 0 leaves the caps the shared load ran with (both
-// k_onecopy_shared_mbuf_bytes) instead of pretending to reconstruct them.
+// (ggml-hexagon.h), but the setter snapshots the caps in force at the first
+// accepted enable, so the disable with max_buffer_bytes 0 hands back the caps
+// the load replaced - the defaults or the GGML_HEXAGON_MBUF seed.
 // Returns false when the setter refused - a shared buffer is still alive -
 // which the callers must not ignore.
 bool restore_hexagon_shared_weights() {

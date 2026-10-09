@@ -45,7 +45,10 @@ typedef uint64_t (*ggml_backend_hexagon_admission_gen_t)(ggml_backend_t backend)
 // GGML_HEXAGON_HOSTBUF, GGML_HEXAGON_HOSTBUF_REPACK and GGML_HEXAGON_MBUF seed the same state at init.
 struct ggml_hexagon_shared_weights {
     bool   enabled;          // offer the device's TILE32/HOST buffer types to the weight placement probe
-    size_t max_buffer_bytes; // get_max_size of every Hexagon buft, 0 = keep the current value
+    size_t max_buffer_bytes; // get_max_size of every Hexagon buft. Enabling with 0 keeps the caps
+                             // (first enable also snapshots the prior pair), with > 0 overwrites both.
+                             // Disabling with 0 restores that snapshot if held; with > 0 writes both
+                             // caps and drops the snapshot.
 };
 
 // Returns 0 when it took effect, nonzero when it changed nothing. Takes effect only while no TILE32

@@ -132,6 +132,13 @@ static bool   opt_dma64   = false;
 static size_t opt_mbuf_dyn    = 512ul * 1024 * 1024;      // max dynamic (compute) buffer size
 static size_t opt_mbuf_static = 1ul * 1024 * 1024 * 1024; // max static (weight/KV) buffer size
 static size_t opt_mbuf_total  = 0;                        // total buffer space limit (0 = unconstrained)
+// caps in force at the first accepted set_shared_weights enable since the last restore (whatever the
+// env seeded), so a setter-driven one-copy load can hand them back. a disable with max_buffer_bytes
+// == 0 restores them if held; a disable with > 0 drops them. valid only while shared_mbuf_saved is
+// set (0 is a legal cap value).
+static size_t saved_mbuf_dyn    = 0;
+static size_t saved_mbuf_static = 0;
+static bool   shared_mbuf_saved = false;
 
 static int    opt_mm_select  = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 static int    opt_fa_select  = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
@@ -9737,12 +9744,15 @@ static uint64_t ggml_backend_hexagon_get_admission_gen(ggml_backend_t backend) {
 // Process-level placement state, the setter counterpart of the GGML_HEXAGON_HOSTBUF[_REPACK]/MBUF env
 // seeds. Caller contract: before any model load or context creation. Legal while no TILE32 or HOST
 // buffer is alive (shared_bufs_live == 0): after a refused or freed shared load the count is back to
-// 0, so the process can fall back to a two-copy load or set the mode again. The plain opts and
-// the mbuf caps are not synchronized and a ggml_gallocr created before the call keeps the old cap -
-// no mutex, the caller is expected to serialize this. Only reachable through the proc address, so
-// the registry - and with it every device context - already exists; the caps are the globals the
-// buffer types read (dyn through get_max_size, static through the alloc_buffer_n plan), so no
-// per-device copy is written.
+// 0, so the process can fall back to a two-copy load or set the mode again. enable with > 0
+// overwrites both mbuf caps (snapshotting the prior pair if none is held); enable with 0 keeps the
+// caps (still snapshots if none is held); disable with > 0 writes both caps and drops the snapshot;
+// disable with 0 restores the snapshot if one is held, else keeps the caps. The plain opts and the
+// mbuf caps are not synchronized and a ggml_gallocr created before the call keeps the old cap - no
+// mutex, the caller is expected to serialize this. Only
+// reachable through the proc address, so the registry - and with it every device context - already
+// exists; the caps are the globals the buffer types read (dyn through get_max_size, static through
+// the alloc_buffer_n plan), so no per-device copy is written.
 static int ggml_backend_hexagon_set_shared_weights(const struct ggml_hexagon_shared_weights * shared_weights) {
     if (!shared_weights) {
         GGML_LOG_WARN("ggml-hex: set_shared_weights ignored: NULL argument\n");
@@ -9755,9 +9765,24 @@ static int ggml_backend_hexagon_set_shared_weights(const struct ggml_hexagon_sha
     }
     opt_hostbuf_repack = shared_weights->enabled;
     opt_hostbuf        = shared_weights->enabled;
+    if (shared_weights->enabled && !shared_mbuf_saved) {
+        // first enable since the last restore snapshots the caps in force, whatever seeded opt_hostbuf
+        // (GGML_HEXAGON_HOSTBUF may have made the very first call an on->on transition)
+        saved_mbuf_dyn    = opt_mbuf_dyn;
+        saved_mbuf_static = opt_mbuf_static;
+        shared_mbuf_saved = true;
+    }
     if (shared_weights->max_buffer_bytes > 0) {
         opt_mbuf_dyn    = shared_weights->max_buffer_bytes;
         opt_mbuf_static = shared_weights->max_buffer_bytes;
+        if (!shared_weights->enabled) {
+            // an explicit disable value is the caller's choice, not a one-copy leftover to restore later
+            shared_mbuf_saved = false;
+        }
+    } else if (!shared_weights->enabled && shared_mbuf_saved) {
+        opt_mbuf_dyn    = saved_mbuf_dyn;
+        opt_mbuf_static = saved_mbuf_static;
+        shared_mbuf_saved = false;
     }
     return 0;
 }

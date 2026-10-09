@@ -210,14 +210,23 @@ export type NativeContextParams = {
         decode_repack?: boolean;
         /**
          * Decode-hop prototype: alternate CPU / live NPU lane every N generated
-         * tokens, no reload. 0 (default) keeps CPU-only decode.
+         * tokens, no reload. 0 (default) keeps CPU-only decode. On a device with
+         * a validated legs-table row the binding supplies the row's measured
+         * values for every rule v3 key this payload omits; an explicitly sent
+         * key always wins.
          */
         decode_hop_tokens?: number;
-        /** Decode-hop window rule; default "npu_first" (shipped). */
+        /** Decode-hop window rule; default "npu_first" (shipped). Read only by
+         *  the decode hop, so "heat_rank" is inert unless decode_hop_tokens > 0
+         *  and the NPU lane is live. */
         decode_leg_weighting?: 'npu_first' | 'gpu_burst' | 'heat_rank';
-        /** Heat weight docking weight * heat-per-token from each leg's headroom; 0 (default) = pure headroom. */
+        /** Heat weight multiplied into each leg's heat_per_token and docked from
+         *  its headroom; 0 (default) = pure headroom. Only the no-fit fallback
+         *  loop reads it - "heat_rank" orders legs by heat_per_token alone. */
         decode_heat_weight?: number;
-        /** Battery C*s/token per leg, one object {npu, gpu, cpu} mirroring the engine's three fields; default all 0. */
+        /** Skin-C heat weight per leg on the S23 scale (a validated device's
+         *  row carries the measured values for it), one object {npu, gpu, cpu}
+         *  mirroring the engine's three fields; default all 0. */
         decode_heat_per_token?: {
             npu: number;
             gpu: number;
@@ -229,7 +238,9 @@ export type NativeContextParams = {
             gpu: number;
             cpu: number;
         };
-        /** HEAT_RANK only: headroom (C) below which the current leg is kept; default 5. */
+        /** HEAT_RANK only: the engine leaves the current leg once its headroom
+         *  drops below this guard (C), returning only when an idle candidate
+         *  clears it plus the hysteresis; default 5. */
         decode_guard_headroom_c?: number;
         /** Headroom EMA time constant in seconds; 0 (default) = raw samples. */
         decode_headroom_tau_s?: number;
@@ -255,8 +266,10 @@ export type GovernorStats = {
     decode_tokens_gpu: number;
     decode_hop_commit_bytes: number;
     decode_hop_commit_ms: number;
-    /** Hop windows the headroom rule decided; zero while the alternation
-     *  fallback (no usable leg zones) decides every window. */
+    /** Hop windows the plain headroom rule decided. The engine counts only
+     *  its "headroom" rule label here, so "heat_rank" windows do not
+     *  increment it; zero while the alternation fallback (no usable leg
+     *  zones) decides every window. */
     decode_hop_headroom_windows: number;
     prefill_ms: number;
     prefill_chunks: string;

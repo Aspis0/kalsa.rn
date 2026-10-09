@@ -213,6 +213,26 @@ export type NativeContextParams = {
          * tokens, no reload. 0 (default) keeps CPU-only decode.
          */
         decode_hop_tokens?: number;
+        /** Decode-hop window rule; default "npu_first" (shipped). */
+        decode_leg_weighting?: 'npu_first' | 'gpu_burst' | 'heat_rank';
+        /** Heat weight docking weight * heat-per-token from each leg's headroom; 0 (default) = pure headroom. */
+        decode_heat_weight?: number;
+        /** Battery C*s/token per leg, one object {npu, gpu, cpu} mirroring the engine's three fields; default all 0. */
+        decode_heat_per_token?: {
+            npu: number;
+            gpu: number;
+            cpu: number;
+        };
+        /** Degrees C docked from every leg that is not the current one, one object {npu, gpu, cpu}; default all 0. */
+        decode_load_step?: {
+            npu: number;
+            gpu: number;
+            cpu: number;
+        };
+        /** HEAT_RANK only: headroom (C) below which the current leg is kept; default 5. */
+        decode_guard_headroom_c?: number;
+        /** Headroom EMA time constant in seconds; 0 (default) = raw samples. */
+        decode_headroom_tau_s?: number;
         thermo: GovernorThermoProfile;
     };
 };

@@ -62,24 +62,41 @@ bool tuning_is(const rn_leg_set & legs, float tau_s, float heat_weight, float np
            legs.decode_heat_per_token_cpu == cpu;
 }
 
+bool rule_v3_is(const rn_leg_set & legs, uint32_t hop_tokens,
+                llama_governor_leg_weighting weighting, float step_npu, float step_gpu,
+                float step_cpu, float guard_c) {
+    return legs.decode_hop_tokens == hop_tokens && legs.decode_leg_weighting == weighting &&
+           legs.decode_load_step_npu_c == step_npu && legs.decode_load_step_gpu_c == step_gpu &&
+           legs.decode_load_step_cpu_c == step_cpu && legs.decode_guard_headroom_c == guard_c;
+}
+
 bool test_row_matches() {
     return all_three(rn_legs_for(s23_facts()));
 }
 
-// The matched row ships its measured hop tuning (owner decision 2026-10-07):
-// tau 10 s smoothing, heat weight 7, skin C per 1k decode tokens per leg.
+// The matched row ships its measured rule v3 tuning (owner decisions
+// 2026-10-07 and 2026-10-09): tau 10 s smoothing, heat weight 7, skin C
+// heat per leg, and the round-4 hop cadence - hop 32, HEAT_RANK, load step
+// 19/9/22 C, guard 5 C (step5-vsleg4, 2026-10-08).
 bool test_row_returns_tuning() {
     return all_three(rn_legs_for(s23_facts())) &&
-           tuning_is(rn_legs_for(s23_facts()), 10.0f, 7.0f, 2.8f, 3.2f, 4.7f);
+           tuning_is(rn_legs_for(s23_facts()), 10.0f, 7.0f, 2.8f, 3.2f, 4.7f) &&
+           rule_v3_is(rn_legs_for(s23_facts()), 32,
+                      llama_governor_leg_weighting::HEAT_RANK, 19.0f, 9.0f, 22.0f, 5.0f);
 }
 
 // Zero = off when no row matched: today's raw headroom rule on every
 // non-validated device.
 bool test_no_match_tuning_is_zero() {
-    if (!tuning_is(rn_legs_for(rn_hw_facts{}), 0, 0, 0, 0, 0)) { return false; }
+    if (!tuning_is(rn_legs_for(rn_hw_facts{}), 0, 0, 0, 0, 0) ||
+        !rule_v3_is(rn_legs_for(rn_hw_facts{}), 0,
+                    llama_governor_leg_weighting::NPU_FIRST, 0, 0, 0, 0)) {
+        return false;
+    }
     auto facts = s23_facts();
     facts.gpu_driver = "OpenCL 3.0 QUALCOMM build: 9999.99 Compiler E031.50.00.00";
-    return tuning_is(rn_legs_for(facts), 0, 0, 0, 0, 0);
+    return tuning_is(rn_legs_for(facts), 0, 0, 0, 0, 0) &&
+           rule_v3_is(rn_legs_for(facts), 0, llama_governor_leg_weighting::NPU_FIRST, 0, 0, 0, 0);
 }
 
 bool test_model_token_boundaries() {

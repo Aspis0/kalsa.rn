@@ -551,15 +551,17 @@ static bool test_decode_rule_v3_parses() {
         return false;
     }
     governor["decode_leg_weighting"] = "gpu_burst";
-    governor["decode_heat_per_token"] = {{"cpu", 0.30}};
+    governor["decode_heat_per_token"] = {{"npu", 0.15}, {"gpu", 0.35}, {"cpu", 0.30}};
     if (!parse_governor_params(governor, params, thermo, options) ||
         params.decode_leg_weighting != llama_governor_leg_weighting::GPU_BURST ||
-        params.decode_heat_per_token_cpu != 0.30f ||
-        params.decode_heat_per_token_npu != 0.0f) {
-        std::cerr << "gpu_burst or partial legs object did not parse" << std::endl;
+        params.decode_heat_per_token_cpu != 0.30f) {
+        std::cerr << "gpu_burst did not parse" << std::endl;
         return false;
     }
-    return true;
+    // F3: a partial legs object refuses - it would half-apply a row's
+    // measured triple. Full objects parse (above); partial ones do not.
+    governor["decode_heat_per_token"] = {{"cpu", 0.30}};
+    return !parses(governor);
 }
 
 // Out-of-range refuses instead of sanitizing: the heat weight and the
@@ -618,7 +620,121 @@ static bool test_decode_rule_v3_refuses_invalid() {
         std::cerr << "negative decode_headroom_tau_s parsed" << std::endl;
         return false;
     }
+    // F3: the legs objects carry all three legs and only them.
+    governor["decode_headroom_tau_s"] = 1.0;
+    governor["decode_heat_per_token"] = {{"npu", 0.15}, {"gpu", 0.35}};
+    if (parses(governor)) {
+        std::cerr << "two-leg decode_heat_per_token parsed" << std::endl;
+        return false;
+    }
+    governor["decode_heat_per_token"] = {{"npu", 0.15}, {"gpu", 0.35}, {"cpu", 0.30}, {"dsp", 1.0}};
+    if (parses(governor)) {
+        std::cerr << "unknown leg key parsed" << std::endl;
+        return false;
+    }
+    // F6: a wrong-typed leg leaf names the parent key in the error.
+    governor["decode_heat_per_token"] = {{"npu", "0.15"}, {"gpu", 0.35}, {"cpu", 0.30}};
+    try {
+        llama_governor_params sink{};
+        llama_governor_thermo_profile thermo{};
+        governor_load_options options{};
+        parse_governor_params(governor, sink, thermo, options);
+        std::cerr << "string decode_heat_per_token leaf parsed" << std::endl;
+        return false;
+    } catch (const std::invalid_argument & error) {
+        if (std::string(error.what()).find("governor.decode_heat_per_token.npu") ==
+            std::string::npos) {
+            std::cerr << "leg leaf error does not name the parent key: " << error.what()
+                      << std::endl;
+            return false;
+        }
+    }
     return true;
+}
+
+// Precedence on the one-copy load (audit F1/P1): the matched row supplies
+// the default for every rule v3 key the payload omits; an explicitly sent
+// key wins (bench keys / kalsa.bench.* overrides keep working). The row
+// values are the S23 row's (cpp/rn-legs-table.cpp, round 4); fabricated
+// here because this target links only the parse TU.
+static rn_leg_set s23_row() {
+    rn_leg_set row;
+    row.one_copy = row.npu = row.gpu = row.cpu = true;
+    row.decode_headroom_tau_s = 10.0f;
+    row.decode_heat_weight = 7.0f;
+    row.decode_heat_per_token_npu = 2.8f;
+    row.decode_heat_per_token_gpu = 3.2f;
+    row.decode_heat_per_token_cpu = 4.7f;
+    row.decode_hop_tokens = 32;
+    row.decode_leg_weighting = llama_governor_leg_weighting::HEAT_RANK;
+    row.decode_load_step_npu_c = 19.0f;
+    row.decode_load_step_gpu_c = 9.0f;
+    row.decode_load_step_cpu_c = 22.0f;
+    row.decode_guard_headroom_c = 5.0f;
+    return row;
+}
+
+static bool test_v3_row_defaults_merge() {
+    llama_governor_params params{};
+    llama_governor_thermo_profile thermo{};
+    governor_load_options options{};
+    try {
+        if (!parse_governor_params(base_governor(), params, thermo, options)) {
+            std::cerr << "base payload returned false" << std::endl;
+            return false;
+        }
+    } catch (const std::exception & e) {
+        std::cerr << "unexpected throw: " << e.what() << std::endl;
+        return false;
+    }
+    if (options.v3_sent.hop_tokens || options.v3_sent.leg_weighting ||
+        options.v3_sent.heat_weight || options.v3_sent.heat_per_token ||
+        options.v3_sent.load_step || options.v3_sent.guard_headroom_c ||
+        options.v3_sent.headroom_tau_s) {
+        std::cerr << "absent keys were recorded as sent" << std::endl;
+        return false;
+    }
+    const llama_governor_params merged =
+        merge_leg_row_defaults(params, options.v3_sent, s23_row());
+    if (merged.decode_hop_tokens != 32 ||
+        merged.decode_leg_weighting != llama_governor_leg_weighting::HEAT_RANK ||
+        merged.decode_heat_weight != 7.0f ||
+        merged.decode_heat_per_token_npu != 2.8f || merged.decode_heat_per_token_gpu != 3.2f ||
+        merged.decode_heat_per_token_cpu != 4.7f ||
+        merged.decode_load_step_npu_c != 19.0f || merged.decode_load_step_gpu_c != 9.0f ||
+        merged.decode_load_step_cpu_c != 22.0f ||
+        merged.decode_guard_headroom_c != 5.0f || merged.decode_headroom_tau_s != 10.0f) {
+        std::cerr << "row defaults did not fill the absent v3 keys" << std::endl;
+        return false;
+    }
+    // Explicit keys win; the absent ones still take the row.
+    auto governor = base_governor();
+    governor["decode_hop_tokens"] = 64;
+    governor["decode_guard_headroom_c"] = 8.0;
+    governor["decode_heat_weight"] = 0.25;
+    governor["decode_leg_weighting"] = "npu_first";
+    try {
+        if (!parse_governor_params(governor, params, thermo, options)) {
+            std::cerr << "explicit payload returned false" << std::endl;
+            return false;
+        }
+    } catch (const std::exception & e) {
+        std::cerr << "unexpected throw: " << e.what() << std::endl;
+        return false;
+    }
+    if (!options.v3_sent.hop_tokens || !options.v3_sent.guard_headroom_c ||
+        !options.v3_sent.heat_weight || !options.v3_sent.leg_weighting) {
+        std::cerr << "explicit keys were not recorded as sent" << std::endl;
+        return false;
+    }
+    const llama_governor_params overridden =
+        merge_leg_row_defaults(params, options.v3_sent, s23_row());
+    return overridden.decode_hop_tokens == 64 &&
+        overridden.decode_guard_headroom_c == 8.0f &&
+        overridden.decode_heat_weight == 0.25f &&
+        overridden.decode_leg_weighting == llama_governor_leg_weighting::NPU_FIRST &&
+        overridden.decode_headroom_tau_s == 10.0f &&
+        overridden.decode_load_step_npu_c == 19.0f;
 }
 
 int main() {
@@ -641,6 +757,7 @@ int main() {
     results.run_test("decode rule v3 absent keys keep engine defaults", test_decode_rule_v3_defaults());
     results.run_test("decode rule v3 heat_rank values parse", test_decode_rule_v3_parses());
     results.run_test("decode rule v3 out-of-range keys refuse", test_decode_rule_v3_refuses_invalid());
+    results.run_test("rule v3 row defaults merge, explicit keys win", test_v3_row_defaults_merge());
     results.print_summary();
     return (results.passed_tests == results.total_tests) ? 0 : 1;
 }

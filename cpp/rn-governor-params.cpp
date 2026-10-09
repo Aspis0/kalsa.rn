@@ -106,28 +106,43 @@ float nonneg_float_or(const nlohmann::ordered_json & object, const char * name, 
 
 // The per-leg knobs mirror the engine's three fields with one JSON object
 // {"npu", "gpu", "cpu"} - the bench's "--heat-per-token NPU,GPU,CPU" order.
-// An absent leg keeps the engine default, so a partial object parses.
+// All three legs are required and unknown keys refuse (audit F3, like the
+// bench's parse_per_leg_nonneg): a partial object would half-apply a row's
+// measured triple, and a typo'd leg would silently vanish. A wrong-typed
+// leaf names the parent key (audit F6).
 void nonneg_legs_or(const nlohmann::ordered_json & object, const char * name,
                     float & npu, float & gpu, float & cpu) {
-    if (!object.contains(name)) {
+    const auto knob = object.find(name);
+    if (knob == object.end()) {
         return;
     }
-    const auto & legs = object.at(name);
-    if (!legs.is_object()) {
+    if (!knob->is_object()) {
         throw std::invalid_argument(
             std::string("governor.") + name + " must be an object with npu, gpu, cpu");
     }
     const auto leg = [&](const char * key, float & out) {
-        const double raw = value_or(legs, key, static_cast<double>(out));
-        if (!valid_heat_knob(raw)) {
+        const auto leaf = knob->find(key);
+        if (leaf == knob->end() || !leaf->is_number()) {
             throw std::invalid_argument(
-                std::string("governor.") + name + "." + key + " must be a non-negative finite number");
+                std::string("governor.") + name + "." + key + " must be a number");
         }
-        out = static_cast<float>(raw);
+        if (!valid_heat_knob(leaf->get<double>())) {
+            throw std::invalid_argument(
+                std::string("governor.") + name + "." + key +
+                " must be a non-negative finite number");
+        }
+        out = static_cast<float>(leaf->get<double>());
     };
     leg("npu", npu);
     leg("gpu", gpu);
     leg("cpu", cpu);
+    for (const auto & entry : knob->items()) {
+        const std::string & key = entry.key();
+        if (key != "npu" && key != "gpu" && key != "cpu") {
+            throw std::invalid_argument(
+                std::string("governor.") + name + "." + key + " is not a leg (npu, gpu, cpu)");
+        }
+    }
 }
 
 } // namespace
@@ -243,6 +258,17 @@ bool parse_governor_params(
         governor, "decode_guard_headroom_c", params.decode_guard_headroom_c);
     params.decode_headroom_tau_s = nonneg_float_or(
         governor, "decode_headroom_tau_s", params.decode_headroom_tau_s);
+    // Audit F1/P1: record which rule v3 keys the app JSON explicitly sent -
+    // on the one-copy load the matched row only fills the absent ones
+    // (merge_leg_row_defaults). An invalid key throws above, so a completed
+    // parse carries only well-typed presence.
+    options.v3_sent.hop_tokens = governor.contains("decode_hop_tokens");
+    options.v3_sent.leg_weighting = governor.contains("decode_leg_weighting");
+    options.v3_sent.heat_weight = governor.contains("decode_heat_weight");
+    options.v3_sent.heat_per_token = governor.contains("decode_heat_per_token");
+    options.v3_sent.load_step = governor.contains("decode_load_step");
+    options.v3_sent.guard_headroom_c = governor.contains("decode_guard_headroom_c");
+    options.v3_sent.headroom_tau_s = governor.contains("decode_headroom_tau_s");
     // npu_lane_enabled is forwarded: the engine's prefill_engine owns the
     // lane (owner rule 2026-09-28) and load_governor_models decides the
     // device with llama_governor_resolve_prefill_device + degrade.
@@ -252,6 +278,38 @@ bool parse_governor_params(
         throw std::invalid_argument("governor: thermo profile invalid");
     }
     return true;
+}
+
+llama_governor_params merge_leg_row_defaults(
+        const llama_governor_params & params, const governor_v3_keys & sent,
+        const rn_leg_set & row) {
+    llama_governor_params merged = params;
+    if (!sent.hop_tokens) {
+        merged.decode_hop_tokens = row.decode_hop_tokens;
+    }
+    if (!sent.leg_weighting) {
+        merged.decode_leg_weighting = row.decode_leg_weighting;
+    }
+    if (!sent.heat_weight) {
+        merged.decode_heat_weight = row.decode_heat_weight;
+    }
+    if (!sent.heat_per_token) {
+        merged.decode_heat_per_token_npu = row.decode_heat_per_token_npu;
+        merged.decode_heat_per_token_gpu = row.decode_heat_per_token_gpu;
+        merged.decode_heat_per_token_cpu = row.decode_heat_per_token_cpu;
+    }
+    if (!sent.load_step) {
+        merged.decode_load_step_npu_c = row.decode_load_step_npu_c;
+        merged.decode_load_step_gpu_c = row.decode_load_step_gpu_c;
+        merged.decode_load_step_cpu_c = row.decode_load_step_cpu_c;
+    }
+    if (!sent.guard_headroom_c) {
+        merged.decode_guard_headroom_c = row.decode_guard_headroom_c;
+    }
+    if (!sent.headroom_tau_s) {
+        merged.decode_headroom_tau_s = row.decode_headroom_tau_s;
+    }
+    return merged;
 }
 
 governor_prefill_device_plan decide_governor_prefill_device(

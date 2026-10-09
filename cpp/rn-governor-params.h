@@ -2,6 +2,7 @@
 
 #include "llama-ext.h"
 #include "nlohmann/json.hpp"
+#include "rn-legs-table.h"
 
 #include "ggml-backend.h"
 
@@ -9,14 +10,32 @@
 
 namespace rnllama {
 
-// Binding-level governor load options: they shape how the two models are
-// loaded here, so they do not travel through the engine's params struct.
+// Which rule v3 governor keys the app JSON explicitly carried (audit F1/P1).
+// On the one-copy load the matched legs-table row supplies the DEFAULT for
+// every rule v3 field; a key the app sent wins, so bench keys /
+// kalsa.bench.* overrides keep working. Produced by parse_governor_params -
+// no globals.
+struct governor_v3_keys {
+    bool hop_tokens = false;
+    bool leg_weighting = false;
+    bool heat_weight = false;
+    bool heat_per_token = false;
+    bool load_step = false;
+    bool guard_headroom_c = false;
+    bool headroom_tau_s = false;
+};
+
+// Binding-level governor load inputs parse_governor_params produces; they do
+// not travel through the engine's params struct.
 struct governor_load_options {
     // Repack on is upstream behaviour and the right default on 12 GB+ phones.
     // false is the 8 GB S23 shape, where the lane only fits without the CPU
     // repack copy (P1): repack-off costs ~1.41x lane decode speed and KLD
     // p99 0.0341 -> 0.0422.
     bool decode_repack = true;
+    // The explicit-key record for the row-defaults precedence on the
+    // one-copy load (merge_leg_row_defaults).
+    governor_v3_keys v3_sent{};
 };
 
 bool parse_governor_params(
@@ -24,6 +43,15 @@ bool parse_governor_params(
     llama_governor_params & params,
     llama_governor_thermo_profile & thermo,
     governor_load_options & options);
+
+/** The effective decode params of the one-copy load (audit F1/P1): the
+ *  matched row supplies the default for every rule v3 field, a key the app
+ *  JSON explicitly sent wins. Only ever applied on the one-copy branch -
+ *  with no row matched the caller's params pass through untouched. Pure. */
+llama_governor_params merge_leg_row_defaults(
+    const llama_governor_params & params,
+    const governor_v3_keys & sent,
+    const rn_leg_set & row);
 
 llama_governor_thermo_profile parse_governor_thermo(
     const nlohmann::ordered_json & thermo);

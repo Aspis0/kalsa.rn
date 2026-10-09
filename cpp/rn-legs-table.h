@@ -1,5 +1,7 @@
 #pragma once
 
+#include "llama-ext.h"
+
 #include <string>
 
 namespace rnllama {
@@ -28,16 +30,26 @@ struct rn_leg_set {
     bool npu = false;
     bool gpu = false;
     bool cpu = false;
-    // The decode-hop tuning of the matched row (owner decision 2026-10-07):
-    // headroom EMA time constant in seconds, then the skin-C heat weighting
-    // measured on that device per leg (S23 ABBA: -15 % skin rise at equal
-    // speed vs the raw rule). Per-device constants live in the row, never in
-    // global defaults; all zero when no row matched = the raw rule, off.
+    // The decode-hop tuning of the matched row (owner decisions 2026-10-07
+    // and 2026-10-09): rule v3 as measured on that device - S23 round 4
+    // (step5-vsleg4, 2026-10-08) - so a matched device hops with HEAT_RANK
+    // without the app sending anything. Per-device constants live in the
+    // row, never in global defaults; all zero / NPU_FIRST when no row
+    // matched = the raw rule, off. These are DEFAULTS, not overrides: the
+    // one-copy load applies them through merge_leg_row_defaults
+    // (rn-governor-params.h), where a key the app JSON explicitly sent wins.
     float decode_headroom_tau_s = 0.0f;
     float decode_heat_weight = 0.0f;
     float decode_heat_per_token_npu = 0.0f;
     float decode_heat_per_token_gpu = 0.0f;
     float decode_heat_per_token_cpu = 0.0f;
+    uint32_t decode_hop_tokens = 0;
+    llama_governor_leg_weighting decode_leg_weighting =
+        llama_governor_leg_weighting::NPU_FIRST;
+    float decode_load_step_npu_c = 0.0f;
+    float decode_load_step_gpu_c = 0.0f;
+    float decode_load_step_cpu_c = 0.0f;
+    float decode_guard_headroom_c = 0.0f;
 };
 
 // The capability table: one pure, host-tested match against the validated

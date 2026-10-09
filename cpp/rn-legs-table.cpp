@@ -54,19 +54,32 @@ struct rn_legs_row {
     const char * gpu_vendor_token;
     const char * gpu_model_token;
     const char * gpu_compiler;
-    // The decode-hop tuning this row ships (owner decision 2026-10-07,
-    // lab PLAN.md raw/session13 + session14): measured on THIS device per
-    // leg, so it moves only with a new lab report on that hardware.
+    // The rule v3 decode tuning this row ships (owner decisions 2026-10-07
+    // and 2026-10-09): measured on THIS device per leg, so a value moves
+    // only with a new lab report on that hardware.
     float decode_headroom_tau_s;
     float decode_heat_weight;
     float decode_heat_per_token_npu;
     float decode_heat_per_token_gpu;
     float decode_heat_per_token_cpu;
+    uint32_t decode_hop_tokens;
+    llama_governor_leg_weighting decode_leg_weighting;
+    float decode_load_step_npu_c;
+    float decode_load_step_gpu_c;
+    float decode_load_step_cpu_c;
+    float decode_guard_headroom_c;
 };
 
+// A new SoC (e.g. SM8650) appends here with its own lab report's measured
+// values - never inferred from the SM8550 row, never in global defaults.
 const rn_legs_row k_rows[] = {
+    // S23 (SM8550 / Hexagon v73 / Adreno 740), rule v3 round 4
+    // (scratchpad onecopy-three-legs/step5-s23, run-step5-vsleg4.sh +
+    // raw/r4/REPORT.md, 2026-10-08): hop 32, HEAT_RANK, per-token heat
+    // 2.8/3.2/4.7 skin C (npu/gpu/cpu), load step 19/9/22 C, guard 5 C.
     { "SM8550", "Hexagon v73", "Adreno", "740", "E031.41.",
-      10.0f, 7.0f, 2.8f, 3.2f, 4.7f },
+      10.0f, 7.0f, 2.8f, 3.2f, 4.7f,
+      32, llama_governor_leg_weighting::HEAT_RANK, 19.0f, 9.0f, 22.0f, 5.0f },
 };
 
 bool row_matches(const rn_legs_row & row, const rn_hw_facts & facts) {
@@ -168,6 +181,12 @@ rn_leg_set rn_legs_for(const rn_hw_facts & facts) {
             match.decode_heat_per_token_npu = row.decode_heat_per_token_npu;
             match.decode_heat_per_token_gpu = row.decode_heat_per_token_gpu;
             match.decode_heat_per_token_cpu = row.decode_heat_per_token_cpu;
+            match.decode_hop_tokens = row.decode_hop_tokens;
+            match.decode_leg_weighting = row.decode_leg_weighting;
+            match.decode_load_step_npu_c = row.decode_load_step_npu_c;
+            match.decode_load_step_gpu_c = row.decode_load_step_gpu_c;
+            match.decode_load_step_cpu_c = row.decode_load_step_cpu_c;
+            match.decode_guard_headroom_c = row.decode_guard_headroom_c;
             return match;
         }
     }

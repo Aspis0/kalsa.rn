@@ -179,14 +179,14 @@ llama_governor_thermo_profile parse_governor_thermo(
     // throw (value_or would throw on a string). JSI numbers arrive as
     // doubles (toJson keeps number precision), so integrality is a value
     // check; the int32 bounds keep the cast defined for Infinity/NaN.
-    // The engine owns the semantic range - it clamps out-of-range to
-    // absent at ingress - so no range check duplicates it here.
+    // Keep malformed values absent before they enter the remembered profile.
     result.platform_thermal_status = -1;
     const auto status = thermo.find("platform_thermal_status");
     if (status != thermo.end() && status->is_number()) {
         const double raw = status->get<double>();
         if (raw == std::trunc(raw) && raw >= -2147483648.0 && raw <= 2147483647.0) {
-            result.platform_thermal_status = static_cast<int32_t>(raw);
+            const auto parsed = static_cast<int32_t>(raw);
+            result.platform_thermal_status = parsed < -1 || parsed > 6 ? -1 : parsed;
         }
     }
     return result;

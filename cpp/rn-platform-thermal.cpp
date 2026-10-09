@@ -1,9 +1,5 @@
-// Android's current thermal status, read natively.
-//
-// One responsibility: answer "what does the platform say now" on the scale
-// the engine's thermo profile carries. The policy about when an answer
-// reaches the engine lives in cpp/rn-governor.cpp (refresh_platform_thermal),
-// which this TU deliberately knows nothing about.
+// Native AThermal access and pure policy helpers used by rn_governor.
+// The governor owns scheduling and forwarding; helpers stay testable on host.
 
 #include "rn-platform-thermal.h"
 
@@ -28,13 +24,43 @@ int32_t rn_map_platform_thermal_status(int32_t athermal_status) {
     return athermal_status;
 }
 
-bool rn_platform_thermal_should_send(int64_t now_us, int64_t & last_read_us,
-                                     int32_t native_status, int32_t remembered_status) {
+bool rn_platform_thermal_should_read(int64_t now_us, int64_t & last_read_us) {
     if (now_us - last_read_us < k_platform_thermal_interval_us) {
         return false;
     }
     last_read_us = now_us;
-    return native_status != k_platform_thermal_absent && native_status != remembered_status;
+    return true;
+}
+
+rn_platform_thermal_send_decision rn_platform_thermal_should_send(
+    int64_t now_us, int32_t native_status, int32_t remembered_status,
+    rn_platform_thermal_send_state state) {
+    rn_platform_thermal_send_decision result;
+    result.next_state = state;
+    if (native_status == k_platform_thermal_absent || native_status == remembered_status) {
+        result.next_state = {};
+        return result;
+    }
+    if (native_status < remembered_status || native_status < 2) {
+        result.send = true;
+        result.next_state = {};
+        return result;
+    }
+    // A pause in the expected read series cannot count as sustained status.
+    if (state.pending_status < 2 || native_status < state.pending_status ||
+        now_us - state.last_seen_us > 2 * k_platform_thermal_interval_us) {
+        result.next_state.pending_status = native_status;
+        result.next_state.pending_since_us = now_us;
+        result.next_state.last_seen_us = now_us;
+        result.pending_started = true;
+        return result;
+    }
+    result.next_state.last_seen_us = now_us;
+    if (now_us - state.pending_since_us >= k_platform_thermal_escalation_debounce_us) {
+        result.send = true;
+        result.next_state = {};
+    }
+    return result;
 }
 
 #if !defined(__ANDROID__)
@@ -46,6 +72,10 @@ rn_platform_thermal::~rn_platform_thermal() = default;
 
 int32_t rn_platform_thermal::status() const {
     return k_platform_thermal_absent;
+}
+
+const char * rn_platform_thermal::unavailable_reason() const {
+    return "not_android";
 }
 
 #else
@@ -60,6 +90,7 @@ struct rn_thermal_api {
     rn_thermal_acquire_fn acquire = nullptr;
     rn_thermal_current_fn current = nullptr;
     rn_thermal_release_fn release = nullptr;
+    const char * unavailable_reason = "symbols_unavailable";
 
     bool complete() const {
         return acquire != nullptr && current != nullptr && release != nullptr;
@@ -78,6 +109,7 @@ const rn_thermal_api & thermal_api() {
         rn_thermal_api table;
         void * lib = ::dlopen("libandroid.so", RTLD_NOW | RTLD_NODELETE);
         if (lib == nullptr) {
+            table.unavailable_reason = "dlopen_failed";
             return table;
         }
         table.acquire = reinterpret_cast<rn_thermal_acquire_fn>(
@@ -86,7 +118,11 @@ const rn_thermal_api & thermal_api() {
             ::dlsym(lib, "AThermal_getCurrentThermalStatus"));
         table.release = reinterpret_cast<rn_thermal_release_fn>(
             ::dlsym(lib, "AThermal_releaseManager"));
-        return table.complete() ? table : rn_thermal_api{};
+        if (table.complete()) {
+            table.unavailable_reason = nullptr;
+            return table;
+        }
+        return table;
     }();
     return api;
 }
@@ -96,6 +132,13 @@ const rn_thermal_api & thermal_api() {
 rn_platform_thermal::rn_platform_thermal() {
     const rn_thermal_api & api = thermal_api();
     manager_ = api.complete() ? api.acquire() : nullptr;
+}
+
+const char * rn_platform_thermal::unavailable_reason() const {
+    if (manager_ == nullptr && thermal_api().complete()) {
+        return "manager_unavailable";
+    }
+    return thermal_api().unavailable_reason;
 }
 
 rn_platform_thermal::~rn_platform_thermal() {

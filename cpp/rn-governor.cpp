@@ -23,6 +23,7 @@ rn_governor::rn_governor(llama_model * prefill_model, llama_model * decode_model
             : failure_reason;
         throw std::runtime_error(failure_reason_);
     }
+    log_platform_thermal_availability();
     init_hop_reader(params);
 }
 
@@ -37,6 +38,7 @@ rn_governor::rn_governor(llama_model * model, const llama_governor_leg * legs, u
         failure_reason_ = "llama_governor_init_one_model_with_params returned null";
         throw std::runtime_error(failure_reason_);
     }
+    log_platform_thermal_availability();
     // A present leg the engine did not build (its device refused, e.g. the
     // OpenCL import) is a runtime demotion: logged once here, the hop simply
     // never uses that leg, and the load stays one-copy on the legs that did
@@ -66,6 +68,14 @@ void rn_governor::init_hop_reader(const llama_governor_params & params) {
                  decode_legs_->cpu_zone_count(), decode_legs_->npu_zone_count(),
                  decode_legs_->gpu_zone_count());
     }
+}
+
+void rn_governor::log_platform_thermal_availability() const {
+#if defined(__ANDROID__)
+    if (const char * reason = platform_thermal_.unavailable_reason()) {
+        LOG_INFO("KALSA_GOVERNOR_PLATFORM {source:\"unavailable\", reason:\"%s\"}", reason);
+    }
+#endif
 }
 
 rn_governor::~rn_governor() {
@@ -168,36 +178,61 @@ bool rn_governor::set_thermo_profile(const llama_governor_thermo_profile & profi
     if (governor_ == nullptr || failed_) {
         return false;
     }
-    profile_valid_ = llama_governor_set_thermo_profile(
-        governor_, profile, ggml_time_us() / 1000);
-    // Remembered only once the engine took it: refresh_platform_thermal
-    // re-sends this profile, so it must be one the engine accepts.
+    std::lock_guard<std::mutex> lock(profile_mutex_);
+    profile_valid_ = llama_governor_set_thermo_profile(governor_, profile, ggml_time_us() / 1000);
     if (profile_valid_) {
         thermo_profile_ = profile;
+        platform_thermal_send_state_ = {};
+        platform_refusal_logged_ = false;
     }
     return profile_valid_;
 }
 
 void rn_governor::refresh_platform_thermal() {
-    if (!profile_valid_) {
-        return;  // the engine has no profile to carry a status in
+    {
+        std::lock_guard<std::mutex> lock(profile_mutex_);
+        if (!profile_valid_ || !rn_platform_thermal_should_read(ggml_time_us(),
+                                                                platform_thermal_read_us_)) {
+            return;
+        }
     }
+    // The HAL call can block on binder; profile updates remain available while
+    // it runs, and the send decision uses whichever profile was accepted latest.
     const int32_t status = platform_thermal_.status();
+    std::lock_guard<std::mutex> lock(profile_mutex_);
+    if (!profile_valid_) {
+        return;
+    }
     const int32_t previous = thermo_profile_.platform_thermal_status;
-    if (!rn_platform_thermal_should_send(ggml_time_us(), platform_thermal_read_us_,
-                                        status, previous)) {
+    const auto decision = rn_platform_thermal_should_send(
+        ggml_time_us(), status, previous, platform_thermal_send_state_);
+    platform_thermal_send_state_ = decision.next_state;
+    if (decision.pending_started) {
+        LOG_INFO("KALSA_GOVERNOR_PLATFORM {status:%d, prev:%d, source:\"native\", sent:0}",
+                 status, previous);
+    }
+    if (!decision.send) {
         return;
     }
-    thermo_profile_.platform_thermal_status = status;
-    if (!llama_governor_set_thermo_profile(governor_, thermo_profile_, ggml_time_us() / 1000)) {
-        // Unreachable while profile_valid_ holds: a profile the engine accepted
-        // is re-accepted with only platform_thermal_status changed, and no
-        // validity rule reads that field. Kept quiet so a refusal could never
-        // turn into a log line per decode.
+    llama_governor_thermo_profile updated = thermo_profile_;
+    updated.platform_thermal_status = status;
+    if (!llama_governor_set_thermo_profile(governor_, updated, ggml_time_us() / 1000)) {
+        profile_valid_ = false;
+        platform_thermal_send_state_ = {};
+        if (!platform_refusal_logged_) {
+            LOG_WARNING("KALSA_GOVERNOR_PLATFORM {source:\"native\", sent:0, reason:\"engine_refused\"}");
+            platform_refusal_logged_ = true;
+        }
         return;
     }
-    LOG_INFO("KALSA_GOVERNOR_PLATFORM {status:%d, prev:%d, source:\"native\"}",
+    thermo_profile_ = updated;
+    LOG_INFO("KALSA_GOVERNOR_PLATFORM {status:%d, prev:%d, source:\"native\", sent:1}",
              status, previous);
+}
+
+bool rn_governor::profile_valid() const {
+    std::lock_guard<std::mutex> lock(profile_mutex_);
+    return profile_valid_;
 }
 
 bool rn_governor::set_prefill_override(int mode) {

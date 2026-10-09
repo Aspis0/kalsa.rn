@@ -1,11 +1,4 @@
-// Mid-turn platform thermal status tests (host-only: no model, no ggml, no
-// Android).
-//
-// Pins cpp/rn-platform-thermal.cpp: the AThermalStatus ladder mapped 1:1 onto
-// the engine's platform_thermal_status, and the three decisions the governor
-// leans on when forwarding a native read - at most one read per second of
-// wall time, only on a change, and never let "absent" overwrite a status the
-// app already handed over.
+// Pure platform thermal policy tests; no Android, model, or ggml runtime.
 
 #include "rn-platform-thermal.h"
 
@@ -15,139 +8,117 @@
 
 using namespace rnllama;
 
-// Test result tracking (same shape as thermal_legs_test.cpp)
+namespace {
+
 struct TestResults {
-    int total_tests = 0;
-    int passed_tests = 0;
+    int total = 0;
+    int passed = 0;
 
-    void run_test(const std::string& name, bool result) {
-        total_tests++;
-        std::cout << "TEST: " << name << " ... ";
-        if (result) {
-            std::cout << "PASSED" << std::endl;
-            passed_tests++;
-        } else {
-            std::cout << "FAILED" << std::endl;
-        }
-    }
-
-    void print_summary() {
-        std::cout << "\n=== Test Summary ===" << std::endl;
-        std::cout << "Total tests: " << total_tests << std::endl;
-        std::cout << "Passed: " << passed_tests << std::endl;
-        std::cout << "Failed: " << (total_tests - passed_tests) << std::endl;
+    void run(const std::string & name, bool result) {
+        ++total;
+        std::cout << "TEST: " << name << " ... " << (result ? "PASSED" : "FAILED") << '\n';
+        passed += result;
     }
 };
 
-namespace {
+constexpr int64_t t0 = 1000000;
 
-constexpr int64_t t0 = 1000000;  // some steady-clock value, well past the 0 start
+bool test_interval_gate_advances_only_when_due() {
+    int64_t last = t0;
+    if (rn_platform_thermal_should_read(t0 + k_platform_thermal_interval_us - 1, last)) return false;
+    if (last != t0) return false;
+    if (!rn_platform_thermal_should_read(t0 + k_platform_thermal_interval_us, last)) return false;
+    return last == t0 + k_platform_thermal_interval_us;
+}
 
-// What the app hands over once per completion: PowerManager's MODERATE.
-constexpr int32_t k_app_status = 2;
+bool test_escalation_requires_five_seconds_of_reads() {
+    rn_platform_thermal_send_state state;
+    auto decision = rn_platform_thermal_should_send(t0, 2, 1, state);
+    if (decision.send || !decision.pending_started) return false;
+    state = decision.next_state;
+    for (int second = 1; second < 5; ++second) {
+        decision = rn_platform_thermal_should_send(t0 + second * 1000000, 2, 1, state);
+        if (decision.send || decision.pending_started) return false;
+        state = decision.next_state;
+    }
+    decision = rn_platform_thermal_should_send(t0 + k_platform_thermal_escalation_debounce_us,
+                                                2, 1, state);
+    return decision.send;
+}
 
-// AThermalStatus is the engine's ladder: ATHERMAL_STATUS_NONE(0)..
-// ATHERMAL_STATUS_SHUTDOWN(6) pass through untouched, SEVERE (3) included -
-// the status the S23 reported mid-turn and the governor missed.
-bool test_ladder_maps_one_to_one() {
+bool test_escalation_keeps_consecutive_reads_at_or_above_pending_level() {
+    rn_platform_thermal_send_state state;
+    auto decision = rn_platform_thermal_should_send(t0, 2, 1, state);
+    state = decision.next_state;
+    for (int second = 1; second <= 5; ++second) {
+        decision = rn_platform_thermal_should_send(t0 + second * 1000000, 3, 1, state);
+        if (second < 5 && decision.send) return false;
+        state = decision.next_state;
+    }
+    return decision.send;
+}
+
+bool test_escalation_restarts_after_a_read_gap() {
+    auto decision = rn_platform_thermal_should_send(t0, 2, 1, {});
+    auto state = decision.next_state;
+    decision = rn_platform_thermal_should_send(t0 + 4 * 1000000, 2, 1, state);
+    if (decision.send || !decision.pending_started ||
+        decision.next_state.pending_since_us != t0 + 4 * 1000000) return false;
+    state = decision.next_state;
+    for (int second = 1; second < 5; ++second) {
+        decision = rn_platform_thermal_should_send(t0 + (4 + second) * 1000000, 2, 1, state);
+        if (decision.send) return false;
+        state = decision.next_state;
+    }
+    decision = rn_platform_thermal_should_send(t0 + 9 * 1000000, 2, 1, state);
+    return decision.send;
+}
+
+bool test_deescalation_is_immediate() {
+    const auto decision = rn_platform_thermal_should_send(t0, 2, 4, {});
+    return decision.send && decision.next_state.pending_status == k_platform_thermal_absent;
+}
+
+bool test_absent_never_overwrites() {
+    const auto decision = rn_platform_thermal_should_send(t0, k_platform_thermal_absent, 3, {});
+    return !decision.send && decision.next_state.pending_status == k_platform_thermal_absent;
+}
+
+bool test_unchanged_status_does_not_resend() {
+    const auto decision = rn_platform_thermal_should_send(t0, 3, 3, {});
+    return !decision.send && !decision.pending_started;
+}
+
+bool test_ladder_mapping() {
     for (int32_t status = 0; status <= k_platform_thermal_shutdown; ++status) {
-        if (rn_map_platform_thermal_status(status) != status) {
-            return false;
-        }
+        if (rn_map_platform_thermal_status(status) != status) return false;
     }
-    return true;
+    return rn_map_platform_thermal_status(-2) == k_platform_thermal_absent &&
+           rn_map_platform_thermal_status(7) == k_platform_thermal_absent;
 }
 
-// Everything the platform never sent is "absent", including the NDK's own
-// ATHERMAL_STATUS_ERROR and whatever a future platform adds above SHUTDOWN.
-bool test_out_of_scale_is_absent() {
-    if (rn_map_platform_thermal_status(-1) != k_platform_thermal_absent) { return false; }
-    if (rn_map_platform_thermal_status(-100) != k_platform_thermal_absent) { return false; }
-    if (rn_map_platform_thermal_status(k_platform_thermal_shutdown + 1) != k_platform_thermal_absent) {
-        return false;
-    }
-    return rn_map_platform_thermal_status(100) == k_platform_thermal_absent;
-}
-
-// Off Android (iOS, host) the same TU answers "absent", which is what keeps
-// every governor path on the app's own status there.
-bool test_off_android_reads_absent() {
+bool test_off_android_reader_is_absent() {
 #if defined(__ANDROID__)
-    // tests/CMakeLists.txt never targets Android; the real reader is proved
-    // in-app, so this case only carries an off-Android meaning.
     return true;
 #else
-    const rn_platform_thermal thermal;
-    return thermal.status() == k_platform_thermal_absent;
+    return rn_platform_thermal().status() == k_platform_thermal_absent;
 #endif
-}
-
-bool test_second_read_inside_the_second_is_dropped() {
-    int64_t last_read = 0;
-    if (!rn_platform_thermal_should_send(t0, last_read, 3, -1)) { return false; }
-    if (last_read != t0) { return false; }
-    // Same tick: the engine must not hear one move twice.
-    if (rn_platform_thermal_should_send(t0, last_read, 3, 3)) { return false; }
-    if (last_read != t0) { return false; }
-    // And still nothing a microsecond short of the second.
-    return !rn_platform_thermal_should_send(t0 + k_platform_thermal_interval_us - 1, last_read, 3, 3);
-}
-
-bool test_read_due_after_a_second_and_only_on_change() {
-    int64_t last_read = 0;
-    const int64_t due = t0 + k_platform_thermal_interval_us;
-    if (!rn_platform_thermal_should_send(t0, last_read, 2, -1)) { return false; }
-    if (last_read != t0) { return false; }
-    // Unchanged: no send, but the read still cost its second.
-    if (rn_platform_thermal_should_send(due, last_read, 2, 2)) { return false; }
-    if (last_read != due) { return false; }
-    if (!rn_platform_thermal_should_send(due + k_platform_thermal_interval_us, last_read, 3, 2)) {
-        return false;
-    }
-    return last_read == due + k_platform_thermal_interval_us;
-}
-
-bool test_absent_never_overwrites_a_valid_status() {
-    int64_t last_read = 0;
-    if (!rn_platform_thermal_should_send(t0, last_read, k_app_status, -1)) { return false; }
-    // An unasking platform one hour later still leaves the app's status.
-    const int64_t hour = t0 + 3600 * k_platform_thermal_interval_us;
-    if (rn_platform_thermal_should_send(hour, last_read, k_platform_thermal_absent,
-                                        k_app_status)) {
-        return false;
-    }
-    if (last_read != hour) { return false; }  // the read was taken anyway
-    // The engine hears the recovery the moment the platform answers again.
-    return rn_platform_thermal_should_send(hour + k_platform_thermal_interval_us, last_read, 0,
-                                           k_app_status);
-}
-
-bool test_absent_on_absent_is_not_a_change() {
-    int64_t last_read = 0;
-    if (rn_platform_thermal_should_send(t0, last_read, k_platform_thermal_absent,
-                                        k_platform_thermal_absent)) {
-        return false;
-    }
-    return !rn_platform_thermal_should_send(t0 + k_platform_thermal_interval_us, last_read,
-                                            k_platform_thermal_absent,
-                                            k_platform_thermal_absent);
 }
 
 } // namespace
 
 int main() {
     TestResults results;
-    results.run_test("AThermal ladder maps 1:1 onto the engine scale", test_ladder_maps_one_to_one());
-    results.run_test("out-of-scale and ATHERMAL_STATUS_ERROR are absent",
-                     test_out_of_scale_is_absent());
-    results.run_test("off-Android build reads absent", test_off_android_reads_absent());
-    results.run_test("second read inside the second is dropped",
-                     test_second_read_inside_the_second_is_dropped());
-    results.run_test("read due after a second, and only on change",
-                     test_read_due_after_a_second_and_only_on_change());
-    results.run_test("absent never overwrites a valid status",
-                     test_absent_never_overwrites_a_valid_status());
-    results.run_test("absent on absent is not a change", test_absent_on_absent_is_not_a_change());
-    results.print_summary();
-    return (results.passed_tests == results.total_tests) ? 0 : 1;
+    results.run("read interval advances only when due", test_interval_gate_advances_only_when_due());
+    results.run("escalation requires five seconds of reads", test_escalation_requires_five_seconds_of_reads());
+    results.run("higher reads sustain the pending escalation", test_escalation_keeps_consecutive_reads_at_or_above_pending_level());
+    results.run("escalation restarts after a read gap", test_escalation_restarts_after_a_read_gap());
+    results.run("de-escalation is immediate", test_deescalation_is_immediate());
+    results.run("absent never overwrites", test_absent_never_overwrites());
+    results.run("unchanged status does not resend", test_unchanged_status_does_not_resend());
+    results.run("AThermal ladder maps to engine scale", test_ladder_mapping());
+    results.run("off-Android reader is absent", test_off_android_reader_is_absent());
+    std::cout << "Total tests: " << results.total << "\nPassed: " << results.passed
+              << "\nFailed: " << (results.total - results.passed) << '\n';
+    return results.passed == results.total ? 0 : 1;
 }

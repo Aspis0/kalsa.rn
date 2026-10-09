@@ -402,10 +402,8 @@ static bool test_devices_excluding_registry() {
     return true;
 }
 
-// platform_thermal_status is optional and the engine owns its range (it
-// clamps out-of-range to absent at ingress), so the binding forwards an
-// integral number untouched and maps absent / wrong type / fractional to
-// -1 (no platform vote) without throwing.
+// platform_thermal_status is optional; out-of-range and malformed values
+// become -1 (no platform vote) without throwing.
 static bool test_platform_thermal_status_parses() {
     auto status_of = [](const nlohmann::ordered_json & thermo, int32_t * out) {
         try {
@@ -424,7 +422,8 @@ static bool test_platform_thermal_status_parses() {
     const status_case cases[] = {
         {"absent", {{"sensor_valid", true}}, -1},
         {"integer 3", {{"sensor_valid", true}, {"platform_thermal_status", 3}}, 3},
-        {"integer 9 passes through", {{"sensor_valid", true}, {"platform_thermal_status", 9}}, 9},
+        {"integer 9 is absent", {{"sensor_valid", true}, {"platform_thermal_status", 9}}, -1},
+        {"integer below -1 is absent", {{"sensor_valid", true}, {"platform_thermal_status", -2}}, -1},
         {"string 3 is absent", {{"sensor_valid", true}, {"platform_thermal_status", "3"}}, -1},
         {"null is absent", {{"sensor_valid", true}, {"platform_thermal_status", nullptr}}, -1},
         {"boolean is absent", {{"sensor_valid", true}, {"platform_thermal_status", true}}, -1},
@@ -443,8 +442,7 @@ static bool test_platform_thermal_status_parses() {
             return false;
         }
     }
-    // End to end: binding-side validity must not reject an out-of-range
-    // status either - 9 is forwarded for the engine to clamp.
+    // End to end: an out-of-range status is normalized before it is retained.
     auto governor = base_governor();
     governor["thermo"]["platform_thermal_status"] = 9;
     llama_governor_params params{};
@@ -459,7 +457,7 @@ static bool test_platform_thermal_status_parses() {
         std::cerr << "unexpected throw: " << e.what() << std::endl;
         return false;
     }
-    return thermo.platform_thermal_status == 9;
+    return thermo.platform_thermal_status == -1;
 }
 
 static bool test_decode_rule_v3_parser_contract() {
@@ -526,7 +524,7 @@ int main() {
     results.run_test("runtime htp reason degrades the next load", test_htp_runtime_reason_degrades_next_load());
     results.run_test("only a batch the HTP device ran kills the lane", test_htp_runtime_failure_attribution());
     results.run_test("registry exclusion keeps non-HTP order", test_devices_excluding_registry());
-    results.run_test("platform_thermal_status optional, engine owns range", test_platform_thermal_status_parses());
+    results.run_test("platform_thermal_status normalizes to -1..6", test_platform_thermal_status_parses());
     results.run_test("decode rule v3 parser contract", test_decode_rule_v3_parser_contract());
     results.run_test("leg object errors distinguish absent from non-numeric", test_leg_object_leaf_errors_name_the_failure());
     results.print_summary();

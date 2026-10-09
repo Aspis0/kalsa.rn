@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 
 namespace rnllama {
@@ -58,7 +59,7 @@ public:
     // The engine governor's sticky state (not the shadow); out-of-line because
     // llama_governor is incomplete in this header.
     bool engine_failed() const;
-    bool profile_valid() const { return profile_valid_; }
+    bool profile_valid() const;
     llama_governor_fit gpu_fit() const { return gpu_fit_; }
     const std::string & failure_reason() const { return failure_reason_; }
 
@@ -66,12 +67,11 @@ private:
     // The decode-hop thermal-leg reader both constructors share: built only
     // when decode_hop_tokens > 0, so a hop-less governor does no sysfs work.
     void init_hop_reader(const llama_governor_params & params);
+    void log_platform_thermal_availability() const;
     // Samples the legs and hands the headroom to the engine; a no-op when
     // there is no reader (decode_hop_tokens == 0).
     void feed_decode_headroom();
-    // Hands the engine the platform's current thermal status when it moved
-    // since the profile the app last handed over; depends on nothing but
-    // decode() calling every step (see the .cpp).
+    // Reads at the interval, then forwards a changed status under profile_mutex_.
     void refresh_platform_thermal();
 
     llama_governor * governor_ = nullptr;
@@ -86,17 +86,16 @@ private:
     // Atomic: decode() writes it on the decode thread while the override
     // setter (allowed to overlap decode) reads it from a pool worker.
     std::atomic<bool> failed_{false};
+    mutable std::mutex profile_mutex_;
     bool profile_valid_ = false;
-    // The last profile the engine accepted from set_thermo_profile: the
-    // mid-turn native platform read re-sends exactly this profile with a
-    // fresh platform_thermal_status, so nothing the app sent is lost. It is
-    // written only on an accepted profile, so a profile_valid_ governor
-    // always holds one the engine takes again.
+    // The last profile accepted by the engine.
     llama_governor_thermo_profile thermo_profile_;
     // Native platform thermal reader, one per governor lifetime, and the
-    // wall-clock stamp of the last read (rn_platform_thermal.cpp's throttle).
+    // Wall-clock stamp of the last platform read.
     rn_platform_thermal platform_thermal_;
     int64_t platform_thermal_read_us_ = 0;
+    rn_platform_thermal_send_state platform_thermal_send_state_;
+    bool platform_refusal_logged_ = false;
     std::string failure_reason_;
 };
 

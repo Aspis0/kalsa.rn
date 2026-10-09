@@ -146,7 +146,7 @@ echo ""
 # Run KV-cache-reuse tests (only if the GGUF models have been downloaded)
 TOTAL_SUITES=7
 if [ -f "kv_cache_reuse_test" ] && ls ../models/*.gguf >/dev/null 2>&1; then
-    TOTAL_SUITES=7
+    TOTAL_SUITES=8
     echo "--- Running KV-cache-reuse Tests ---"
     if ./kv_cache_reuse_test; then
         echo "✓ KV-cache-reuse tests passed"

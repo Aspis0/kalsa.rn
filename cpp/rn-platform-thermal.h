@@ -17,10 +17,21 @@ constexpr int32_t k_platform_thermal_absent = -1;
 /** The top of that scale: NDK ATHERMAL_STATUS_SHUTDOWN (android/thermal.h). */
 constexpr int32_t k_platform_thermal_shutdown = 6;
 
-/** One native read per this many microseconds of wall time: the decode path
- *  is the only reader, and a read is a round trip to the thermal HAL service
- *  that a decode step should not pay more than once a second. */
+/** Minimum wall time between native reads. */
 constexpr int64_t k_platform_thermal_interval_us = 1000000;
+constexpr int64_t k_platform_thermal_escalation_debounce_us = 5000000;
+
+struct rn_platform_thermal_send_state {
+    int32_t pending_status = k_platform_thermal_absent;
+    int64_t pending_since_us = 0;
+    int64_t last_seen_us = 0;
+};
+
+struct rn_platform_thermal_send_decision {
+    bool send = false;
+    bool pending_started = false;
+    rn_platform_thermal_send_state next_state;
+};
 
 /** AThermal's ladder mapped 1:1 onto the engine's. ATHERMAL_STATUS_ERROR and
  *  any value a newer platform adds above SHUTDOWN are refused to "absent":
@@ -29,17 +40,9 @@ constexpr int64_t k_platform_thermal_interval_us = 1000000;
  *  Pure, so a host build and the test can drive it without Android. */
 int32_t rn_map_platform_thermal_status(int32_t athermal_status);
 
-/** Android's current thermal status, read natively (android/thermal.h).
- *
- *  The app can only report the platform status once per completion, so a turn
- *  long enough to heat the phone finishes on the status the app handed over
- *  at load: the engine never sees that the phone went SEVERE in the middle.
- *  The manager is acquired once for this object's lifetime
- *  (AThermal_acquireManager is a binder to the thermal HAL service, not a
- *  call to repeat per read) and status() is called from the decode thread only.
- *
- *  Off Android nothing answers and status() reports "absent", so the same
- *  translation unit links into every build. Never throws. */
+/** Reads Android's thermal status through the API 30 NDK interface when
+ *  available. The manager is acquired once per object. Off Android, status()
+ *  reports absent so this translation unit remains portable. */
 class rn_platform_thermal {
 public:
     rn_platform_thermal();
@@ -54,6 +57,7 @@ public:
      *  an acquire that returned null) or the platform answered
      *  ATHERMAL_STATUS_ERROR. */
     int32_t status() const;
+    const char * unavailable_reason() const;
 
 private:
 #if defined(__ANDROID__)
@@ -63,18 +67,14 @@ private:
 #endif
 };
 
-/** Whether a freshly read status must reach the engine, plus the clock that
- *  throttles the read. Pure: the caller owns last_read_us and the test drives
- *  it with literals.
- *
- *  True only for a read that is due (at most one native read per
- *  k_platform_thermal_interval_us of wall time, ggml_time_us is monotonic),
- *  and that differs from remembered_status, the status the last profile
- *  carried. A read of "absent" is never true: it is the platform declining to
- *  vote, and it must not overwrite the status the app already handed over.
- *  last_read_us advances whenever a read was taken, so an unchanged status
- *  still pays its second of wall time. */
-bool rn_platform_thermal_should_send(int64_t now_us, int64_t & last_read_us,
-                                     int32_t native_status, int32_t remembered_status);
+/** Advances last_read_us and returns true only when a native read is due. */
+bool rn_platform_thermal_should_read(int64_t now_us, int64_t & last_read_us);
+
+/** Pure send decision. Escalations to status >= 2 need five seconds of
+ *  consecutive reads at or above the pending level; lower statuses apply
+ *  immediately. Absent never replaces the remembered status. */
+rn_platform_thermal_send_decision rn_platform_thermal_should_send(
+    int64_t now_us, int32_t native_status, int32_t remembered_status,
+    rn_platform_thermal_send_state state);
 
 } // namespace rnllama

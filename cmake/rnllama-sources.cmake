@@ -146,6 +146,7 @@ set(RNLLAMA_RN_SOURCES
     ${RNLLAMA_CPP_DIR}/rn-governor.cpp
     ${RNLLAMA_CPP_DIR}/rn-governor-params.cpp
     ${RNLLAMA_CPP_DIR}/rn-legs-table.cpp
+    ${RNLLAMA_CPP_DIR}/rn-platform-thermal.cpp
     ${RNLLAMA_CPP_DIR}/rn-slot.cpp
     ${RNLLAMA_CPP_DIR}/rn-slot-manager.cpp
     ${RNLLAMA_CPP_DIR}/rn-thermal-legs.cpp

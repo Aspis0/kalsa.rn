@@ -2,6 +2,7 @@
 
 #include "llama-ext.h"
 #include "llama.h"
+#include "rn-platform-thermal.h"
 #include "rn-thermal-legs.h"
 
 #include <atomic>
@@ -68,6 +69,10 @@ private:
     // Samples the legs and hands the headroom to the engine; a no-op when
     // there is no reader (decode_hop_tokens == 0).
     void feed_decode_headroom();
+    // Hands the engine the platform's current thermal status when it moved
+    // since the profile the app last handed over; depends on nothing but
+    // decode() calling every step (see the .cpp).
+    void refresh_platform_thermal();
 
     llama_governor * governor_ = nullptr;
     uint32_t decode_hop_tokens_ = 0;
@@ -82,6 +87,16 @@ private:
     // setter (allowed to overlap decode) reads it from a pool worker.
     std::atomic<bool> failed_{false};
     bool profile_valid_ = false;
+    // The last profile the engine accepted from set_thermo_profile: the
+    // mid-turn native platform read re-sends exactly this profile with a
+    // fresh platform_thermal_status, so nothing the app sent is lost. It is
+    // written only on an accepted profile, so a profile_valid_ governor
+    // always holds one the engine takes again.
+    llama_governor_thermo_profile thermo_profile_;
+    // Native platform thermal reader, one per governor lifetime, and the
+    // wall-clock stamp of the last read (rn_platform_thermal.cpp's throttle).
+    rn_platform_thermal platform_thermal_;
+    int64_t platform_thermal_read_us_ = 0;
     std::string failure_reason_;
 };
 

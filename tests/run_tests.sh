@@ -52,6 +52,12 @@ if [ ! -f "legs_table_test" ]; then
     exit 1
 fi
 
+if [ ! -f "platform_thermal_test" ]; then
+    echo "Error: platform_thermal_test executable not found"
+    echo "Please run ./build_and_test.sh first"
+    exit 1
+fi
+
 echo "Found all test executables"
 
 TESTS_PASSED=0
@@ -125,8 +131,20 @@ fi
 
 echo ""
 
+# Run mid-turn platform thermal status tests (host-only: no model, no GPU)
+echo "--- Running Platform Thermal Tests ---"
+if ./platform_thermal_test; then
+    echo "✓ Platform thermal tests passed"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ Platform thermal tests failed"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+echo ""
+
 # Run KV-cache-reuse tests (only if the GGUF models have been downloaded)
-TOTAL_SUITES=6
+TOTAL_SUITES=7
 if [ -f "kv_cache_reuse_test" ] && ls ../models/*.gguf >/dev/null 2>&1; then
     TOTAL_SUITES=7
     echo "--- Running KV-cache-reuse Tests ---"

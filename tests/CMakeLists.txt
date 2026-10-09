@@ -159,3 +159,14 @@ target_include_directories(legs_table_test PRIVATE ${RNLLAMA_INCLUDE_DIRS})
 if(UNIX AND NOT APPLE)
     target_link_libraries(legs_table_test PRIVATE m)
 endif()
+
+# Mid-turn platform thermal status: links only the reader TU (its Android half
+# compiles out here) and drives the pure ladder mapping plus the
+# read-once-a-second / only-on-change / never-overwrite decision -- same shape
+# as thermal_legs_test above.
+add_executable(platform_thermal_test platform_thermal_test.cpp
+    ${RNLLAMA_CPP_DIR}/rn-platform-thermal.cpp)
+target_include_directories(platform_thermal_test PRIVATE ${RNLLAMA_INCLUDE_DIRS})
+if(UNIX AND NOT APPLE)
+    target_link_libraries(platform_thermal_test PRIVATE m)
+endif()

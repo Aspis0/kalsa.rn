@@ -76,6 +76,15 @@ fi
 echo "✓ legs_table_test built successfully"
 
 echo ""
+echo "Building platform_thermal_test..."
+make platform_thermal_test -j4
+if [ ! -f "platform_thermal_test" ]; then
+    echo "Error: Failed to build platform_thermal_test"
+    exit 1
+fi
+echo "✓ platform_thermal_test built successfully"
+
+echo ""
 echo "=== Build Successful ==="
 echo ""
 echo "Built executables:"
@@ -85,6 +94,7 @@ echo "  - chat_parse_utf8_test (chat parse UTF-8 robustness tests)"
 echo "  - governor_params_test (governor thermo parse tests)"
 echo "  - governor_v3_precedence_test (decode rule v3 precedence tests)"
 echo "  - legs_table_test (one-copy capability table tests)"
+echo "  - platform_thermal_test (mid-turn platform thermal status tests)"
 echo ""
 echo "To run the tests:"
 echo "  cd tests/build"
@@ -94,7 +104,8 @@ echo "  ./chat_parse_utf8_test    # Run chat parse UTF-8 tests"
 echo "  ./governor_params_test    # Run governor thermo parse tests"
 echo "  ./governor_v3_precedence_test # Run decode rule v3 precedence tests"
 echo "  ./legs_table_test         # Run one-copy capability table tests"
+echo "  ./platform_thermal_test   # Run mid-turn platform thermal status tests"
 echo ""
 echo "Or run all:"
-echo "  ./rnllama_tests && ./parallel_decoding_test && ./chat_parse_utf8_test && ./governor_params_test && ./governor_v3_precedence_test && ./legs_table_test"
+echo "  ./rnllama_tests && ./parallel_decoding_test && ./chat_parse_utf8_test && ./governor_params_test && ./governor_v3_precedence_test && ./legs_table_test && ./platform_thermal_test"
 echo ""

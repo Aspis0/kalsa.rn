@@ -92,6 +92,11 @@ int32_t rn_governor::decode(llama_batch batch) {
         return -1;
     }
 
+    // Ahead of this step's admission, because the engine's platform floor
+    // (apply_platform_floor) is read at admission time and decode is the one
+    // place every step of every governor path passes through.
+    refresh_platform_thermal();
+
     const int32_t result = llama_governor_decode(governor_, batch);
     if (governor_decode_failed(result, governor_->is_failed())) {
         failed_ = true;
@@ -165,7 +170,34 @@ bool rn_governor::set_thermo_profile(const llama_governor_thermo_profile & profi
     }
     profile_valid_ = llama_governor_set_thermo_profile(
         governor_, profile, ggml_time_us() / 1000);
+    // Remembered only once the engine took it: refresh_platform_thermal
+    // re-sends this profile, so it must be one the engine accepts.
+    if (profile_valid_) {
+        thermo_profile_ = profile;
+    }
     return profile_valid_;
+}
+
+void rn_governor::refresh_platform_thermal() {
+    if (!profile_valid_) {
+        return;  // the engine has no profile to carry a status in
+    }
+    const int32_t status = platform_thermal_.status();
+    const int32_t previous = thermo_profile_.platform_thermal_status;
+    if (!rn_platform_thermal_should_send(ggml_time_us(), platform_thermal_read_us_,
+                                        status, previous)) {
+        return;
+    }
+    thermo_profile_.platform_thermal_status = status;
+    if (!llama_governor_set_thermo_profile(governor_, thermo_profile_, ggml_time_us() / 1000)) {
+        // Unreachable while profile_valid_ holds: a profile the engine accepted
+        // is re-accepted with only platform_thermal_status changed, and no
+        // validity rule reads that field. Kept quiet so a refusal could never
+        // turn into a log line per decode.
+        return;
+    }
+    LOG_INFO("KALSA_GOVERNOR_PLATFORM {status:%d, prev:%d, source:\"native\"}",
+             status, previous);
 }
 
 bool rn_governor::set_prefill_override(int mode) {

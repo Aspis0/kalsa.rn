@@ -88,6 +88,10 @@ set(RNLLAMA_GGML_OPENCL_DIR  "${_ggml}/ggml-opencl")
 # -- ggml-opencl-kalsa-diag.cpp was missing from all three call sites and only
 # the link step noticed. The engine's own CMakeLists builds this whole directory.
 file(GLOB RNLLAMA_GGML_OPENCL_SOURCES CONFIGURE_DEPENDS ${RNLLAMA_GGML_OPENCL_DIR}/*.cpp)
+# ...except tile32-verify.cpp: lab-only, built by the engine solely under
+# GGML_OPENCL_TILE32_LAB (no binding target sets it; it is the only gate for the
+# ggml_opencl_tile32_gemv_io type) -- the bare glob above would compile it and fail.
+list(FILTER RNLLAMA_GGML_OPENCL_SOURCES EXCLUDE REGEX "/ggml-opencl-tile32-verify\\.cpp$")
 set(RNLLAMA_GGML_HEXAGON_DIR "${_ggml}/ggml-hexagon")
 
 # --- llama, common, mtmd ------------------------------------------------------

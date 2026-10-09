@@ -170,26 +170,20 @@ ggml_backend_hexagon_set_shared_weights_t hexagon_shared_weights_setter() {
                                               "ggml_backend_hexagon_set_shared_weights"));
 }
 
-// F2: restore the Hexagon globals the one-copy setter changed (shared weights
-// off, buffer cap back). No getter exists (ggml-hexagon.h), so the prior value
-// is the engine's documented state, reconstructed exactly as the process
-// started: opt_mbuf defaults to 1 GiB (vendored ggml-hexagon.cpp:100) and
-// GGML_HEXAGON_MBUF seeds it at init as strtoul(value, NULL, 0) MiB (vendored
-// ggml-hexagon.cpp:8756). Returns false when the setter refused - a shared
-// buffer is still alive - which the callers must not ignore.
+// F2: turn the one-copy shared-weights mode back off. No getter exists
+// (ggml-hexagon.h), and since the engine split opt_mbuf into dyn (default
+// 512 MiB) and static (default 1 GiB), its setter writes ONE cap to both or
+// keeps both on 0 - the asymmetric pre-one-copy caps are not expressible, so
+// max_buffer_bytes 0 leaves the caps the shared load ran with (both
+// k_onecopy_shared_mbuf_bytes) instead of pretending to reconstruct them.
+// Returns false when the setter refused - a shared buffer is still alive -
+// which the callers must not ignore.
 bool restore_hexagon_shared_weights() {
     auto set_shared_weights = hexagon_shared_weights_setter();
     if (set_shared_weights == nullptr) {
         return true;  // nothing was ever changed in this build
     }
-    size_t max_buffer_bytes = 1ull * 1024 * 1024 * 1024;
-    if (const char * mbuf = std::getenv("GGML_HEXAGON_MBUF")) {
-        const unsigned long mib = std::strtoul(mbuf, nullptr, 0);
-        if (mib > 0) {
-            max_buffer_bytes = (size_t) mib * 1024 * 1024;
-        }
-    }
-    const ggml_hexagon_shared_weights restore { false, max_buffer_bytes };
+    const ggml_hexagon_shared_weights restore { false, 0 };
     return set_shared_weights(&restore) == 0;
 }
 

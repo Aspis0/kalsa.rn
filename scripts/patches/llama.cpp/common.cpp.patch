@@ -1,6 +1,6 @@
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -433,6 +433,9 @@
+@@ -438,6 +438,9 @@
      os << " / " << std::thread::hardware_concurrency() << " | " << llama_print_system_info();
  #endif
  
@@ -10,7 +10,7 @@
      return os.str();
  }
  
-@@ -1683,6 +1686,7 @@
+@@ -1670,6 +1673,7 @@
          mparams.devices = params.devices.data();
      }
  
@@ -18,9 +18,9 @@
      mparams.n_gpu_layers    = params.n_gpu_layers;
      mparams.main_gpu        = params.main_gpu;
      mparams.split_mode      = params.split_mode;
-@@ -1712,6 +1716,11 @@
+@@ -1699,6 +1703,11 @@
      mparams.no_alloc                    = params.no_alloc;
-     mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+     mparams.load_mtp                    = params.load_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
  
 +    if (params.progress_callback != nullptr) {
 +        mparams.progress_callback = params.progress_callback;

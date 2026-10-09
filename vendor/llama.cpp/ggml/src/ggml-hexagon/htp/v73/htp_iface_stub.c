@@ -278,12 +278,12 @@ static const StructType structTypes[1] = {{0x1,&(typeArrays[0]),0x20,0x0,0x20,0x
 static const Type types[2] = {{0x20,{{(const uintptr_t)&(types[1]),(const uintptr_t)0x8}}, 8,0x4},{0x4,{{(const uintptr_t)0,(const uintptr_t)1}}, 2,0x4}};
 static const Parameter parameters[8] = {{SLIM_IFPTR32(0x8,0x10),{{(const uintptr_t)0x0,0}}, 4,SLIM_IFPTR32(0x4,0x8),0,0},{SLIM_IFPTR32(0x4,0x8),{{(const uintptr_t)0xdeadc0de,(const uintptr_t)0}}, 0,SLIM_IFPTR32(0x4,0x8),3,0},{SLIM_IFPTR32(0x4,0x8),{{(const uintptr_t)0xdeadc0de,(const uintptr_t)0}}, 0,SLIM_IFPTR32(0x4,0x8),0,0},{0x4,{{(const uintptr_t)0,(const uintptr_t)1}}, 2,0x4,0,0},{0x8,{{(const uintptr_t)0,(const uintptr_t)1}}, 2,0x8,0,0},{0x20,{{(const uintptr_t)&(structTypes[0]),0}}, 6,0x4,0,0},{0x4,{{(const uintptr_t)0,(const uintptr_t)1}}, 2,0x4,3,0},{0x8,{{(const uintptr_t)0,(const uintptr_t)1}}, 2,0x8,3,0}};
 static const Parameter* const parameterArrays[14] = {(&(parameters[3])),(&(parameters[4])),(&(parameters[3])),(&(parameters[3])),(&(parameters[4])),(&(parameters[6])),(&(parameters[6])),(&(parameters[6])),(&(parameters[7])),(&(parameters[3])),(&(parameters[5])),(&(parameters[0])),(&(parameters[1])),(&(parameters[2]))};
-static const Method methods[8] = {{REMOTE_SCALARS_MAKEX(0,0,0x2,0x0,0x0,0x1),0x4,0x0,2,2,(&(parameterArrays[11])),0x4,0x1},{REMOTE_SCALARS_MAKEX(0,0,0x0,0x0,0x1,0x0),0x0,0x0,1,1,(&(parameterArrays[13])),0x1,0x0},{REMOTE_SCALARS_MAKEX(0,0,0x1,0x0,0x0,0x0),0x20,0x0,9,5,(&(parameterArrays[0])),0x8,0x0},{REMOTE_SCALARS_MAKEX(0,0,0x0,0x0,0x0,0x0),0x0,0x0,0,0,0,0x0,0x0},{REMOTE_SCALARS_MAKEX(0,0,0x1,0x0,0x0,0x0),0x10,0x0,4,2,(&(parameterArrays[0])),0x8,0x0},{REMOTE_SCALARS_MAKEX(0,0,0x1,0x0,0x0,0x0),0x4,0x0,1,1,(&(parameterArrays[0])),0x4,0x0},{REMOTE_SCALARS_MAKEX(0,0,0x1,0x0,0x0,0x0),0x24,0x0,2,2,(&(parameterArrays[9])),0x4,0x0},{REMOTE_SCALARS_MAKEX(0,0,0x0,0x1,0x0,0x0),0x0,0x18,4,4,(&(parameterArrays[5])),0x1,0x8}};
-static const Method* const methodArrays[9] = {&(methods[0]),&(methods[1]),&(methods[2]),&(methods[3]),&(methods[4]),&(methods[5]),&(methods[6]),&(methods[5]),&(methods[7])};
-static const char strings[149] = "dsp_queue_id\0vtcm_size\0n_threads\0profiler\0max_vmem\0sess_id\0hwinfo\0enable\0events\0munmap\0n_hmx\0n_hvx\0start\0close\0mode\0mmap\0stop\0open\0etm\0pmu\0uri\0fd\0h\0";
-static const uint16_t methodStrings[28] = {99,51,0,93,87,42,59,23,93,87,13,33,111,135,73,116,143,18,126,139,146,131,66,80,143,105,146,121};
-static const uint16_t methodStringsArrays[9] = {18,25,0,27,15,23,11,21,6};
-__QAIC_SLIM_EXPORT const Interface __QAIC_SLIM(htp_iface_slim) = {9,&(methodArrays[0]),0,0,&(methodStringsArrays [0]),methodStrings,strings};
+static const Method methods[9] = {{REMOTE_SCALARS_MAKEX(0,0,0x2,0x0,0x0,0x1),0x4,0x0,2,2,(&(parameterArrays[11])),0x4,0x1},{REMOTE_SCALARS_MAKEX(0,0,0x0,0x0,0x1,0x0),0x0,0x0,1,1,(&(parameterArrays[13])),0x1,0x0},{REMOTE_SCALARS_MAKEX(0,0,0x1,0x0,0x0,0x0),0x20,0x0,9,5,(&(parameterArrays[0])),0x8,0x0},{REMOTE_SCALARS_MAKEX(0,0,0x0,0x0,0x0,0x0),0x0,0x0,0,0,0,0x0,0x0},{REMOTE_SCALARS_MAKEX(0,0,0x1,0x0,0x0,0x0),0x10,0x0,4,2,(&(parameterArrays[0])),0x8,0x0},{REMOTE_SCALARS_MAKEX(0,0,0x1,0x0,0x0,0x0),0x4,0x0,1,1,(&(parameterArrays[0])),0x4,0x0},{REMOTE_SCALARS_MAKEX(0,0,0x1,0x0,0x0,0x0),0x24,0x0,2,2,(&(parameterArrays[9])),0x4,0x0},{REMOTE_SCALARS_MAKEX(0,0,0x0,0x1,0x0,0x0),0x0,0x18,4,4,(&(parameterArrays[5])),0x1,0x8},{REMOTE_SCALARS_MAKEX(0,0,0x1,0x0,0x0,0x0),0x8,0x0,2,2,(&(parameterArrays[2])),0x4,0x0}};
+static const Method* const methodArrays[10] = {&(methods[0]),&(methods[1]),&(methods[2]),&(methods[3]),&(methods[4]),&(methods[5]),&(methods[6]),&(methods[5]),&(methods[7]),&(methods[8])};
+static const char strings[178] = "dsp_queue_id\0core_corner\0bus_corner\0vtcm_size\0n_threads\0profiler\0max_vmem\0sess_id\0hwinfo\0enable\0events\0munmap\0power\0n_hmx\0n_hvx\0start\0close\0mode\0mmap\0stop\0open\0etm\0pmu\0uri\0fd\0h\0";
+static const uint16_t methodStrings[31] = {128,74,0,122,116,65,82,46,122,116,36,56,140,164,96,110,13,25,145,172,41,155,168,175,160,89,103,172,134,175,150};
+static const uint16_t methodStringsArrays[10] = {21,28,0,30,18,26,11,24,6,15};
+__QAIC_SLIM_EXPORT const Interface __QAIC_SLIM(htp_iface_slim) = {10,&(methodArrays[0]),0,0,&(methodStringsArrays [0]),methodStrings,strings};
 #endif //_HTP_IFACE_SLIM_H
 
 
@@ -408,6 +408,24 @@ static __inline int _stub_method_5(remote_handle64 _handle, uint32_t _mid, uint3
 __QAIC_STUB_EXPORT AEEResult __QAIC_STUB(htp_iface_hwinfo)(remote_handle64 _handle, uint32* n_threads, uint32* n_hvx, uint32* n_hmx, uint64* vtcm_size) __QAIC_STUB_ATTRIBUTE {
    uint32_t _mid = 8;
    return _stub_method_5(_handle, _mid, (uint32_t*)n_threads, (uint32_t*)n_hvx, (uint32_t*)n_hmx, (uint64_t*)vtcm_size);
+}
+static __inline int _stub_method_6(remote_handle64 _handle, uint32_t _mid, uint32_t _in0[1], uint32_t _in1[1]) {
+   remote_arg _pra[1] = {0};
+   uint32_t _primIn[2]= {0};
+   int _nErr = 0;
+   _pra[0].buf.pv = (void*)_primIn;
+   _pra[0].buf.nLen = sizeof(_primIn);
+   _COPY(_primIn, 0, _in0, 0, 4);
+   _COPY(_primIn, 4, _in1, 0, 4);
+   _TRY_FARF(_nErr, __QAIC_REMOTE(remote_handle64_invoke)(_handle, REMOTE_SCALARS_MAKEX(0, _mid, 1, 0, 0, 0), _pra));
+   _CATCH_FARF(_nErr) {
+      _QAIC_FARF(RUNTIME_ERROR, "ERROR 0x%x: handle=0x%"PRIx64", scalar=0x%x, method ID=%d: %s failed\n", _nErr , _handle, REMOTE_SCALARS_MAKEX(0, _mid, 1, 0, 0, 0), _mid, __func__);
+   }
+   return _nErr;
+}
+__QAIC_STUB_EXPORT AEEResult __QAIC_STUB(htp_iface_power)(remote_handle64 _handle, uint32 core_corner, uint32 bus_corner) __QAIC_STUB_ATTRIBUTE {
+   uint32_t _mid = 9;
+   return _stub_method_6(_handle, _mid, (uint32_t*)&core_corner, (uint32_t*)&bus_corner);
 }
 #ifdef __cplusplus
 }

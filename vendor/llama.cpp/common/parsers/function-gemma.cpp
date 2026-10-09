@@ -26,7 +26,7 @@ common_chat_params common_chat_params_init_function_gemma(const common_chat_temp
         auto generation_prompt = p.prefix(data.generation_prompt, "<start_function_call>");
         auto tool_choice = p.choice();
 
-        foreach_function(inputs.tools, [&](const json & tool) {
+        foreach_function(inputs.tools, [&](size_t, const json & tool) {
             const auto & function = tool.at("function");
             std::string  name     = function.at("name");
             const auto   schema   = common_chat_tool_parameters(function);

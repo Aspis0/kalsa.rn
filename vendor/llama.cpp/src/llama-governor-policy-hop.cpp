@@ -10,9 +10,12 @@
 // hysteresis, NPU preferred on ties and returning under the same hysteresis.
 // With any present leg's headroom unknown the rule falls back to v1's fixed
 // alternation extended to the present legs. The heat-per-token weighting is
-// a parameter defaulting to zero - pure headroom, v1 behaviour - so with the
-// default leg mask (NPU+CPU, the two-model form) and default weights the
-// decisions are byte-identical to v1.
+// a parameter defaulting to zero - pure headroom, v1 behaviour - and so is
+// the per-leg load step that judges each idle candidate at its loaded
+// temperature, so with the default leg mask (NPU+CPU, the two-model form)
+// and default weights the decisions are byte-identical to v1.
+// HEAT_RANK (owner rule v3) takes the window on the cheapest-heat leg that is
+// fit (heat_rank_fit); only when no leg is fit does the headroom loop decide.
 
 #include "llama-governor-policy.h"
 
@@ -30,6 +33,56 @@ const char * leg_label(llama_governor_engine engine) {
         case llama_governor_engine::GPU_COOLMODE: break;
     }
     return "?";
+}
+
+float load_step_of(const llama_governor_params & params, llama_governor_engine engine) {
+    switch (engine) {
+        case llama_governor_engine::CPU: return params.decode_load_step_cpu_c;
+        case llama_governor_engine::GPU: return params.decode_load_step_gpu_c;
+        case llama_governor_engine::NPU: return params.decode_load_step_npu_c;
+        case llama_governor_engine::GPU_COOLMODE: break;
+    }
+    return 0.0f;
+}
+
+float heat_per_token_of(const llama_governor_params & params, llama_governor_engine engine) {
+    switch (engine) {
+        case llama_governor_engine::CPU: return params.decode_heat_per_token_cpu;
+        case llama_governor_engine::GPU: return params.decode_heat_per_token_gpu;
+        case llama_governor_engine::NPU: return params.decode_heat_per_token_npu;
+        case llama_governor_engine::GPU_COOLMODE: break;
+    }
+    return 0.0f;
+}
+
+// The index into present[] of the first leg, cheapest heat per token first,
+// that is fit to run the next window, or -1 when none is. The current leg
+// stays while its own headroom holds the guard. An idle candidate is judged
+// after its load step and must clear the guard plus the hysteresis, so a leg
+// is not re-entered on a reading it would lose again at once. The strict
+// compare keeps present[] order on exact heat ties (NPU > GPU > CPU).
+int heat_rank_fit(const llama_governor_params & params, const llama_governor_engine * present,
+                  const float * present_headroom, int n_present, llama_governor_engine current) {
+    bool used[3] = { false, false, false };
+    for (int step = 0; step < n_present; ++step) {
+        int next = -1;
+        for (int i = 0; i < n_present; ++i) {
+            if (!used[i] && (next < 0 || heat_per_token_of(params, present[i]) <
+                                             heat_per_token_of(params, present[next]))) {
+                next = i;
+            }
+        }
+        used[next] = true;
+        const llama_governor_engine engine = present[next];
+        const float guard_c = params.decode_guard_headroom_c;
+        const bool fit = engine == current
+            ? present_headroom[next] >= guard_c
+            : present_headroom[next] - load_step_of(params, engine) >= guard_c + k_hop_hysteresis_c;
+        if (fit) {
+            return next;
+        }
+    }
+    return -1;
 }
 
 } // namespace
@@ -76,6 +129,22 @@ void llama_governor_policy::set_decode_headroom(float cpu_headroom_c, float npu_
         }
     }
     decode_headroom_have_last_us_ = true;
+}
+
+// WHY: the EMA still lags the physical step at a hop (tau behind it), so
+// start both legs from the predicted state - the new current leg is about
+// to load, the departing leg about to cool - and the effective scores stay
+// continuous across the identity change instead of jumping by the step.
+void llama_governor_policy::shift_smoothed_for_hop(llama_governor_engine prev_leg,
+                                                   llama_governor_engine new_leg) {
+    float & entering = decode_headroom_smooth_[static_cast<int>(new_leg)];
+    float & leaving = decode_headroom_smooth_[static_cast<int>(prev_leg)];
+    if (std::isfinite(entering)) {
+        entering -= load_step_of(params_, new_leg);
+    }
+    if (std::isfinite(leaving)) {
+        leaving += load_step_of(params_, prev_leg);
+    }
 }
 
 void llama_governor_policy::set_decode_legs(bool npu, bool gpu, bool cpu) {
@@ -128,22 +197,21 @@ const char * llama_governor_policy::hop_decide(uint32_t window, uint32_t tokens_
     };
     // effective headroom: the heat weighting (battery C*s/token, a lab
     // constant per leg) subtracts weight*heat from a leg's raw headroom;
-    // weight 0 is pure headroom, i.e. v1
+    // weight 0 is pure headroom, i.e. v1. A candidate is judged at its
+    // loaded temperature: the load step is subtracted from every leg that
+    // is not the current one, never from the current leg, which is hot.
     const auto effective_of = [this, &headroom_of](llama_governor_engine engine) {
-        float heat = 0.0f;
-        switch (engine) {
-            case llama_governor_engine::CPU: heat = params_.decode_heat_per_token_cpu; break;
-            case llama_governor_engine::GPU: heat = params_.decode_heat_per_token_gpu; break;
-            case llama_governor_engine::NPU: heat = params_.decode_heat_per_token_npu; break;
-            case llama_governor_engine::GPU_COOLMODE: break;
-        }
-        return headroom_of(engine) - params_.decode_heat_weight * heat;
+        const float heat = heat_per_token_of(params_, engine);
+        const float step_c = engine == decode_hop_leg_ ? 0.0f : load_step_of(params_, engine);
+        return headroom_of(engine) - params_.decode_heat_weight * heat - step_c;
     };
 
     const llama_governor_engine prev_leg = decode_hop_leg_;
+    float present_headroom[3] = { 0.0f, 0.0f, 0.0f };
     bool all_known = true;
     for (int i = 0; i < n_present; ++i) {
-        if (!std::isfinite(headroom_of(present[i]))) {
+        present_headroom[i] = headroom_of(present[i]);
+        if (!std::isfinite(present_headroom[i])) {
             all_known = false;
         }
     }
@@ -151,7 +219,20 @@ const char * llama_governor_policy::hop_decide(uint32_t window, uint32_t tokens_
     const char * hop_rule = "alternation";
     if (all_known) {
         hop_rule = "headroom";
-        if (window == 0) {
+        // HEAT_RANK: the cheapest fit leg takes the window; no fit leg leaves
+        // it to NPU_FIRST's loop below. WHY window 0 passes no current leg:
+        // nothing is loaded yet, so the cheapest leg opens only if it clears
+        // its load step and the hysteresis as an idle candidate; otherwise
+        // the cold open falls to present[0], as NPU_FIRST does.
+        int ranked = -1;
+        if (params_.decode_leg_weighting == llama_governor_leg_weighting::HEAT_RANK) {
+            ranked = heat_rank_fit(params_, present, present_headroom, n_present,
+                                   window == 0 ? llama_governor_engine::GPU_COOLMODE : decode_hop_leg_);
+        }
+        if (ranked >= 0) {
+            decode_hop_leg_ = present[ranked];
+            hop_rule = "heat_rank";
+        } else if (window == 0) {
             // open every decode on the NPU (present[0]; when the NPU is not
             // a candidate this falls to the next leg in preference order)
             decode_hop_leg_ = present[0];
@@ -219,6 +300,13 @@ const char * llama_governor_policy::hop_decide(uint32_t window, uint32_t tokens_
             LLAMA_LOG_INFO("governor: decode hop %s->%s at token %u (alternation, zones unknown)\n",
                            leg_label(prev_leg), leg_label(decode_hop_leg_), tokens_since_prefill);
         }
+    }
+    // Shifted after the log line: the line keeps printing the pre-shift
+    // values the decision used. Rule-driven hop only - window 0 opens and
+    // the alternation fallback never saw effective_of, so nothing jumped.
+    if (window > 0 && all_known && decode_hop_leg_ != prev_leg &&
+        params_.decode_headroom_tau_s > 0.0f) {
+        shift_smoothed_for_hop(prev_leg, decode_hop_leg_);
     }
     return hop_rule;
 }

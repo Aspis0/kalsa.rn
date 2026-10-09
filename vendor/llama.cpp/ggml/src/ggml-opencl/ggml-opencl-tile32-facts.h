@@ -11,7 +11,7 @@ struct ggml_opencl_tile32_facts {
     bool         adreno;              // backend_ctx->gpu_family == ADRENO
     const char * device_name;         // CL_DEVICE_NAME
     const char * device_version;      // CL_DEVICE_VERSION
-    const char * driver_version;      // CL_DRIVER_VERSION, must contain "E031.41."
+    const char * driver_version;      // CL_DRIVER_VERSION, must contain "E031.41." (see unmeasured_ok)
     bool         ext_dmabuf_host_ptr; // cl_qcom_dmabuf_host_ptr in CL_DEVICE_EXTENSIONS
     bool         ext_host_ptr;        // cl_qcom_ext_host_ptr in CL_DEVICE_EXTENSIONS
     size_t       max_alloc_size;      // CL_DEVICE_MAX_MEM_ALLOC_SIZE, bytes
@@ -23,4 +23,17 @@ struct ggml_opencl_tile32_facts {
 // Returns true when every fact passes and max_alloc_size covers need_bytes; on a miss
 // returns false and sets *reason to the failing clause. need_bytes is 0 before any TILE32
 // buffer exists; the import re-asks with the dma-buf block it would have to place.
-bool ggml_opencl_tile32_facts_ok(const struct ggml_opencl_tile32_facts * facts, size_t need_bytes, const char ** reason);
+//
+// unmeasured_ok waives ONLY the two measured-on clauses (the "740" model token and the
+// E031.41. driver line) so a lab bench can run the leg on a device it was never measured
+// on; missing facts, non-Adreno, the QCOM extensions and max_alloc_size still refuse.
+// Callers pass ggml_opencl_tile32_unmeasured_override(); in a default build it is false
+// no matter what the environment holds, and an admit that only the waiver produced warns
+// once per process.
+bool ggml_opencl_tile32_facts_ok(const struct ggml_opencl_tile32_facts * facts, size_t need_bytes,
+                                 bool unmeasured_ok, const char ** reason);
+
+// True only in a build configured with -DGGML_OPENCL_TILE32_LAB=ON and then only when
+// GGML_OPENCL_TILE32_UNMEASURED=1 (exact); always false otherwise, so the shipped binding
+// cannot widen the gate from an env var. Read on every call, never cached.
+bool ggml_opencl_tile32_unmeasured_override(void);

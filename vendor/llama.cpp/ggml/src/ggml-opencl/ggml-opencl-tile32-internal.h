@@ -118,3 +118,26 @@ void ggml_opencl_host_q6k_aos_drop_locked(const struct ggml_opencl_tile32_env * 
 
 // The v4 mat-vec program and kernel, built on first use.
 cl_kernel ggml_opencl_tile32_kernel_locked(const struct ggml_opencl_tile32_env * env);
+
+#ifdef GGML_OPENCL_TILE32_LAB
+// Lab-only run-time verify of one v4 GEMV (ggml-opencl-tile32-verify.cpp). The buffers of one
+// call, as the mat-vec created them; the verify only reads them, after clFinish.
+struct ggml_opencl_tile32_gemv_io {
+    cl_mem   act;       // src1's OpenCL buffer, whole
+    cl_ulong act_off;   // the activation column inside it
+    cl_mem   act_sub;   // the sub-buffer the image is built on
+    cl_mem   act_img;   // the image1d_buffer the kernel reads the activation through
+    cl_mem   dst;       // dst's OpenCL buffer, whole
+    cl_ulong dst_off;   // the result inside it
+    cl_mem   dst_sub;   // the sub-buffer the kernel writes
+};
+
+// True for the first GGML_OPENCL_TILE32_VERIFY calls, then false; parsed once. Requires the leg mutex.
+bool ggml_opencl_tile32_verify_next_locked(void);
+
+// Compare the GEMV's activation and both result views with the CPU reference over the host
+// tiles of w, and log one line. Requires the leg mutex.
+void ggml_opencl_tile32_verify_gemv_locked(const struct ggml_opencl_tile32_env * env,
+        const struct ggml_opencl_tile32_views * v, const struct ggml_tensor * w,
+        const struct ggml_opencl_tile32_gemv_io * io);
+#endif

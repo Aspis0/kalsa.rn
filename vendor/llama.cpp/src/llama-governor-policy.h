@@ -156,6 +156,7 @@ private:
     // returns the hop-rule label ("headroom"/"gpu_burst"/"alternation")
     // and logs one line per leg change.
     const char * hop_decide(uint32_t window, uint32_t tokens_since_prefill);
+    void shift_smoothed_for_hop(llama_governor_engine prev_leg, llama_governor_engine new_leg);
 
     llama_governor_params params_;
     llama_governor_thermo_profile profile_;

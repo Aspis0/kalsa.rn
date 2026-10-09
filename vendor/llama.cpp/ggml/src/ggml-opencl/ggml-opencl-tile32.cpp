@@ -117,7 +117,7 @@ tile32_import * import_locked(const ggml_opencl_tile32_env * env, ggml_backend_b
     // the import asks for the dma-buf block, not the ggml allocation: that is the size
     // the driver has to place in GPU memory
     const char * why = nullptr;
-    if (!ggml_opencl_tile32_facts_ok(&env->facts, size, &why)) {
+    if (!ggml_opencl_tile32_facts_ok(&env->facts, size, ggml_opencl_tile32_unmeasured_override(), &why)) {
         *reason = why;
         return nullptr;
     }

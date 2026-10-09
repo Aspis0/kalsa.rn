@@ -264,6 +264,7 @@ __QAIC_HEADER_EXPORT AEEResult __QAIC_HEADER(htp_iface_munmap)(remote_handle64 _
 __QAIC_HEADER_EXPORT AEEResult __QAIC_HEADER(htp_iface_profiler)(remote_handle64 _h, uint32 mode, const htp_iface_pmu_conf* pmu) __QAIC_HEADER_ATTRIBUTE;
 __QAIC_HEADER_EXPORT AEEResult __QAIC_HEADER(htp_iface_etm)(remote_handle64 _h, uint32 enable) __QAIC_HEADER_ATTRIBUTE;
 __QAIC_HEADER_EXPORT AEEResult __QAIC_HEADER(htp_iface_hwinfo)(remote_handle64 _h, uint32* n_threads, uint32* n_hvx, uint32* n_hmx, uint64* vtcm_size) __QAIC_HEADER_ATTRIBUTE;
+__QAIC_HEADER_EXPORT AEEResult __QAIC_HEADER(htp_iface_power)(remote_handle64 _h, uint32 core_corner, uint32 bus_corner) __QAIC_HEADER_ATTRIBUTE;
 #ifndef htp_iface_URI
 #define htp_iface_URI "file:///libhtp_iface_skel.so?htp_iface_skel_handle_invoke&_modver=1.0"
 #endif /*htp_iface_URI*/

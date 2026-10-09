@@ -163,6 +163,12 @@ void ggml_cl_mul_mat_tile32(const struct ggml_opencl_tile32_env * env,
                                   "v4 enqueue")) {
         GGML_ABORT("ggml-opencl-tile32: v4 launch failed on %s", src0->name);
     }
+#ifdef GGML_OPENCL_TILE32_LAB
+    if (ggml_opencl_tile32_verify_next_locked()) {
+        const ggml_opencl_tile32_gemv_io io = { src1_buf, src1_off, xsub, ximg, dst_buf, dst_off, dsub };
+        ggml_opencl_tile32_verify_gemv_locked(env, v, src0, &io);
+    }
+#endif
     clReleaseMemObject(ximg);
     clReleaseMemObject(dsub);
     clReleaseMemObject(xsub);

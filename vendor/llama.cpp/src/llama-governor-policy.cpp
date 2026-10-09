@@ -59,6 +59,30 @@ int32_t normalize_platform_status(int32_t platform_status) {
     return platform_status < -1 || platform_status > 6 ? -1 : platform_status;
 }
 
+// NaN poisons the ranking compare, +inf disables the leg, a negative step
+// rewards idling: any load step that is not finite and >= 0 is rejected to
+// 0 (no dock), the warning naming the field and the value it saw.
+float sanitize_load_step(const char * field, float value) {
+    if (!std::isfinite(value) || value < 0.0f) {
+        LLAMA_LOG_WARN("governor: invalid %s %.6g; load step reset to 0 (no dock)\n",
+                       field, static_cast<double>(value));
+        return 0.0f;
+    }
+    return value;
+}
+
+// NaN makes every guard compare false (the current leg is always left), a
+// negative guard never leaves it, +inf never keeps it: any value that is not
+// finite and >= 0 is rejected to the 5 C default, the warning naming the value.
+float sanitize_guard_headroom(float value) {
+    if (!std::isfinite(value) || value < 0.0f) {
+        LLAMA_LOG_WARN("governor: invalid decode_guard_headroom_c %.6g; guard reset to 5 C\n",
+                       static_cast<double>(value));
+        return 5.0f;
+    }
+    return value;
+}
+
 } // namespace
 
 bool llama_governor_expert_substitution_would_displace(
@@ -82,6 +106,13 @@ llama_governor_policy::llama_governor_policy(const llama_governor_params & param
                        static_cast<double>(params_.decode_headroom_tau_s));
         params_.decode_headroom_tau_s = 0.0f;
     }
+    params_.decode_load_step_npu_c =
+        sanitize_load_step("decode_load_step_npu_c", params_.decode_load_step_npu_c);
+    params_.decode_load_step_gpu_c =
+        sanitize_load_step("decode_load_step_gpu_c", params_.decode_load_step_gpu_c);
+    params_.decode_load_step_cpu_c =
+        sanitize_load_step("decode_load_step_cpu_c", params_.decode_load_step_cpu_c);
+    params_.decode_guard_headroom_c = sanitize_guard_headroom(params_.decode_guard_headroom_c);
 }
 
 llama_governor_policy::thresholds llama_governor_policy::get_thresholds() const {

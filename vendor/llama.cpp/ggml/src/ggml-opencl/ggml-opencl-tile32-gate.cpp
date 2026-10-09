@@ -6,7 +6,7 @@
 #include "ggml-opencl-tile32-internal.h"
 
 #include "ggml-impl.h"
-#include "ggml-q4_0-tile32.h"
+#include "ggml-opencl-tile32-check.h"
 
 #include <cmath>
 #include <cstring>
@@ -99,7 +99,8 @@ bool ggml_opencl_tile32_gate_locked(const ggml_opencl_tile32_env * env) {
         // need_bytes = 0: no TILE32 buffer exists yet; the import re-asks the size clause with
         // the dma-buf block it is about to place in GPU memory
         const char * reason = nullptr;
-        state = ggml_opencl_tile32_facts_ok(&env->facts, 0, &reason) && views_canary(env, &reason)
+        state = ggml_opencl_tile32_facts_ok(&env->facts, 0, ggml_opencl_tile32_unmeasured_override(), &reason)
+              && views_canary(env, &reason)
               ? GATE_OK : GATE_FAILED;
         if (state == GATE_FAILED) {
             GGML_LOG_INFO("ggml-opencl: TILE32 leg not available on %s: %s\n",
@@ -134,19 +135,10 @@ bool ggml_opencl_tile32_ready(const ggml_opencl_tile32_env * env) {
 bool ggml_opencl_tile32_self_check_locked(const ggml_opencl_tile32_env * env,
                                           const ggml_opencl_tile32_views * v,
                                           const ggml_tensor * w, cl_kernel kernel) {
-    const int64_t K = w->ne[0], M = w->ne[1], nkt = K / GGML_Q4_0_TILE32_K;
+    const int64_t K = w->ne[0], M = w->ne[1];
     std::vector<float> x(K), ref(M), dev(M);
     unit_vector(K, x);
-
-    const uint8_t * tiles = v->host_tiles;
-    for (int64_t m = 0; m < M; m++) {
-        float sum = 0.0f;
-        for (int64_t kt = 0; kt < nkt; kt++) {
-            sum += ggml_q4_0_tile32_dot_row(tiles + ((m / GGML_Q4_0_TILE32_ROWS) * nkt + kt) * GGML_Q4_0_TILE32_SIZE,
-                                            x.data() + kt * GGML_Q4_0_TILE32_K, m % GGML_Q4_0_TILE32_ROWS);
-        }
-        ref[m] = sum;
-    }
+    ggml_opencl_tile32_check_reference(v->host_tiles, x.data(), K, M, ref.data());
 
     cl_int err;
     cl_mem xb = clCreateBuffer(env->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
@@ -190,9 +182,7 @@ bool ggml_opencl_tile32_self_check_locked(const ggml_opencl_tile32_env * env,
                 }
             }
             const double rms = sqrt(sq / (double) M);
-            // an all-zero weight makes both sides all zero, where a relative bound is
-            // undefined: accept that pair and keep the relative bound for the rest
-            ok = rms > 0.0 ? maxd <= 1e-5 * rms : maxd == 0.0;
+            ok = ggml_opencl_tile32_check_pass(maxd, rms);
             GGML_LOG_INFO("ggml-opencl-tile32: self-check %s: %s max|diff| %.3e rms %.4f\n",
                           w->name, ok ? "PASS" : "FAIL", maxd, rms);
         }

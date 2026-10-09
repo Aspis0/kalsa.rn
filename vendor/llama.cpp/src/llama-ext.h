@@ -145,6 +145,20 @@ LLAMA_API void llama_memory_set_pressure_callback(
         void * user_data,
         float trigger_frac);
 
+// Marks the entries that a joint decision head (clef) reads, the default is 0
+// See https://github.com/ggml-org/llama.cpp/pull/29831 for details
+// A run of entries with the same value is one span, spans must be separated by entries with value 0
+// An option belongs to the last question before it
+enum llama_decision_order {
+    LLAMA_DECISION_ORDER_NONE            = 0, // not read by the head
+    LLAMA_DECISION_ORDER_QUESTION_NOUL   = 1, // text of a question
+    LLAMA_DECISION_ORDER_QUESTION_CHOICE = 2,
+    LLAMA_DECISION_ORDER_QUESTION_SCORE  = 3,
+    LLAMA_DECISION_ORDER_OPTION          = 4, // text of an option
+};
+// The embeddings output has one value per entry: row i is the score of option i
+LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch, int32_t idx, enum llama_decision_order order);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
@@ -290,6 +304,13 @@ enum class llama_governor_leg_weighting {
     // exactly one window, and the next burst may start only after a
     // non-GPU window has run.
     GPU_BURST,
+    // The present legs in order of heat per token, cheapest first; the
+    // window stays on the first leg that is fit to run it: the current leg
+    // while its headroom holds decode_guard_headroom_c, an idle candidate
+    // once its loaded headroom clears that plus the hysteresis. No fit leg
+    // falls back to NPU_FIRST's loop. Decides from measured headroom, not a
+    // per-SoC ranking, so phones with the same chip may differ.
+    HEAT_RANK,
 };
 
 enum class llama_governor_thermal_state {
@@ -349,6 +370,18 @@ struct llama_governor_params {
     float decode_heat_per_token_npu = 0;
     float decode_heat_per_token_gpu = 0;
     float decode_heat_per_token_cpu = 0;
+    // Per-leg load step (C): a leg's zone temperature jumps when the leg
+    // starts working, so an idle leg's headroom overstates what it will
+    // have once it runs. The rule subtracts the step from every leg that is
+    // not the current one (the current leg already reads loaded); 0 = today's
+    // rule; invalid values are rejected to 0 at construction.
+    float decode_load_step_npu_c = 0;
+    float decode_load_step_gpu_c = 0;
+    float decode_load_step_cpu_c = 0;
+    // Used only by HEAT_RANK: the headroom (C) below which the current leg is
+    // left. Invalid values (NaN, negative, infinite) are rejected to 5 at
+    // construction.
+    float decode_guard_headroom_c = 5;
     // Forced decode-leg rotation (F5 proof hook; off by default): when
     // forced_leg_tokens > 0, decode follows forced_leg_sequence
     // (engines CPU/GPU/NPU) round-robin, one engine per window of

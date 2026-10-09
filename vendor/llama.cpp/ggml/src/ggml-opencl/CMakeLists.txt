@@ -3,6 +3,12 @@ find_package(Python3 REQUIRED)
 
 set(TARGET_NAME ggml-opencl)
 
+# Lab-only run-time verify of the v4 GEMV: the shipped build does not compile it.
+set(TILE32_LAB_SOURCES)
+if (GGML_OPENCL_TILE32_LAB)
+    set(TILE32_LAB_SOURCES ggml-opencl-tile32-verify.cpp)
+endif ()
+
 ggml_add_backend_library(${TARGET_NAME}
                          ggml-opencl.cpp
                          ggml-opencl-kalsa-diag.cpp
@@ -13,6 +19,7 @@ ggml_add_backend_library(${TARGET_NAME}
                          ggml-opencl-tile32-host-q6k.cpp
                          ggml-opencl-tile32-internal.h
                          ggml-opencl-tile32-facts.cpp
+                         ${TILE32_LAB_SOURCES}
                          cl-program-cache.cpp
                          cl-program-cache.h
                          ../../include/ggml-opencl.h)
@@ -22,6 +29,10 @@ target_include_directories(${TARGET_NAME} PRIVATE ${OpenCL_INCLUDE_DIRS})
 if (GGML_OPENCL_PROFILING)
     message(STATUS "OpenCL profiling enabled (increases CPU overhead)")
     add_compile_definitions(GGML_OPENCL_PROFILING)
+endif ()
+
+if (GGML_OPENCL_TILE32_LAB)
+    add_compile_definitions(GGML_OPENCL_TILE32_LAB)
 endif ()
 
 add_compile_definitions(GGML_OPENCL_SOA_Q)

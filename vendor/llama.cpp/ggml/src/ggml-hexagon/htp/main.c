@@ -363,6 +363,37 @@ static void htp_main_thread(void * context);
 static void htp_packet_callback(dspqueue_t queue, int error, void * context);
 static void htp_error_callback(dspqueue_t queue, int error, void * context);
 
+// Host parser (ggml-hexagon/htp-vcorner.h) hardcodes these ordinals; keep the ABI pinned.
+_Static_assert(HAP_DCVS_VCORNER_SVS2 == 1 && HAP_DCVS_VCORNER_TURBO_PLUS == 7 &&
+               HAP_DCVS_VCORNER_TURBO_L5 == 11 && HAP_DCVS_VCORNER_MAX == 255,
+               "HAP_dcvs_voltage_corner_t ordinals drifted from the host vcorner table");
+
+// Single DCVS v3 vote: DCVS and sleep stay disabled, only the pinned corners vary between
+// session start (MAX/MAX, shipped behaviour) and the lab-only power method.
+static int htp_set_dcvs_v3_corners(struct htp_context * ctx, uint32_t core_corner, uint32_t bus_corner) {
+    HAP_power_request_t request;
+    memset(&request, 0, sizeof(request));
+
+    request.type                              = HAP_power_set_DCVS_v3;
+    request.dcvs_v3.set_dcvs_enable           = TRUE;
+    request.dcvs_v3.dcvs_enable               = FALSE;
+    request.dcvs_v3.set_bus_params            = TRUE;
+    request.dcvs_v3.bus_params.min_corner     = bus_corner;
+    request.dcvs_v3.bus_params.max_corner     = bus_corner;
+    request.dcvs_v3.bus_params.target_corner  = bus_corner;
+    request.dcvs_v3.set_core_params           = TRUE;
+    request.dcvs_v3.core_params.min_corner    = core_corner;
+    request.dcvs_v3.core_params.max_corner    = core_corner;
+    request.dcvs_v3.core_params.target_corner = core_corner;
+    request.dcvs_v3.set_sleep_disable         = TRUE;
+    request.dcvs_v3.sleep_disable             = TRUE;
+
+#if (__HEXAGON_ARCH__ >= 79)
+    HAP_set_dcvs_v3_protected_bus_corners(&request, 1);
+#endif
+    return HAP_power_set((void *) ctx, &request);
+}
+
 AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp_queue_id, uint32_t n_hvx, uint32_t n_hmx, uint64_t max_vmem) {
     struct htp_handle * h = (struct htp_handle *) handle;
     if (!h) {
@@ -494,31 +525,13 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
 
     // DCVS setup
     {
-        HAP_power_request_t request;
-        memset(&request, 0, sizeof(request));
-
-        request.type                              = HAP_power_set_DCVS_v3;
-        request.dcvs_v3.set_dcvs_enable           = TRUE;
-        request.dcvs_v3.dcvs_enable               = FALSE;
-        request.dcvs_v3.set_bus_params            = TRUE;
-        request.dcvs_v3.bus_params.min_corner     = HAP_DCVS_VCORNER_MAX;
-        request.dcvs_v3.bus_params.max_corner     = HAP_DCVS_VCORNER_MAX;
-        request.dcvs_v3.bus_params.target_corner  = HAP_DCVS_VCORNER_MAX;
-        request.dcvs_v3.set_core_params           = TRUE;
-        request.dcvs_v3.core_params.min_corner    = HAP_DCVS_VCORNER_MAX;
-        request.dcvs_v3.core_params.max_corner    = HAP_DCVS_VCORNER_MAX;
-        request.dcvs_v3.core_params.target_corner = HAP_DCVS_VCORNER_MAX;
-        request.dcvs_v3.set_sleep_disable         = TRUE;
-        request.dcvs_v3.sleep_disable             = TRUE;
-
-#if (__HEXAGON_ARCH__ >= 79)
-        HAP_set_dcvs_v3_protected_bus_corners(&request, 1);
-#endif
-        if ((err = HAP_power_set((void *) ctx, &request)) != 0) {
+        err = htp_set_dcvs_v3_corners(ctx, HAP_DCVS_VCORNER_MAX, HAP_DCVS_VCORNER_MAX);
+        if (err != 0) {
             htp_iface_stop(handle);
             return err;
         }
 
+        HAP_power_request_t request;
         memset(&request, 0, sizeof(request));
         request.type         = HAP_power_set_HVX;
         request.hvx.power_up = TRUE;
@@ -698,6 +711,29 @@ AEEResult htp_iface_hwinfo(remote_handle64 handle, uint32_t * n_threads, uint32_
     return AEE_SUCCESS;
 }
 
+// HAP_dcvs_voltage_corner_t membership: SVS2..TURBO_L5 (1..11) plus MAX (255). DISABLE (0)
+// is not a corner vote and 12..254 are holes in the enum, not lower corners.
+static bool htp_vcorner_is_member(uint32_t corner) {
+    return (corner >= HAP_DCVS_VCORNER_SVS2 && corner <= HAP_DCVS_VCORNER_TURBO_L5) ||
+           corner == HAP_DCVS_VCORNER_MAX;
+}
+
+// Lab-only corner override (GGML_HEXAGON_LAB host builds): re-pins the DCVS vote set by
+// start. Rejects anything that is not an HAP_dcvs_voltage_corner_t member.
+AEEResult htp_iface_power(remote_handle64 handle, uint32_t core_corner, uint32_t bus_corner) {
+    struct htp_handle * h = (struct htp_handle *) handle;
+    if (!h || !h->ctx) {
+        return AEE_EBADPARM;
+    }
+
+    if (!htp_vcorner_is_member(core_corner) || !htp_vcorner_is_member(bus_corner)) {
+        FARF(ERROR, "ggml-hex: power: corner not an enum member: core %u bus %u", core_corner, bus_corner);
+        return AEE_EBADPARM;
+    }
+
+    return htp_set_dcvs_v3_corners(h->ctx, core_corner, bus_corner);
+}
+
 static void htp_error_callback(dspqueue_t queue, int error, void * context) {
     // No errors expected on the DSP.
     FARF(ERROR, "Error callback: 0x%08x", (unsigned) error);
@@ -851,6 +887,7 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_UNARY_SIGMOID:
         case HTP_OP_UNARY_SILU:
         case HTP_OP_UNARY_GELU:
+        case HTP_OP_UNARY_GELU_QUICK:
         case HTP_OP_UNARY_GELU_ERF:
         case HTP_OP_UNARY_NEG:
         case HTP_OP_UNARY_EXP:
@@ -930,6 +967,12 @@ static int execute_op(struct htp_ops_context * octx) {
 
         case HTP_OP_ROLL:
             return op_roll(octx);
+
+        case HTP_OP_POOL_2D:
+            return op_pool_2d(octx);
+
+        case HTP_OP_POOL_1D:
+            return op_pool_1d(octx);
 
         case HTP_OP_CONCAT:
             return op_concat(octx);

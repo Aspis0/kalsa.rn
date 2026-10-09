@@ -127,10 +127,19 @@ endif()
 # Governor thermo parse: links only the parse TU, not the whole library.
 # It checks the binding's transport contract (payload sanity only, plugged
 # baselines forwarded for the engine), so a host-only fast target is enough.
-add_executable(governor_params_test governor_params_test.cpp ${RNLLAMA_CPP_DIR}/rn-governor-params.cpp)
+add_executable(governor_params_test governor_params_test.cpp
+    ${RNLLAMA_CPP_DIR}/rn-governor-params.cpp ${RNLLAMA_CPP_DIR}/rn-legs-table.cpp)
 target_include_directories(governor_params_test PRIVATE ${RNLLAMA_INCLUDE_DIRS})
 if(UNIX AND NOT APPLE)
     target_link_libraries(governor_params_test PRIVATE m)
+endif()
+
+# Decode rule v3 parsing and precedence against the actual capability row.
+add_executable(governor_v3_precedence_test governor_v3_precedence_test.cpp
+    ${RNLLAMA_CPP_DIR}/rn-governor-params.cpp ${RNLLAMA_CPP_DIR}/rn-legs-table.cpp)
+target_include_directories(governor_v3_precedence_test PRIVATE ${RNLLAMA_INCLUDE_DIRS})
+if(UNIX AND NOT APPLE)
+    target_link_libraries(governor_v3_precedence_test PRIVATE m)
 endif()
 
 # Decode-hop thermal legs: links only the sysfs reader TU (host-only, no

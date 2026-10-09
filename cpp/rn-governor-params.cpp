@@ -5,6 +5,7 @@
 #include "ggml-backend-impl.h"
 
 #include <cmath>
+#include <cfloat>
 #include <string>
 #include <string_view>
 #include <stdexcept>
@@ -92,10 +93,13 @@ llama_governor_leg_weighting leg_weighting_from(const std::string & value) {
 // bench's parse_nonneg_float is their only other gate), so the binding
 // refuses anything but finite >= 0 here. NaN fails the >= compare.
 bool valid_heat_knob(double raw) {
-    return raw >= 0.0 && std::isfinite(raw) && std::isfinite(static_cast<float>(raw));
+    return raw >= 0.0 && raw <= FLT_MAX && std::isfinite(raw);
 }
 
 float nonneg_float_or(const nlohmann::ordered_json & object, const char * name, float fallback) {
+    if (!object.contains(name) || object.at(name).is_null()) {
+        return fallback;
+    }
     const double raw = value_or(object, name, static_cast<double>(fallback));
     if (!valid_heat_knob(raw)) {
         throw std::invalid_argument(
@@ -113,13 +117,16 @@ float nonneg_float_or(const nlohmann::ordered_json & object, const char * name, 
 void nonneg_legs_or(const nlohmann::ordered_json & object, const char * name,
                     float & npu, float & gpu, float & cpu) {
     const auto knob = object.find(name);
-    if (knob == object.end()) {
+    if (knob == object.end() || knob->is_null()) {
         return;
     }
     if (!knob->is_object()) {
         throw std::invalid_argument(
             std::string("governor.") + name + " must be an object with npu, gpu, cpu");
     }
+    float parsed_npu = 0.0f;
+    float parsed_gpu = 0.0f;
+    float parsed_cpu = 0.0f;
     const auto leg = [&](const char * key, float & out) {
         const auto leaf = knob->find(key);
         if (leaf == knob->end() || !leaf->is_number()) {
@@ -133,9 +140,9 @@ void nonneg_legs_or(const nlohmann::ordered_json & object, const char * name,
         }
         out = static_cast<float>(leaf->get<double>());
     };
-    leg("npu", npu);
-    leg("gpu", gpu);
-    leg("cpu", cpu);
+    leg("npu", parsed_npu);
+    leg("gpu", parsed_gpu);
+    leg("cpu", parsed_cpu);
     for (const auto & entry : knob->items()) {
         const std::string & key = entry.key();
         if (key != "npu" && key != "gpu" && key != "cpu") {
@@ -143,6 +150,9 @@ void nonneg_legs_or(const nlohmann::ordered_json & object, const char * name,
                 std::string("governor.") + name + "." + key + " is not a leg (npu, gpu, cpu)");
         }
     }
+    npu = parsed_npu;
+    gpu = parsed_gpu;
+    cpu = parsed_cpu;
 }
 
 } // namespace
@@ -194,6 +204,7 @@ bool parse_governor_params(
     llama_governor_params & params,
     llama_governor_thermo_profile & thermo,
     governor_load_options & options) {
+    options.v3_sent = {};
     if (!governor.is_object()) {
         throw std::invalid_argument("governor must be a JSON object");
     }
@@ -237,7 +248,9 @@ bool parse_governor_params(
     // N > 0 alternates decode CPU / NPU lane every N generated tokens; 0 or
     // absent keeps CPU. JSI numbers are doubles: the range check also refuses
     // NaN before the cast.
-    const double hop = value_or(governor, "decode_hop_tokens", 0.0);
+    const double hop = !governor.contains("decode_hop_tokens") ||
+            governor.at("decode_hop_tokens").is_null()
+        ? 0.0 : value_or(governor, "decode_hop_tokens", 0.0);
     if (!(hop >= 0.0 && hop <= 4294967295.0)) {
         throw std::invalid_argument("governor.decode_hop_tokens must be a non-negative uint32");
     }
@@ -245,7 +258,14 @@ bool parse_governor_params(
     // Rule v3 decode knobs (llama-ext.h decode_leg_weighting and friends):
     // absent keys keep the fresh llama_governor_params defaults above, so
     // today's payloads parse to today's behaviour.
-    params.decode_leg_weighting = leg_weighting_from(string_or(governor, "decode_leg_weighting"));
+    const bool weighting_sent = governor.contains("decode_leg_weighting") &&
+        !governor.at("decode_leg_weighting").is_null();
+    if (weighting_sent && governor.at("decode_leg_weighting").is_string() &&
+        governor.at("decode_leg_weighting").get<std::string>().empty()) {
+        throw std::invalid_argument("governor.decode_leg_weighting must not be empty");
+    }
+    params.decode_leg_weighting = leg_weighting_from(
+        weighting_sent ? string_or(governor, "decode_leg_weighting") : std::string{});
     params.decode_heat_weight = nonneg_float_or(
         governor, "decode_heat_weight", params.decode_heat_weight);
     nonneg_legs_or(governor, "decode_heat_per_token",
@@ -262,13 +282,6 @@ bool parse_governor_params(
     // on the one-copy load the matched row only fills the absent ones
     // (merge_leg_row_defaults). An invalid key throws above, so a completed
     // parse carries only well-typed presence.
-    options.v3_sent.hop_tokens = governor.contains("decode_hop_tokens");
-    options.v3_sent.leg_weighting = governor.contains("decode_leg_weighting");
-    options.v3_sent.heat_weight = governor.contains("decode_heat_weight");
-    options.v3_sent.heat_per_token = governor.contains("decode_heat_per_token");
-    options.v3_sent.load_step = governor.contains("decode_load_step");
-    options.v3_sent.guard_headroom_c = governor.contains("decode_guard_headroom_c");
-    options.v3_sent.headroom_tau_s = governor.contains("decode_headroom_tau_s");
     // npu_lane_enabled is forwarded: the engine's prefill_engine owns the
     // lane (owner rule 2026-09-28) and load_governor_models decides the
     // device with llama_governor_resolve_prefill_device + degrade.
@@ -277,6 +290,19 @@ bool parse_governor_params(
     if (!governor_thermo_profile_is_valid(thermo)) {
         throw std::invalid_argument("governor: thermo profile invalid");
     }
+    options.v3_sent.hop_tokens = governor.contains("decode_hop_tokens") &&
+        !governor.at("decode_hop_tokens").is_null();
+    options.v3_sent.leg_weighting = weighting_sent;
+    options.v3_sent.heat_weight = governor.contains("decode_heat_weight") &&
+        !governor.at("decode_heat_weight").is_null();
+    options.v3_sent.heat_per_token = governor.contains("decode_heat_per_token") &&
+        !governor.at("decode_heat_per_token").is_null();
+    options.v3_sent.load_step = governor.contains("decode_load_step") &&
+        !governor.at("decode_load_step").is_null();
+    options.v3_sent.guard_headroom_c = governor.contains("decode_guard_headroom_c") &&
+        !governor.at("decode_guard_headroom_c").is_null();
+    options.v3_sent.headroom_tau_s = governor.contains("decode_headroom_tau_s") &&
+        !governor.at("decode_headroom_tau_s").is_null();
     return true;
 }
 

@@ -95,6 +95,8 @@ private:
     rn_platform_thermal platform_thermal_;
     int64_t platform_thermal_read_us_ = 0;
     rn_platform_thermal_send_state platform_thermal_send_state_;
+    // Monotonic stamp of the last native read that returned a status.
+    int64_t platform_native_valid_us_ = 0;
     bool platform_refusal_logged_ = false;
     std::string failure_reason_;
 };

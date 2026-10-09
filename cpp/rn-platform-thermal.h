@@ -20,6 +20,8 @@ constexpr int32_t k_platform_thermal_shutdown = 6;
 /** Minimum wall time between native reads. */
 constexpr int64_t k_platform_thermal_interval_us = 1000000;
 constexpr int64_t k_platform_thermal_escalation_debounce_us = 5000000;
+// How long an app profile without a status may carry the last native reading.
+constexpr int64_t k_platform_thermal_carry_us = 10000000;
 
 struct rn_platform_thermal_send_state {
     int32_t pending_status = k_platform_thermal_absent;

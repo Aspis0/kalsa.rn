@@ -83,7 +83,8 @@ bool test_absent_read_keeps_pending_escalation() {
     decision = rn_platform_thermal_should_send(t0 + k_platform_thermal_interval_us,
                                                 k_platform_thermal_absent, 1, state);
     if (decision.send || decision.pending_started ||
-        decision.next_state.pending_since_us != t0) return false;
+        decision.next_state.pending_since_us != t0 ||
+        decision.next_state.last_seen_us != t0) return false;
     state = decision.next_state;
     for (int second = 2; second < 5; ++second) {
         decision = rn_platform_thermal_should_send(t0 + second * 1000000, 3, 1, state);

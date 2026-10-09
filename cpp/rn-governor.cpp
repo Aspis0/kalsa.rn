@@ -179,11 +179,15 @@ bool rn_governor::set_thermo_profile(const llama_governor_thermo_profile & profi
         return false;
     }
     std::lock_guard<std::mutex> lock(profile_mutex_);
-    // The app leaves platform_thermal_status at -1 when its own read failed:
-    // a failed read is a gap, not a cool-down, and must not erase the
-    // native reading.
+    // The app leaves platform_thermal_status at -1 when its own read failed.
+    // A failed read is a gap, not a cool-down, so the remembered status
+    // survives it while a native read has confirmed one recently; carried
+    // without that bound, a dark thermal service after a hot moment would
+    // hold COOLMODE indefinitely.
     llama_governor_thermo_profile merged = profile;
-    if (merged.platform_thermal_status < 0) {
+    const bool native_recent = platform_native_valid_us_ > 0 &&
+        ggml_time_us() - platform_native_valid_us_ <= k_platform_thermal_carry_us;
+    if (merged.platform_thermal_status < 0 && native_recent) {
         merged.platform_thermal_status = thermo_profile_.platform_thermal_status;
     }
     const bool status_changed =
@@ -191,7 +195,8 @@ bool rn_governor::set_thermo_profile(const llama_governor_thermo_profile & profi
     profile_valid_ = llama_governor_set_thermo_profile(governor_, merged, ggml_time_us() / 1000);
     if (profile_valid_) {
         thermo_profile_ = merged;
-        // Only a status change may cancel a pending native escalation.
+        // An app profile cancels a pending native escalation only when it
+        // changes the status.
         if (status_changed) {
             platform_thermal_send_state_ = {};
         }
@@ -214,6 +219,9 @@ void rn_governor::refresh_platform_thermal() {
     std::lock_guard<std::mutex> lock(profile_mutex_);
     if (!profile_valid_) {
         return;
+    }
+    if (status != k_platform_thermal_absent) {
+        platform_native_valid_us_ = ggml_time_us();
     }
     const int32_t previous = thermo_profile_.platform_thermal_status;
     const auto decision = rn_platform_thermal_should_send(

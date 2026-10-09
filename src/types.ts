@@ -51,7 +51,9 @@ export type GovernorThermoProfile = {
   t_idle_c?: number
   trend_c_per_min?: number
   /** Android PowerManager.getCurrentThermalStatus(): 0..6. Absent,
-   *  non-integer or out-of-range reads as -1 (no platform vote). */
+   *  non-integer or out-of-range reads as -1: no app vote. On Android the
+   *  binding then keeps the status its native reader confirmed in the last
+   *  10 s; otherwise the platform does not vote. */
   platform_thermal_status?: number
 }
 

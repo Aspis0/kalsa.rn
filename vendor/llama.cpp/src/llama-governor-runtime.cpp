@@ -68,6 +68,13 @@ void llama_governor::refresh_policy_stats() {
     stats_.cpu_to_gpu_engagements = policy_.cpu_to_gpu_engagements();
     stats_.cache_budget_warning = policy_.cache_budget_warning();
     stats_.last_router_rule = policy_.prefill_rule();
+    // The forecast as the policy normalized it: what the pacing duty curve
+    // reads, which a bench reports instead of the requested option.
+    stats_.decode_pacing_headroom_last = policy_.platform_thermal_headroom();
+    const auto & ramp = policy_.params();
+    stats_.decode_pacing_start_applied = ramp.decode_pacing_headroom_start;
+    stats_.decode_pacing_full_applied = ramp.decode_pacing_headroom_full;
+    stats_.decode_pacing_min_duty_applied = ramp.decode_pacing_min_duty;
 }
 
 int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {

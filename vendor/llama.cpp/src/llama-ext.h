@@ -366,7 +366,10 @@ struct llama_governor_params {
     float decode_floor_tps_npu = 0;
     float decode_floor_tps_gpu = 0;
     float decode_floor_tps_cpu = 0;
-    // Decode duty cycle as a fraction in COOLMODE; 1.0 disables pacing.
+    // The flat duty a COOLMODE decode falls back to when the platform sends
+    // no thermal forecast and the battery ramp is not tighter. It is also the
+    // cap at platform status 2; status 3+ caps at decode_pacing_min_duty
+    // instead, so 1.0 leaves status 2 unpaced but not status 3.
     float decode_coolmode_duty = 1.0f;
     float decode_heat_weight = 0;
     float decode_heat_per_token_npu = 0;
@@ -401,6 +404,21 @@ struct llama_governor_params {
     // the window rule.
     float decode_headroom_tau_s = 0;
     llama_governor_leg_weighting decode_leg_weighting = llama_governor_leg_weighting::NPU_FIRST;
+    // Graduated decode pacing (llama-governor-pacing-duty.cpp), read from
+    // the platform thermal headroom forecast in the thermo profile: full
+    // speed to decode_pacing_headroom_start, then a ramp down to
+    // decode_pacing_min_duty at decode_pacing_headroom_full. On the S23
+    // calibration (2026-10-10, headroom = (skin - 12) / 30) the start line is
+    // Android status 1 (0.877) and the full line sits just below SEVERE
+    // (1.003). A second ramp on the battery temperature runs underneath it,
+    // from the profile's cool entry to the pause line, and the tighter of the
+    // two wins; decode_coolmode_duty is the fallback when the platform sends
+    // no forecast. start and full are sanitized as a pair: a start at or
+    // above the full line resets both to the shipped values.
+    float decode_pacing_headroom_start = 0.87f;
+    float decode_pacing_headroom_full = 0.97f;
+    // The floor both ramps bottom out at; 1.0 would disable pacing outright.
+    float decode_pacing_min_duty = 0.35f;
 };
 
 /** One successful battery poll. Temperature is the dumpsys tenths-of-degrees-C
@@ -427,6 +445,14 @@ struct llama_governor_thermo_profile {
     // status requires the binding to parse the field, and until it does
     // the status stays absent.
     int32_t platform_thermal_status = -1;
+    // Android PowerManager.getThermalHeadroom() (AThermal_getThermalHeadroom)
+    // forecast, in the same shape as the status above: 0 = cool, 1.0 = the
+    // device reaches THERMAL_STATUS_SEVERE, and a reading above 1 is legal;
+    // NaN = the platform did not answer. The policy folds NaN, -inf and every
+    // negative value into that unknown; +inf passes through as a reading
+    // (maximally hot) and paces at the floor. Decode pacing reads it (see
+    // decode_pacing_headroom_start); nothing else classifies on it.
+    float platform_thermal_headroom = std::numeric_limits<float>::quiet_NaN();
 };
 
 /** Actual tensor_get/set counts for one commit. K is always naive, including in Staged mode. */
@@ -590,6 +616,23 @@ struct llama_governor_stats {
     // "battery" / "platform" set by refresh_policy_stats, never freed.
     int32_t platform_thermal_status = -1;
     const char * state_source = "battery";
+    // The duty the last single-token decode step ran at (1.0 = the step ran
+    // unpaced): compute / (compute + the delay actually slept), so a step the
+    // 250 ms cap shortened reports the higher duty it realized, not the
+    // requested one. A reading of the last decision, not a counter, so
+    // clear_cache leaves it.
+    float decode_pacing_duty_last = 1.0f;
+    // The normalized platform thermal headroom the policy last read (NaN = no
+    // forecast): a bench reads it back instead of echoing the requested
+    // option, which the profile may have refused or clamped.
+    float decode_pacing_headroom_last = std::numeric_limits<float>::quiet_NaN();
+    // The pacing ramp the policy runs, after sanitizing (a refused flag reads
+    // back as the shipped value). NaN until the policy refreshes the stats
+    // (a thermal profile or a decode), so a run that never reaches either
+    // prints NaN rather than a ramp it never ran.
+    float decode_pacing_start_applied = std::numeric_limits<float>::quiet_NaN();
+    float decode_pacing_full_applied = std::numeric_limits<float>::quiet_NaN();
+    float decode_pacing_min_duty_applied = std::numeric_limits<float>::quiet_NaN();
 };
 
 /** Cumulative optional telemetry supplied by a streaming/backend integration. */

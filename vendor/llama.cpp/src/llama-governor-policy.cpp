@@ -19,6 +19,13 @@ constexpr float k_kill_c = 44.0f;
 constexpr float k_trend_c_per_min = 1.5f;
 constexpr uint32_t k_table_tokens[] = { 128, 512, 1024, 2048 };
 constexpr float k_cpu_delta_c[] = { 1.9f, 3.25f, 3.25f, 5.15f };
+// Shipped decode-pacing lines (llama-ext.h): the S23 calibration of
+// 2026-10-10 puts Android thermal status 1 at headroom 0.877 and SEVERE at
+// 1.003, so full speed holds through status 1 and the floor lands just below
+// SEVERE.
+constexpr float k_pacing_start_default = 0.87f;
+constexpr float k_pacing_full_default = 0.97f;
+constexpr float k_pacing_min_duty_default = 0.35f;
 
 bool valid_schema(const llama_governor_params & params) {
     return params.schema_version == 3 && params.capability_schema_version == 2 &&
@@ -92,6 +99,44 @@ float sanitize_coolmode_duty(float value) {
     return value;
 }
 
+// NaN makes every compare false (no ramp at all, full speed) and +inf never
+// reaches the start line: any line that is not finite and >= 0 falls back to
+// its shipped default, the warning naming the field. The pair's ORDER is not
+// this function's business - either line alone can pass and still be
+// misplaced, so the constructor checks it once more over both.
+float sanitize_pacing_headroom_line(const char * field, float value, float fallback) {
+    if (!std::isfinite(value) || value < 0.0f) {
+        LLAMA_LOG_WARN("governor: invalid %s %.6g; reset to %.2f\n",
+                       field, static_cast<double>(value), static_cast<double>(fallback));
+        return fallback;
+    }
+    return value;
+}
+
+// A floor of 0 would divide by zero in the idle delay, and a floor of 1 is
+// accepted: it disables both ramps outright, which is a legal way to turn the
+// pacing off. Anything else outside (0, 1] falls back to the shipped floor,
+// naming the value.
+float sanitize_pacing_min_duty(float value) {
+    if (!std::isfinite(value) || value <= 0.0f || value > 1.0f) {
+        LLAMA_LOG_WARN("governor: invalid decode_pacing_min_duty %.6g; reset to %g\n",
+                       static_cast<double>(value),
+                       static_cast<double>(k_pacing_min_duty_default));
+        return k_pacing_min_duty_default;
+    }
+    return value;
+}
+
+// AThermal_getThermalHeadroom: NaN means the platform did not answer, which
+// the duty curve already handles. A negative, -inf or NaN reading is a client
+// fault in the same units, so it is folded into that unknown instead of
+// refusing the profile - the headroom only paces decode. +inf is a reading
+// (maximally hot), so it passes through and the duty curve reads it as the
+// floor; folding it into the unknown would hand COOLMODE its faster flat duty.
+float normalize_thermal_headroom(float headroom) {
+    return headroom >= 0.0f ? headroom : std::numeric_limits<float>::quiet_NaN();
+}
+
 } // namespace
 
 bool llama_governor_expert_substitution_would_displace(
@@ -105,6 +150,23 @@ bool llama_governor_expert_substitution_would_displace(
 
 llama_governor_policy::llama_governor_policy(const llama_governor_params & params) : params_(params) {
     params_.decode_coolmode_duty = sanitize_coolmode_duty(params_.decode_coolmode_duty);
+    params_.decode_pacing_headroom_start =
+        sanitize_pacing_headroom_line("decode_pacing_headroom_start",
+                                      params_.decode_pacing_headroom_start, k_pacing_start_default);
+    params_.decode_pacing_headroom_full =
+        sanitize_pacing_headroom_line("decode_pacing_headroom_full",
+                                      params_.decode_pacing_headroom_full, k_pacing_full_default);
+    if (params_.decode_pacing_headroom_start >= params_.decode_pacing_headroom_full) {
+        LLAMA_LOG_WARN("governor: decode_pacing_headroom_start %.6g is not below "
+                       "decode_pacing_headroom_full %.6g; both reset to %g/%g\n",
+                       static_cast<double>(params_.decode_pacing_headroom_start),
+                       static_cast<double>(params_.decode_pacing_headroom_full),
+                       static_cast<double>(k_pacing_start_default),
+                       static_cast<double>(k_pacing_full_default));
+        params_.decode_pacing_headroom_start = k_pacing_start_default;
+        params_.decode_pacing_headroom_full = k_pacing_full_default;
+    }
+    params_.decode_pacing_min_duty = sanitize_pacing_min_duty(params_.decode_pacing_min_duty);
     cache_budget_warning_ = params_.cache_budget_bytes != 0 && params_.expert_cycle_bytes != 0 &&
                            params_.cache_budget_bytes < params_.expert_cycle_bytes;
     // An invalid tau must not silently become a third mode: NaN poisons
@@ -186,6 +248,7 @@ bool llama_governor_policy::can_leave(int64_t now_ms, float temperature, float e
 bool llama_governor_policy::update_thermal(const llama_governor_thermo_profile & profile, int64_t now_ms) {
     profile_ = profile;
     profile_.platform_thermal_status = normalize_platform_status(profile.platform_thermal_status);
+    profile_.platform_thermal_headroom = normalize_thermal_headroom(profile.platform_thermal_headroom);
     if (!profile_is_valid(profile)) {
         profile_valid_ = false;
         have_profile_ = true;
@@ -575,6 +638,14 @@ uint32_t llama_governor_policy::prefill_token_cap() const {
 uint64_t llama_governor_policy::cpu_to_gpu_engagements() const { return cpu_to_gpu_engagements_; }
 bool llama_governor_policy::cache_budget_warning() const { return cache_budget_warning_; }
 bool llama_governor_policy::hot_plugged() const { return hot_plugged_; }
+
+// cool_enter is the state machine's COOLMODE entry for THIS profile (39.5 C
+// unplugged, t_idle + 4.5 capped at 42 plugged) and k_warn_c the pause line,
+// so the battery ramp slows decode exactly where the classifier escalates.
+llama_governor_pacing_battery_lines llama_governor_policy::decode_battery_lines() const {
+    const auto limits = get_thresholds();
+    return { limits.cool_enter, k_warn_c };
+}
 
 bool llama_governor_policy::set_prefill_override(int mode) {
     if (mode < static_cast<int>(llama_governor_prefill_mode::Auto) ||

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama-ext.h"
+#include "llama-governor-pacing-duty.h"
 
 #include <atomic>
 #include <cstdint>
@@ -128,6 +129,13 @@ public:
     uint64_t cpu_to_gpu_engagements() const;
     bool cache_budget_warning() const;
     float decode_coolmode_duty() const { return params_.decode_coolmode_duty; }
+    // The platform thermal headroom forecast the duty curve reads (NaN = the
+    // platform did not answer), normalized by update_thermal.
+    float platform_thermal_headroom() const { return profile_.platform_thermal_headroom; }
+    // The two battery-temperature lines the duty curve's second ramp reads
+    // (llama-governor-pacing-duty.cpp), taken from the live profile: the cool
+    // entry the classifier uses and the pause line above it.
+    llama_governor_pacing_battery_lines decode_battery_lines() const;
     bool hot_plugged() const;
 
 private:

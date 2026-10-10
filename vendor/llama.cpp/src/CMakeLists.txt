@@ -31,6 +31,7 @@ set(LLAMA_CORE_SOURCES
     llama-governor-legs.cpp
     llama-governor-runtime.cpp
     llama-governor-pacing.cpp
+    llama-governor-pacing-duty.cpp
     llama-governor-metrics.cpp
     llama-governor-policy.cpp
     llama-governor-policy-hop.cpp

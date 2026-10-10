@@ -550,6 +550,62 @@ static bool test_decode_coolmode_duty_range() {
     return false;
 }
 
+// Decode pacing (llama-governor-pacing-duty.cpp). Absent keys keep the engine's
+// defaults, which the test reads from llama_governor_params{} instead of
+// repeating them. The binding refuses a misordered headroom pair and a min duty
+// outside (0, 1]; the engine would reset those with a warning.
+static bool test_decode_pacing_params() {
+    const llama_governor_params engine_defaults{};
+    const auto with = [](nlohmann::ordered_json governor, const char * key,
+                         nlohmann::ordered_json value) {
+        governor[key] = std::move(value);
+        return governor;
+    };
+    const auto parse = [](const nlohmann::ordered_json & governor) {
+        llama_governor_params params{};
+        llama_governor_thermo_profile thermo{};
+        governor_load_options options{};
+        parse_governor_params(governor, params, thermo, options);
+        return params;
+    };
+    const auto absent = parse(base_governor());
+    if (absent.decode_pacing_headroom_start != engine_defaults.decode_pacing_headroom_start ||
+        absent.decode_pacing_headroom_full != engine_defaults.decode_pacing_headroom_full ||
+        absent.decode_pacing_min_duty != engine_defaults.decode_pacing_min_duty) {
+        return false;
+    }
+    auto explicit_keys = base_governor();
+    explicit_keys["decode_pacing_headroom_start"] = 0.9;
+    explicit_keys["decode_pacing_headroom_full"] = 0.98;
+    explicit_keys["decode_pacing_min_duty"] = 0.5;
+    const auto set = parse(explicit_keys);
+    if (set.decode_pacing_headroom_start != 0.9f || set.decode_pacing_headroom_full != 0.98f ||
+        set.decode_pacing_min_duty != 0.5f) {
+        return false;
+    }
+    // A min duty of 1 is the legal way to switch both ramps off.
+    if (parse(with(base_governor(), "decode_pacing_min_duty", 1.0)).decode_pacing_min_duty != 1.0f) {
+        return false;
+    }
+    const double default_full = engine_defaults.decode_pacing_headroom_full;
+    const nlohmann::ordered_json refused[] = {
+        // Start alone, past the engine's full line: a misordered pair.
+        with(base_governor(), "decode_pacing_headroom_start", default_full + 0.01),
+        with(with(base_governor(), "decode_pacing_headroom_start", 0.9),
+             "decode_pacing_headroom_full", 0.9),
+        with(base_governor(), "decode_pacing_headroom_start", -0.1),
+        with(base_governor(), "decode_pacing_min_duty", 0.0),
+        with(base_governor(), "decode_pacing_min_duty", 1.5),
+        with(base_governor(), "decode_pacing_min_duty", "0.5"),
+    };
+    for (const auto & governor : refused) {
+        if (parses(governor)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool test_leg_object_leaf_errors_name_the_failure() {
     auto governor = base_governor();
     governor["decode_heat_per_token"] = {{"npu", 0.1}, {"gpu", 0.2}};
@@ -587,6 +643,7 @@ int main() {
     results.run_test("platform_thermal_status normalizes to -1..6", test_platform_thermal_status_parses());
     results.run_test("decode rule v3 parser contract", test_decode_rule_v3_parser_contract());
     results.run_test("decode_coolmode_duty range and default", test_decode_coolmode_duty_range());
+    results.run_test("decode pacing params: engine defaults, ordering, duty range", test_decode_pacing_params());
     results.run_test("leg object errors distinguish absent from non-numeric", test_leg_object_leaf_errors_name_the_failure());
     results.print_summary();
     return (results.passed_tests == results.total_tests) ? 0 : 1;

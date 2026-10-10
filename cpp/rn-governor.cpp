@@ -4,6 +4,8 @@
 
 #include "ggml.h"
 
+#include <cmath>
+#include <limits>
 #include <stdexcept>
 
 namespace rnllama {
@@ -74,6 +76,12 @@ void rn_governor::log_platform_thermal_availability() const {
 #if defined(__ANDROID__)
     if (const char * reason = platform_thermal_.unavailable_reason()) {
         LOG_INFO("KALSA_GOVERNOR_PLATFORM {source:\"unavailable\", reason:\"%s\"}", reason);
+    }
+    // Its own prefix, so KALSA_GOVERNOR_PLATFORM stays a status-only line.
+    if (const char * reason = platform_thermal_.headroom_unavailable_reason()) {
+        LOG_INFO("KALSA_GOVERNOR_HEADROOM {available:0, reason:\"%s\"}", reason);
+    } else {
+        LOG_INFO("KALSA_GOVERNOR_HEADROOM {available:1}");
     }
 #endif
 }
@@ -191,6 +199,12 @@ bool rn_governor::set_thermo_profile(const llama_governor_thermo_profile & profi
     if (merged.platform_thermal_status < 0 && native_recent) {
         merged.platform_thermal_status = thermo_profile_.platform_thermal_status;
     }
+    // The engine reads a negative headroom as unknown (normalize_thermal_headroom),
+    // so an app profile without one takes the native read the same way.
+    if (!(merged.platform_thermal_headroom >= 0.0f)) {
+        merged.platform_thermal_headroom =
+            rn_platform_thermal_headroom_carried(ggml_time_us(), platform_headroom_state_);
+    }
     const bool status_changed =
         merged.platform_thermal_status != thermo_profile_.platform_thermal_status;
     profile_valid_ = llama_governor_set_thermo_profile(governor_, merged, ggml_time_us() / 1000);
@@ -207,16 +221,28 @@ bool rn_governor::set_thermo_profile(const llama_governor_thermo_profile & profi
 }
 
 void rn_governor::refresh_platform_thermal() {
+    bool status_due = false;
+    bool headroom_due = false;
     {
         std::lock_guard<std::mutex> lock(profile_mutex_);
-        if (!profile_valid_ || !rn_platform_thermal_should_read(ggml_time_us(),
-                                                                platform_thermal_read_us_)) {
+        if (!profile_valid_) {
             return;
         }
+        const int64_t now_us = ggml_time_us();
+        status_due = rn_platform_thermal_should_read(now_us, platform_thermal_read_us_,
+                                                     k_platform_thermal_interval_us);
+        headroom_due = rn_platform_thermal_should_read(now_us, platform_headroom_read_us_,
+                                                       k_platform_thermal_headroom_interval_us);
     }
-    // The HAL call can block on binder; profile updates remain available while
-    // it runs, and the send decision uses whichever profile was accepted latest.
-    const int32_t status = platform_thermal_.status();
+    if (!status_due && !headroom_due) {
+        return;
+    }
+    // The HAL calls can block on binder; profile updates remain available while
+    // they run, and the send decisions use whichever profile was accepted latest.
+    // A status that is not due reads as absent, which the send decision ignores.
+    const int32_t status = status_due ? platform_thermal_.status() : k_platform_thermal_absent;
+    const float headroom_read = headroom_due ? platform_thermal_.headroom()
+                                             : std::numeric_limits<float>::quiet_NaN();
     std::lock_guard<std::mutex> lock(profile_mutex_);
     if (!profile_valid_) {
         return;
@@ -232,11 +258,23 @@ void rn_governor::refresh_platform_thermal() {
         LOG_INFO("KALSA_GOVERNOR_PLATFORM {status:%d, prev:%d, source:\"native\", sent:0}",
                  status, previous);
     }
-    if (!decision.send) {
+    const float previous_headroom = thermo_profile_.platform_thermal_headroom;
+    float headroom = previous_headroom;
+    if (headroom_due) {
+        headroom = rn_platform_thermal_headroom_forward(ggml_time_us(), headroom_read,
+                                                        platform_headroom_state_);
+    }
+    // NaN is a value here too: two unknowns are the same headroom.
+    const bool headroom_changed = std::isnan(headroom) ? !std::isnan(previous_headroom)
+                                                       : headroom != previous_headroom;
+    if (!decision.send && !headroom_changed) {
         return;
     }
     llama_governor_thermo_profile updated = thermo_profile_;
-    updated.platform_thermal_status = status;
+    if (decision.send) {
+        updated.platform_thermal_status = status;
+    }
+    updated.platform_thermal_headroom = headroom;
     if (!llama_governor_set_thermo_profile(governor_, updated, ggml_time_us() / 1000)) {
         profile_valid_ = false;
         platform_thermal_send_state_ = {};
@@ -247,8 +285,10 @@ void rn_governor::refresh_platform_thermal() {
         return;
     }
     thermo_profile_ = updated;
-    LOG_INFO("KALSA_GOVERNOR_PLATFORM {status:%d, prev:%d, source:\"native\", sent:1}",
-             status, previous);
+    if (decision.send) {
+        LOG_INFO("KALSA_GOVERNOR_PLATFORM {status:%d, prev:%d, source:\"native\", sent:1}",
+                 status, previous);
+    }
 }
 
 bool rn_governor::profile_valid() const {

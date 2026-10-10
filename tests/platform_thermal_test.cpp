@@ -2,8 +2,10 @@
 
 #include "rn-platform-thermal.h"
 
+#include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <string>
 
 using namespace rnllama;
@@ -25,10 +27,51 @@ constexpr int64_t t0 = 1000000;
 
 bool test_interval_gate_advances_only_when_due() {
     int64_t last = t0;
-    if (rn_platform_thermal_should_read(t0 + k_platform_thermal_interval_us - 1, last)) return false;
+    if (rn_platform_thermal_should_read(t0 + k_platform_thermal_interval_us - 1, last,
+                                        k_platform_thermal_interval_us)) return false;
     if (last != t0) return false;
-    if (!rn_platform_thermal_should_read(t0 + k_platform_thermal_interval_us, last)) return false;
+    if (!rn_platform_thermal_should_read(t0 + k_platform_thermal_interval_us, last,
+                                         k_platform_thermal_interval_us)) return false;
     return last == t0 + k_platform_thermal_interval_us;
+}
+
+bool test_headroom_interval_is_its_own() {
+    int64_t last = t0;
+    return !rn_platform_thermal_should_read(t0 + k_platform_thermal_interval_us, last,
+                                            k_platform_thermal_headroom_interval_us) &&
+           rn_platform_thermal_should_read(t0 + k_platform_thermal_headroom_interval_us, last,
+                                           k_platform_thermal_headroom_interval_us);
+}
+
+bool test_headroom_finite_read_is_forwarded_and_remembered() {
+    rn_platform_thermal_headroom_state state;
+    return rn_platform_thermal_headroom_forward(t0, 0.5f, state) == 0.5f &&
+           state.value == 0.5f && state.read_us == t0;
+}
+
+bool test_headroom_nan_or_negative_read_carries_the_last_finite_value() {
+    rn_platform_thermal_headroom_state state;
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    rn_platform_thermal_headroom_forward(t0, 0.8f, state);
+    if (rn_platform_thermal_headroom_forward(t0 + 1000000, nan, state) != 0.8f) return false;
+    if (rn_platform_thermal_headroom_forward(t0 + 2000000, -1.0f, state) != 0.8f) return false;
+    // A carried value does not refresh the window: it still expires 10 s after t0.
+    return state.read_us == t0;
+}
+
+bool test_headroom_is_nan_after_the_carry_window() {
+    rn_platform_thermal_headroom_state state;
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    rn_platform_thermal_headroom_forward(t0, 0.8f, state);
+    const float expired = rn_platform_thermal_headroom_forward(
+        t0 + k_platform_thermal_carry_us + 1, nan, state);
+    return std::isnan(expired) &&
+           std::isnan(rn_platform_thermal_headroom_carried(t0 + k_platform_thermal_carry_us + 1, state));
+}
+
+bool test_headroom_never_read_is_nan() {
+    const rn_platform_thermal_headroom_state state;
+    return std::isnan(rn_platform_thermal_headroom_carried(t0, state));
 }
 
 bool test_escalation_requires_five_seconds_of_reads() {
@@ -132,6 +175,11 @@ bool test_off_android_reader_is_absent() {
 int main() {
     TestResults results;
     results.run("read interval advances only when due", test_interval_gate_advances_only_when_due());
+    results.run("headroom has its own read interval", test_headroom_interval_is_its_own());
+    results.run("finite headroom is forwarded and remembered", test_headroom_finite_read_is_forwarded_and_remembered());
+    results.run("NaN or negative headroom carries the last finite value", test_headroom_nan_or_negative_read_carries_the_last_finite_value());
+    results.run("headroom is NaN after the carry window", test_headroom_is_nan_after_the_carry_window());
+    results.run("headroom never read is NaN", test_headroom_never_read_is_nan());
     results.run("escalation requires five seconds of reads", test_escalation_requires_five_seconds_of_reads());
     results.run("higher reads sustain the pending escalation", test_escalation_keeps_consecutive_reads_at_or_above_pending_level());
     results.run("escalation restarts after a read gap", test_escalation_restarts_after_a_read_gap());

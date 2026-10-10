@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -959,6 +960,12 @@ namespace rnllama_jsi {
                             result.setProperty(rt, "decode_paced_ms", (double) stats.decode_paced_ms);
                             result.setProperty(rt, "decode_paced_tokens", (double) stats.decode_paced_tokens);
                             result.setProperty(rt, "decode_paced_capped", (double) stats.decode_paced_capped);
+                            result.setProperty(rt, "decode_pacing_duty_last", (double) stats.decode_pacing_duty_last);
+                            // NaN (no platform forecast read yet) crosses as null: JSON has no NaN.
+                            result.setProperty(rt, "decode_pacing_headroom_last",
+                                std::isfinite(stats.decode_pacing_headroom_last)
+                                    ? jsi::Value((double) stats.decode_pacing_headroom_last)
+                                    : jsi::Value::null());
                             if (stats.decode_hop_rule != nullptr) {
                                 result.setProperty(rt, "decode_hop_rule",
                                     jsi::String::createFromUtf8(rt, stats.decode_hop_rule));

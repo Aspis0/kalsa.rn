@@ -284,6 +284,11 @@ export type GovernorStats = {
     decode_paced_ms: number;
     decode_paced_tokens: number;
     decode_paced_capped: number;
+    /** Duty the last single-token decode step ran at (1 = unpaced). */
+    decode_pacing_duty_last: number;
+    /** Platform thermal headroom the policy last read (1 = SEVERE); null when
+     *  no forecast is available. */
+    decode_pacing_headroom_last: number | null;
     /** Rule used by the last decode-hop window that made a decision; it stays
      *  until the next decision or clear_cache. */
     decode_hop_rule: string | null;

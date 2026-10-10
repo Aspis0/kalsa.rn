@@ -3,6 +3,8 @@
 
 #include "rn-platform-thermal.h"
 
+#include <cmath>
+
 #if defined(__ANDROID__)
 #include <dlfcn.h>
 #endif
@@ -24,12 +26,30 @@ int32_t rn_map_platform_thermal_status(int32_t athermal_status) {
     return athermal_status;
 }
 
-bool rn_platform_thermal_should_read(int64_t now_us, int64_t & last_read_us) {
-    if (now_us - last_read_us < k_platform_thermal_interval_us) {
+bool rn_platform_thermal_should_read(int64_t now_us, int64_t & last_read_us, int64_t interval_us) {
+    if (now_us - last_read_us < interval_us) {
         return false;
     }
     last_read_us = now_us;
     return true;
+}
+
+float rn_platform_thermal_headroom_carried(int64_t now_us,
+                                           const rn_platform_thermal_headroom_state & state) {
+    if (state.read_us > 0 && now_us - state.read_us <= k_platform_thermal_carry_us) {
+        return state.value;
+    }
+    return std::numeric_limits<float>::quiet_NaN();
+}
+
+float rn_platform_thermal_headroom_forward(int64_t now_us, float read,
+                                           rn_platform_thermal_headroom_state & state) {
+    if (std::isfinite(read) && read >= 0.0f) {
+        state.value = read;
+        state.read_us = now_us;
+        return read;
+    }
+    return rn_platform_thermal_headroom_carried(now_us, state);
 }
 
 rn_platform_thermal_send_decision rn_platform_thermal_should_send(
@@ -83,6 +103,14 @@ const char * rn_platform_thermal::unavailable_reason() const {
     return "not_android";
 }
 
+float rn_platform_thermal::headroom() const {
+    return std::numeric_limits<float>::quiet_NaN();
+}
+
+const char * rn_platform_thermal::headroom_unavailable_reason() const {
+    return "not_android";
+}
+
 #else
 
 namespace {
@@ -90,11 +118,14 @@ namespace {
 using rn_thermal_acquire_fn = AThermalManager * (*)();
 using rn_thermal_current_fn = AThermalStatus (*)(AThermalManager * manager);
 using rn_thermal_release_fn = void (*)(AThermalManager * manager);
+using rn_thermal_headroom_fn = float (*)(AThermalManager * manager, int forecast_seconds);
 
 struct rn_thermal_api {
     rn_thermal_acquire_fn acquire = nullptr;
     rn_thermal_current_fn current = nullptr;
     rn_thermal_release_fn release = nullptr;
+    // API 31 and optional: its absence leaves the status reader working.
+    rn_thermal_headroom_fn headroom = nullptr;
     const char * unavailable_reason = "symbols_unavailable";
 
     bool complete() const {
@@ -123,6 +154,8 @@ const rn_thermal_api & thermal_api() {
             ::dlsym(lib, "AThermal_getCurrentThermalStatus"));
         table.release = reinterpret_cast<rn_thermal_release_fn>(
             ::dlsym(lib, "AThermal_releaseManager"));
+        table.headroom = reinterpret_cast<rn_thermal_headroom_fn>(
+            ::dlsym(lib, "AThermal_getThermalHeadroom"));
         if (table.complete()) {
             table.unavailable_reason = nullptr;
             return table;
@@ -159,6 +192,25 @@ int32_t rn_platform_thermal::status() const {
         return k_platform_thermal_absent;
     }
     return rn_map_platform_thermal_status(api.current(manager_));
+}
+
+float rn_platform_thermal::headroom() const {
+    const rn_thermal_api & api = thermal_api();
+    if (manager_ == nullptr || api.headroom == nullptr) {
+        return std::numeric_limits<float>::quiet_NaN();
+    }
+    return api.headroom(manager_, k_platform_thermal_headroom_forecast_s);
+}
+
+const char * rn_platform_thermal::headroom_unavailable_reason() const {
+    const rn_thermal_api & api = thermal_api();
+    if (!api.complete()) {
+        return api.unavailable_reason;
+    }
+    if (manager_ == nullptr) {
+        return "manager_unavailable";
+    }
+    return api.headroom == nullptr ? "headroom_symbol_unavailable" : nullptr;
 }
 
 #endif // __ANDROID__

@@ -309,6 +309,19 @@ bool parse_governor_params(
     // policy is on, not only the validated one-copy rows.
     params.decode_coolmode_duty = duty_or(
         governor, "decode_coolmode_duty", 0.5f);
+    // Decode pacing keeps the engine's defaults when a key is absent. The engine
+    // resets a misordered pair to its defaults with a warning; the binding
+    // refuses it instead, as it does a bad duty.
+    params.decode_pacing_headroom_start = nonneg_float_or(
+        governor, "decode_pacing_headroom_start", params.decode_pacing_headroom_start);
+    params.decode_pacing_headroom_full = nonneg_float_or(
+        governor, "decode_pacing_headroom_full", params.decode_pacing_headroom_full);
+    if (params.decode_pacing_headroom_start >= params.decode_pacing_headroom_full) {
+        throw std::invalid_argument(
+            "governor.decode_pacing_headroom_start must be below decode_pacing_headroom_full");
+    }
+    params.decode_pacing_min_duty = duty_or(
+        governor, "decode_pacing_min_duty", params.decode_pacing_min_duty);
     // Audit F1/P1: record which rule v3 keys the app JSON explicitly sent -
     // on the one-copy load the matched row only fills the absent ones
     // (merge_leg_row_defaults). An invalid key throws above, so a completed

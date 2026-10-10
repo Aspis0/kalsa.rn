@@ -71,7 +71,8 @@ private:
     // Samples the legs and hands the headroom to the engine; a no-op when
     // there is no reader (decode_hop_tokens == 0).
     void feed_decode_headroom();
-    // Reads at the interval, then forwards a changed status under profile_mutex_.
+    // Reads status and headroom on their own intervals, then forwards a
+    // changed status or headroom under profile_mutex_.
     void refresh_platform_thermal();
 
     llama_governor * governor_ = nullptr;
@@ -91,9 +92,11 @@ private:
     // The last profile accepted by the engine.
     llama_governor_thermo_profile thermo_profile_;
     // Native platform thermal reader, one per governor lifetime, and the
-    // monotonic-clock stamp (ggml_time_us) of the last platform read.
+    // monotonic-clock stamp (ggml_time_us) of the last status and headroom reads.
     rn_platform_thermal platform_thermal_;
     int64_t platform_thermal_read_us_ = 0;
+    int64_t platform_headroom_read_us_ = 0;
+    rn_platform_thermal_headroom_state platform_headroom_state_;
     rn_platform_thermal_send_state platform_thermal_send_state_;
     // Monotonic stamp of the last native read that returned a status.
     int64_t platform_native_valid_us_ = 0;

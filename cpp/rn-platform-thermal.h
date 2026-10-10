@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 
 #if defined(__ANDROID__)
 #include <android/thermal.h>
@@ -22,6 +23,10 @@ constexpr int64_t k_platform_thermal_interval_us = 1000000;
 constexpr int64_t k_platform_thermal_escalation_debounce_us = 5000000;
 // How long an app profile without a status may carry the last native reading.
 constexpr int64_t k_platform_thermal_carry_us = 10000000;
+// The headroom read has its own cadence: AThermal_getThermalHeadroom answers
+// NaN to a call made again within a second, so 2 s keeps every read valid.
+constexpr int64_t k_platform_thermal_headroom_interval_us = 2000000;
+constexpr int k_platform_thermal_headroom_forecast_s = 10;
 
 struct rn_platform_thermal_send_state {
     int32_t pending_status = k_platform_thermal_absent;
@@ -42,9 +47,26 @@ struct rn_platform_thermal_send_decision {
  *  Pure, so a host build and the test can drive it without Android. */
 int32_t rn_map_platform_thermal_status(int32_t athermal_status);
 
+/** The last finite headroom read and when it was taken (read_us 0 = never). */
+struct rn_platform_thermal_headroom_state {
+    float value = std::numeric_limits<float>::quiet_NaN();
+    int64_t read_us = 0;
+};
+
+/** The headroom to forward at now_us for one read. A finite read (>= 0) is
+ *  taken as is and remembered. A NaN or negative read yields the remembered
+ *  value for at most k_platform_thermal_carry_us, then NaN. */
+float rn_platform_thermal_headroom_forward(int64_t now_us, float read,
+                                           rn_platform_thermal_headroom_state & state);
+
+/** The remembered headroom while it is within the carry window, else NaN. */
+float rn_platform_thermal_headroom_carried(int64_t now_us,
+                                           const rn_platform_thermal_headroom_state & state);
+
 /** Reads Android's thermal status through the API 30 NDK interface when
- *  available. The manager is acquired once per object. Off Android, status()
- *  reports absent so this translation unit remains portable. */
+ *  available, and the headroom through API 31 when that symbol exists. The
+ *  manager is acquired once per object. Off Android, status() reports absent
+ *  and headroom() reports NaN, so this translation unit remains portable. */
 class rn_platform_thermal {
 public:
     rn_platform_thermal();
@@ -61,6 +83,12 @@ public:
     int32_t status() const;
     const char * unavailable_reason() const;
 
+    /** The forecast headroom on the engine's scale (1.0 = SEVERE), or NaN when
+     *  the read is unavailable. */
+    float headroom() const;
+    /** Why headroom() is always NaN, or nullptr when it can answer. */
+    const char * headroom_unavailable_reason() const;
+
 private:
 #if defined(__ANDROID__)
     // An AThermalManager handle, opaque on both sides of the .cpp boundary;
@@ -69,8 +97,9 @@ private:
 #endif
 };
 
-/** Advances last_read_us and returns true only when a native read is due. */
-bool rn_platform_thermal_should_read(int64_t now_us, int64_t & last_read_us);
+/** Advances last_read_us and returns true only when a read is due, i.e. at
+ *  least interval_us after the last one. */
+bool rn_platform_thermal_should_read(int64_t now_us, int64_t & last_read_us, int64_t interval_us);
 
 /** Pure send decision. Escalations to status >= 2 need five seconds of
  *  consecutive reads at or above the pending level; lower statuses apply

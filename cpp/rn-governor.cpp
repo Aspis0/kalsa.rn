@@ -115,7 +115,11 @@ int32_t rn_governor::decode(llama_batch batch) {
     // place every step of every governor path passes through.
     refresh_platform_thermal();
 
-    const int32_t result = llama_governor_decode(governor_, batch);
+    int32_t result = 0;
+    {
+        std::lock_guard<std::mutex> lock(engine_mutex_);
+        result = llama_governor_decode(governor_, batch);
+    }
     if (governor_decode_failed(result, governor_->is_failed())) {
         failed_ = true;
         const char * reason = governor_->failure_reason();
@@ -129,7 +133,11 @@ int32_t rn_governor::decode(llama_batch batch) {
 }
 
 bool rn_governor::trim_sequence(llama_pos p) const {
-    return governor_ != nullptr && llama_governor_trim_sequence(governor_, p);
+    if (governor_ == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(engine_mutex_);
+    return llama_governor_trim_sequence(governor_, p);
 }
 
 bool rn_governor::engine_failed() const {
@@ -138,7 +146,9 @@ bool rn_governor::engine_failed() const {
 
 void rn_governor::clear_cache(bool clear_data) {
     // The engine restarts its hop clock here (llama-governor-runtime.cpp
-    // clear_cache); keep the mirror in step.
+    // clear_cache); keep the mirror in step. Both happen under engine_mutex_,
+    // which before_decode_batch also holds for the mirror it advances.
+    std::lock_guard<std::mutex> lock(engine_mutex_);
     decode_tokens_since_prefill_ = 0;
     llama_governor_clear_cache(governor_, clear_data);
 }
@@ -146,6 +156,7 @@ void rn_governor::clear_cache(bool clear_data) {
 void rn_governor::reset_prefill_stats() {
     // The engine restarts its hop clock here too (the completion's
     // beginCompletion is one caller); keep the mirror in step.
+    std::lock_guard<std::mutex> lock(engine_mutex_);
     decode_tokens_since_prefill_ = 0;
     llama_governor_reset_prefill_stats(governor_);
 }
@@ -154,6 +165,9 @@ void rn_governor::before_decode_batch(int n_tokens) {
     if (decode_legs_ == nullptr) {
         return;
     }
+    // The mirror is read and written here and reset by clear_cache from a JSI
+    // worker, so the whole step, the leg sample included, runs under the lock.
+    std::lock_guard<std::mutex> lock(engine_mutex_);
     // The engine's decode_tokens_since_prefill_ counts exactly these
     // standard-path batches (multi-token batches are prefills that restart
     // it; 1-token batches increment it after the run), and select_decode
@@ -207,7 +221,10 @@ bool rn_governor::set_thermo_profile(const llama_governor_thermo_profile & profi
     }
     const bool status_changed =
         merged.platform_thermal_status != thermo_profile_.platform_thermal_status;
-    profile_valid_ = llama_governor_set_thermo_profile(governor_, merged, ggml_time_us() / 1000);
+    {
+        std::lock_guard<std::mutex> engine_lock(engine_mutex_);
+        profile_valid_ = llama_governor_set_thermo_profile(governor_, merged, ggml_time_us() / 1000);
+    }
     if (profile_valid_) {
         thermo_profile_ = merged;
         // An app profile cancels a pending native escalation only when it
@@ -275,7 +292,12 @@ void rn_governor::refresh_platform_thermal() {
         updated.platform_thermal_status = status;
     }
     updated.platform_thermal_headroom = headroom;
-    if (!llama_governor_set_thermo_profile(governor_, updated, ggml_time_us() / 1000)) {
+    bool accepted = false;
+    {
+        std::lock_guard<std::mutex> engine_lock(engine_mutex_);
+        accepted = llama_governor_set_thermo_profile(governor_, updated, ggml_time_us() / 1000);
+    }
+    if (!accepted) {
         profile_valid_ = false;
         platform_thermal_send_state_ = {};
         if (!platform_refusal_logged_) {
@@ -305,6 +327,7 @@ bool rn_governor::set_prefill_override(int mode) {
 
 llama_governor_stats rn_governor::stats() const {
     llama_governor_stats result{};
+    std::lock_guard<std::mutex> lock(engine_mutex_);
     llama_governor_get_stats(governor_, &result);
     return result;
 }

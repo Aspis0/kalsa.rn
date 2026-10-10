@@ -69,7 +69,8 @@ private:
     void init_hop_reader(const llama_governor_params & params);
     void log_platform_thermal_availability() const;
     // Samples the legs and hands the headroom to the engine; a no-op when
-    // there is no reader (decode_hop_tokens == 0).
+    // there is no reader (decode_hop_tokens == 0). Called only from
+    // before_decode_batch, which holds engine_mutex_.
     void feed_decode_headroom();
     // Reads status and headroom on their own intervals, then forwards a
     // changed status or headroom under profile_mutex_.
@@ -88,6 +89,13 @@ private:
     // setter (allowed to overlap decode) reads it from a pool worker.
     std::atomic<bool> failed_{false};
     mutable std::mutex profile_mutex_;
+    // Serializes the engine calls the threading contract forbids overlapping.
+    // decode, set_decode_headroom and the two KV/stat rewinds run on the
+    // completion thread; set_thermo_profile, clear_cache and stats run on JSI
+    // promise workers, where throwIfContextBusy is a check, not a lock. Lock
+    // order is profile_mutex_, then engine_mutex_, everywhere; nothing takes
+    // profile_mutex_ while holding engine_mutex_.
+    mutable std::mutex engine_mutex_;
     bool profile_valid_ = false;
     // The last profile accepted by the engine.
     llama_governor_thermo_profile thermo_profile_;

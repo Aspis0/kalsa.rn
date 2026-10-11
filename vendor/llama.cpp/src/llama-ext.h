@@ -269,7 +269,7 @@ enum class llama_governor_generation {
     V73,
     V75,
     V79,
-    V81,           // Unqualified for GPU prefill: prefill_engine() admits only V73/V75/V79.
+    V81,           // GPU prefill fallback, owner decision 2026-10-11 (default plan: NPU lane wins when live; JS override and bench force outrank it).
 };
 
 enum class llama_governor_model_kind {

@@ -418,12 +418,18 @@ llama_governor_engine llama_governor_policy::prefill_engine(
     // measured: ALIVE #38: 8 Elite GPU prefill, G ttft 1434/1470 ms vs
     // C 16476/14412 ms (>=9.8x); decode 25.3/24.2 t/s >= C's.
     // V73 carries the owner's 2026-09-21 enablement decision, not a measurement.
-    // V81 stays out: unmeasured on Adreno 840, so gpu_fit and gpu_prefill_measured
-    // cannot open GPU until the owner flips this list after the oracle passes.
+    // V81 is owner decision 2026-10-11, on the V75 effect-size yardstick (lab cell
+    // qdc-oracle-onoff-41dc728f, REPORT.md addendum). The raw R2 verdict is still
+    // FAIL, as it is for V75. Here GPU is the fallback. In the default plan the
+    // NPU branch above wins whenever the NPU lane is live; the bench/JS override
+    // above outranks both. FAST, WARM and COOLMODE reach this branch only with no
+    // live NPU lane, so no live NPU is ever left for the GPU. The alternative
+    // there is CPU, the hottest prefill backend measured (S23 heat arms above).
     // The generation list is duplicated in the app; the form refactor should carry it once.
     if ((params_.generation == llama_governor_generation::V73 ||
          params_.generation == llama_governor_generation::V75 ||
-         params_.generation == llama_governor_generation::V79) &&
+         params_.generation == llama_governor_generation::V79 ||
+         params_.generation == llama_governor_generation::V81) &&
         params_.gpu_fit == llama_governor_fit::Fit && params_.gpu_prefill_measured) {
         return llama_governor_engine::GPU;
     }

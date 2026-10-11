@@ -251,6 +251,18 @@ export type NativeContextParams = {
         decode_headroom_tau_s?: number;
         /** COOLMODE decode duty in (0,1]; binding default 0.5; 1 = no pacing. */
         decode_coolmode_duty?: number;
+        /** Headroom (Android AThermal_getThermalHeadroom, 1.0 = SEVERE) where the
+         *  decode-pacing ramp leaves full speed; engine default 0.87. Refused
+         *  when not a non-negative finite number, or at/above the full line. */
+        decode_pacing_headroom_start?: number;
+        /** Headroom (1.0 = SEVERE) where the ramp reaches
+         *  decode_pacing_min_duty; engine default 0.97. Refused when not a
+         *  non-negative finite number, or at/below decode_pacing_headroom_start. */
+        decode_pacing_headroom_full?: number;
+        /** Decode-duty floor both pacing ramps bottom out at, in (0,1]; engine
+         *  default 0.35. 1 flattens both ramps, but status 2 and, in COOLMODE, an absent forecast
+         *  still pace at decode_coolmode_duty. Refused outside (0,1]. */
+        decode_pacing_min_duty?: number;
         thermo: GovernorThermoProfile;
     };
 };

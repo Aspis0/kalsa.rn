@@ -204,7 +204,7 @@ void rn_governor::clear_cache(bool clear_data) {
     // clock that no longer exists.
     std::lock_guard<std::mutex> lock(engine_mutex_);
     decode_tokens_since_prefill_ = 0;
-    reset_observation_record();
+    reset_observation_record_locked();
     llama_governor_clear_cache(governor_, clear_data);
 }
 
@@ -214,7 +214,7 @@ void rn_governor::reset_prefill_stats() {
     std::lock_guard<std::mutex> lock(engine_mutex_);
     decode_tokens_since_prefill_ = 0;
     // The record is per completion: this is its start.
-    reset_observation_record();
+    reset_observation_record_locked();
     llama_governor_reset_prefill_stats(governor_);
 }
 
@@ -298,6 +298,11 @@ void rn_governor::commit_window(int64_t step_end_ms) {
 }
 
 void rn_governor::reset_observation_record() {
+    std::lock_guard<std::mutex> lock(engine_mutex_);
+    reset_observation_record_locked();
+}
+
+void rn_governor::reset_observation_record_locked() {
     samples_.reset();
     pending_valid_ = false;
     pending_first_window_ = false;

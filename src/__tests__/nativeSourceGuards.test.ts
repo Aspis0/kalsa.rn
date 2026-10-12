@@ -132,6 +132,23 @@ test('every devices list in rn-llama.cpp is nullptr-terminated', () => {
   expect(sites.filter((site) => !site.terminated)).toEqual([])
 })
 
+test('bench path drops the observation record only, never engine state', () => {
+  // reset_prefill_stats resets engine routing (hop clock, route, legs,
+  // prefill stats), so the bench - which restarts its sequence per run -
+  // may drop the stage 0 record but must not touch the engine. Pin the
+  // whole bench function: exactly the two record resets, no engine reset
+  // name anywhere in it.
+  const bench = cpp('rn-completion.cpp').match(
+    /json llama_rn_context_completion::bench\(int pp, int tg, int pl, int nr\) {[\S\s]*?\n}\n/,
+  )![0]
+  expect(bench.match(/->reset_observation_record\(\)/g)?.length).toBe(2)
+  expect(bench).not.toContain('resetGovernorPrefillStats')
+  expect(bench).not.toContain('llama_governor_reset_prefill_stats')
+  // And the public record reset stays engine-free: the engine prefill-stats
+  // reset exists exactly once in rn-governor.cpp, inside reset_prefill_stats.
+  expect(cpp('rn-governor.cpp').split('llama_governor_reset_prefill_stats(').length - 1).toBe(1)
+})
+
 test('governor stats wire decode_tokens_gpu beside the cpu/npu counters', () => {
   // The KALSA_GOVERNOR GPU leg evidence is this property; a dropped or
   // relocated setProperty still passes tsc, so pin the adjacency on the wire.

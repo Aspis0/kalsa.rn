@@ -59,6 +59,12 @@ public:
     // under ONE engine_mutex_ hold, so both describe the same instant - the
     // JSI stats task reads them together.
     std::pair<llama_governor_stats, rn_governor_samples> stats_with_samples() const;
+    // Drops the stage 0 observation record and any staged boundary - the
+    // binding record only, no engine call: the bench path uses it where the
+    // completion start would use reset_prefill_stats, whose engine effects
+    // (hop clock, route, legs, prefill stats) must not reach the bench.
+    // Takes engine_mutex_.
+    void reset_observation_record();
 
     // The only sanctioned KV rewind under a governor (both contexts, both
     // watermarks); see llama_governor_trim_sequence. False only when even the
@@ -96,9 +102,8 @@ private:
     // stamp; called only after a 1-token decode step returned rc 0. Caller
     // holds engine_mutex_.
     void commit_window(int64_t step_end_ms);
-    // Completion start and cache clear: the record and any staged boundary
-    // restart together. Caller holds engine_mutex_.
-    void reset_observation_record();
+    // Drops the record and any staged boundary. Caller holds engine_mutex_.
+    void reset_observation_record_locked();
     // Reads status and headroom on their own intervals, then forwards a
     // changed status or headroom under profile_mutex_.
     void refresh_platform_thermal();

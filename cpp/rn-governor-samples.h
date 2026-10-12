@@ -16,8 +16,12 @@ namespace rnllama {
 struct rn_window_sample {
     // Tokens decoded since the last prefill when the window opened.
     uint32_t tokens = 0;
-    // The leg that ran the step before this window: 0 cpu, 1 gpu, 2 npu;
-    // -1 none (the completion's first window has no predecessor in it).
+    // The leg that ran the step before this window: 0 cpu, 1 gpu, 2 npu, and
+    // 3 as the explicit gpu-coolmode marker (the engine books those decode
+    // tokens under decode_tokens_cpu, so a 3 tells the replay to exclude the
+    // window from Stage 0 learning rather than mix a coolmode GPU step into
+    // the cpu/gpu fits); -1 none (the completion's first window has no
+    // predecessor in it).
     int8_t leg_prev = -1;
     // The platform forecast and platform status at the window boundary, with
     // the ages of their last reads.

@@ -148,3 +148,64 @@ test('governor stats wire decode_us_* adjacency', () => {
     /result\.setProperty\(rt, "decode_us_cpu"[^\n]*\n[^\n]*"decode_us_npu"[^\n]*\n[^\n]*"decode_us_gpu"/,
   )
 })
+
+// Body of one member function of rn-governor.cpp (its closing brace is the
+// first at column 0).
+const governorFn = (signature: RegExp): string =>
+  cpp('rn-governor.cpp').match(new RegExp(signature.source + /[^\n]*[\S\s]*?\n}\n/.source))![0]
+
+test('window observation stays fresh on unchanged forecasts', () => {
+  // A stable forecast is re-read every 2 s; the observation stamp must move
+  // on every finite read even when the unchanged-value early return skips
+  // the engine update, or the logged age grows without bound (hostile audit
+  // item 1). Pin the store ahead of that early return, inside the read.
+  const refresh = governorFn(/void rn_governor::refresh_platform_thermal\(\)/)
+  const read = refresh.indexOf('if (headroom_due)')
+  const stamp = refresh.indexOf('observed_headroom_read_us_.store')
+  const earlyReturn = refresh.indexOf('if (!decision.send && !headroom_changed)')
+  expect(read).toBeGreaterThan(-1)
+  expect(stamp).toBeGreaterThan(read)
+  expect(earlyReturn).toBeGreaterThan(stamp)
+})
+
+test('KALSA_GOVERNOR_BATTERY_SYSFS line parses as JSON', () => {
+  // The campaign parser JSON.parses the payload verbatim and silently drops
+  // what does not parse (telemetryParse.mjs), so the emitted line must be
+  // strict JSON: quoted keys, numeric values. Rebuild the payload from the
+  // LOG_INFO format string (adjacent C++ literals joined) and parse it here.
+  const fn = cpp('rn-governor.cpp').match(/void rn_governor::log_battery_sysfs[\S\s]*?\n}\n/)
+  expect(fn).not.toBeNull()
+  const format = fn![0]
+    .match(/"((?:[^"\\]|\\.)*)"/g)!
+    .map((literal) => literal.slice(1, -1))
+    .join('')
+  const tag = 'KALSA_GOVERNOR_BATTERY_SYSFS '
+  const payload = format
+    .slice(format.indexOf(tag) + tag.length)
+    .replace(/\\"/g, '"')
+    .replace(/%d/g, '1')
+  expect(JSON.parse(payload)).toEqual({
+    temp_ok: 1,
+    temp_tenths_c: 1,
+    status_ok: 1,
+    status: 1,
+  })
+})
+
+test('decode-path observation hooks stay wired', () => {
+  // The host tests drive the record's own API, so nothing fails if the
+  // governor stops calling it. Pin the wiring: the window sample is recorded
+  // on the before_decode_batch path, the last-step stamp also lands AFTER
+  // the engine call inside decode (so first/last bound the steps' compute
+  // time, hostile audit item 5), and gpu-coolmode carries its own leg marker
+  // instead of reading as unknown (item 4).
+  const before = governorFn(/void rn_governor::before_decode_batch\(int n_tokens\)/)
+  expect(before).toContain('observe_window(now_ms, legs)')
+  const decode = governorFn(/int32_t rn_governor::decode\(llama_batch batch\)/)
+  expect(
+    decode.indexOf('llama_governor_decode(governor_, batch)'),
+  ).toBeLessThan(decode.indexOf('samples_.last_step'))
+  expect(cpp('rn-governor.cpp')).toMatch(
+    /case llama_governor_engine::GPU_COOLMODE:\n {12}return 3;/,
+  )
+})

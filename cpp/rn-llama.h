@@ -2,6 +2,7 @@
 #define RNLLAMA_H
 
 #include <sstream>
+#include <utility>
 #include <iostream>
 #include <mutex>
 #include <thread>
@@ -224,9 +225,10 @@ struct llama_rn_context {
     // Bench route dev hook: "cpu" | "gpu" | "auto" parsed by the JSI layer.
     bool setPrefillOverride(int mode);
     llama_governor_stats governorStats() const;
-    // Stage 0 observation: the governor's per-completion decode-hop record;
-    // an empty record without a governor.
-    rn_governor_samples governorSamples() const;
+    // Stage 0 observation: the governor's engine stats and per-completion
+    // observation record under one lock (one instant); empty record without
+    // a governor.
+    std::pair<llama_governor_stats, rn_governor_samples> governorStatsWithSamples() const;
     // Record the session degrade after a decode failure attributed to a
     // batch the HTP device ran (htp_runtime_failure) with the lane
     // engaged: the fallback reason (stats/KALSA_GOVERNOR) and the

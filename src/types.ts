@@ -362,13 +362,16 @@ export type GovernorStats = {
    *  null = leg without usable zones. */
   decode_zone_trips: Array<number | null>
   /** Stage 0 observation. One row per decode-hop window (oldest first), the
-   *  struct order of rn_window_sample: [tokens, leg_prev (0 cpu, 1 gpu,
-   *  2 npu), headroom, headroom_age_ms, status, status_age_ms, app_age_ms,
-   *  cpu_hot_c, npu_hot_c, gpu_hot_c, applied_headroom, applied_status,
-   *  duty_last]. applied_* are the forecast and status the engine applied
-   *  for the step whose realized duty is duty_last. The ages are
-   *  APPROXIMATE: each stamp updates independently, so one row can mix
-   *  generations - never treat an age as exact. */
+   *  struct order of rn_window_sample: [tokens, leg_prev, headroom,
+   *  headroom_age_ms, status, status_age_ms, app_age_ms, cpu_hot_c, npu_hot_c,
+   *  gpu_hot_c, applied_headroom, applied_status, duty_last]. leg_prev codes
+   *  the leg of the previous step: 0 cpu, 1 gpu, 2 npu, and 3 as the explicit
+   *  gpu-coolmode marker (the engine books those tokens under
+   *  decode_tokens_cpu; exclude leg 3 rows from Stage 0 learning), null none.
+   *  applied_* are the forecast and status the engine applied for the step
+   *  whose realized duty is duty_last. The ages are APPROXIMATE: each stamp
+   *  updates independently, so one row can mix generations - never treat an
+   *  age as exact. */
   decode_window_samples: Array<Array<number | null>>
   /** True when a completion outgrew the 256-sample ring (later windows
    *  dropped). */

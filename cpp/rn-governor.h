@@ -13,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 
 namespace rnllama {
 
@@ -53,10 +54,11 @@ public:
     // Bench route dev hook: 0=auto, 1=cpu, 2=gpu (engine validates).
     bool set_prefill_override(int mode);
     llama_governor_stats stats() const;
-    // Stage 0 observation: a copy of the per-completion decode-hop record
-    // (stamps, first sample, battery probe, window ring, trips), taken under
-    // engine_mutex_ like stats().
-    rn_governor_samples samples() const;
+    // Stage 0 observation: the engine stats and the per-completion decode-hop
+    // record (stamps, first sample, battery probe, window ring, trips) copied
+    // under ONE engine_mutex_ hold, so both describe the same instant - the
+    // JSI stats task reads them together.
+    std::pair<llama_governor_stats, rn_governor_samples> stats_with_samples() const;
 
     // The only sanctioned KV rewind under a governor (both contexts, both
     // watermarks); see llama_governor_trim_sequence. False only when even the

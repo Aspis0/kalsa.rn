@@ -950,10 +950,10 @@ namespace rnllama_jsi {
                 return createPromiseTask(runtime, callInvoker,
                     [contextId]() -> PromiseResultGenerator {
                         auto ctx = getContextOrThrow(contextId);
-                        const auto stats = ctx->governorStats();
-                        // Stage 0: read beside governorStats, in the same
-                        // task, so both copies see one completion boundary.
-                        const auto samples = ctx->governorSamples();
+                        // Stage 0: engine stats and the observation record
+                        // come from ONE locked copy, so both describe the
+                        // same instant even while a completion decodes.
+                        const auto recorded = ctx->governorStatsWithSamples();
                         const auto failure = ctx->governorFailureReason();
                         const bool active = ctx->hasGovernor();
                         // Mutex-guarded copies: the load thread sets the
@@ -970,7 +970,8 @@ namespace rnllama_jsi {
                         const std::string kvTypeK = ctx->governorKvTypeK();
                         const std::string kvTypeV = ctx->governorKvTypeV();
                         const std::string kvPlacement = ctx->governorKvPlacement();
-                        return [stats, samples, failure, active, hasNpuDevice, npuDevice,
+                        return [stats = recorded.first, samples = recorded.second,
+                                failure, active, hasNpuDevice, npuDevice,
                                 hasNpuFallback, npuFallback, kvTypeK, kvTypeV,
                                 kvPlacement](jsi::Runtime& rt) {
                             jsi::Object result(rt);

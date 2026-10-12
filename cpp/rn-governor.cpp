@@ -17,7 +17,11 @@ int32_t age_ms(int64_t now_ms, int64_t stamp_us) {
     return stamp_us == 0 ? -1 : static_cast<int32_t>(now_ms - stamp_us / 1000);
 }
 
-// The leg that ran the last step, in the wire's coding (0 cpu 1 gpu 2 npu).
+// The leg that ran the last step, in the wire's coding: 0 cpu, 1 gpu, 2 npu,
+// and 3 as the explicit gpu-coolmode marker - the engine books those decode
+// tokens under decode_tokens_cpu (kalsallama llama-governor.cpp), so a 3 tells
+// the replay to exclude the window from Stage 0 learning instead of silently
+// mixing a coolmode GPU step into the CPU or GPU fits.
 int8_t observed_leg(llama_governor_engine engine) {
     switch (engine) {
         case llama_governor_engine::CPU:
@@ -27,7 +31,7 @@ int8_t observed_leg(llama_governor_engine engine) {
         case llama_governor_engine::NPU:
             return 2;
         case llama_governor_engine::GPU_COOLMODE:
-            return -1;
+            return 3;
     }
     return -1;
 }
@@ -104,7 +108,10 @@ void rn_governor::init_hop_reader(const llama_governor_params & params) {
 
 void rn_governor::log_battery_sysfs() const {
     const rn_battery_sysfs probe = rn_battery_sysfs_read(k_battery_sysfs_root);
-    LOG_INFO("KALSA_GOVERNOR_BATTERY_SYSFS {temp_ok:%d, temp_tenths_c:%d, status_ok:%d, status:%d}",
+    // Strict JSON: the campaign parser JSON.parses the payload verbatim
+    // (telemetryParse.mjs) and silently drops what does not parse.
+    LOG_INFO("KALSA_GOVERNOR_BATTERY_SYSFS "
+             "{\"temp_ok\":%d, \"temp_tenths_c\":%d, \"status_ok\":%d, \"status\":%d}",
              probe.temp_ok ? 1 : 0, probe.temp_tenths_c, probe.status_ok ? 1 : 0,
              probe.status);
 }
@@ -156,6 +163,13 @@ int32_t rn_governor::decode(llama_batch batch) {
     {
         std::lock_guard<std::mutex> lock(engine_mutex_);
         result = llama_governor_decode(governor_, batch);
+        // Observation stamp AFTER the step ran: before_decode_batch stamps
+        // ahead of it, so without this the recorded last step would exclude
+        // the step's own compute time. rc 0 is the one outcome where the
+        // single-token step actually ran (-2 is flow control: no step).
+        if (decode_legs_ != nullptr && batch.n_tokens == 1 && result == 0) {
+            samples_.last_step(ggml_time_us() / 1000);
+        }
     }
     if (governor_decode_failed(result, governor_->is_failed())) {
         failed_ = true;
@@ -184,9 +198,13 @@ bool rn_governor::engine_failed() const {
 void rn_governor::clear_cache(bool clear_data) {
     // The engine restarts its hop clock here (llama-governor-runtime.cpp
     // clear_cache); keep the mirror in step. Both happen under engine_mutex_,
-    // which before_decode_batch also holds for the mirror it advances.
+    // which before_decode_batch also holds for the mirror it advances. The
+    // observation record restarts with it: the mirror's next 0 opens a first
+    // window again, and a ring from before the clear would answer for a hop
+    // clock that no longer exists.
     std::lock_guard<std::mutex> lock(engine_mutex_);
     decode_tokens_since_prefill_ = 0;
+    samples_.reset();
     llama_governor_clear_cache(governor_, clear_data);
 }
 
@@ -361,6 +379,17 @@ void rn_governor::refresh_platform_thermal() {
     if (headroom_due) {
         headroom = rn_platform_thermal_headroom_forward(ggml_time_us(), headroom_read,
                                                         platform_headroom_state_);
+        // Freshness is a property of the read, not of a change: a stable
+        // forecast is re-read every 2 s, and the early return below must not
+        // make it look ever staler on the observation wire. The value follows
+        // what the engine would see (NaN once the carry expires); the stamp
+        // advances only on a finite read, which is exactly when
+        // rn_platform_thermal_headroom_forward refreshes read_us.
+        observed_headroom_.store(headroom, std::memory_order_relaxed);
+        if (std::isfinite(headroom)) {
+            observed_headroom_read_us_.store(platform_headroom_state_.read_us,
+                                             std::memory_order_relaxed);
+        }
     }
     // NaN is a value here too: two unknowns are the same headroom.
     const bool headroom_changed = std::isnan(headroom) ? !std::isnan(previous_headroom)
@@ -388,10 +417,6 @@ void rn_governor::refresh_platform_thermal() {
         return;
     }
     thermo_profile_ = updated;
-    // The accepted native profile is what the engine applies from here; the
-    // forecast stamp is the read it came from.
-    observed_headroom_.store(headroom, std::memory_order_relaxed);
-    observed_headroom_read_us_.store(platform_headroom_state_.read_us, std::memory_order_relaxed);
     if (decision.send) {
         LOG_INFO("KALSA_GOVERNOR_PLATFORM {status:%d, prev:%d, source:\"native\", sent:1}",
                  status, previous);
@@ -417,9 +442,14 @@ llama_governor_stats rn_governor::stats() const {
     return result;
 }
 
-rn_governor_samples rn_governor::samples() const {
+std::pair<llama_governor_stats, rn_governor_samples> rn_governor::stats_with_samples() const {
+    // One engine_mutex_ hold for both copies: taking stats() and samples()
+    // separately lets a decode step land between them, pairing one
+    // completion's stats with the next one's record.
     std::lock_guard<std::mutex> lock(engine_mutex_);
-    return samples_;
+    llama_governor_stats stats{};
+    llama_governor_get_stats(governor_, &stats);
+    return {stats, samples_};
 }
 
 } // namespace rnllama

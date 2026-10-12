@@ -7,10 +7,12 @@
 
 #include "rn-battery-sysfs.h"
 
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace rnllama;
@@ -101,6 +103,33 @@ bool test_garbage_temp() {
     return ok;
 }
 
+// Trailing junk after the integer is a malformed read ("301junk" must not
+// answer 301), while whitespace around it is the kernel's own formatting.
+bool test_temp_trailing_junk() {
+    const std::vector<std::pair<std::string, bool>> cases = {
+        {"301junk", false}, {"301 trailing", false}, {"-", false},
+        {" 301 \t", true}, {"-5", true},
+    };
+    for (const auto & temp_case : cases) {
+        const auto root = make_temp_root("kalsa_battery_sysfs_junk");
+        write_file(root / "battery" / "temp", temp_case.first);
+        const rn_battery_sysfs probe = rn_battery_sysfs_read(root.string());
+        // -5 is a real (if cold) read; the expected value is the line's
+        // integer whenever the line is well-formed.
+        const int32_t expected = temp_case.second
+            ? static_cast<int32_t>(std::strtol(temp_case.first.c_str(), nullptr, 10))
+            : -1;
+        if (probe.temp_ok != temp_case.second || probe.temp_tenths_c != expected) {
+            std::cerr << "temp '" << temp_case.first << "' ok=" << probe.temp_ok
+                      << " value=" << probe.temp_tenths_c << std::endl;
+            std::filesystem::remove_all(root);
+            return false;
+        }
+        std::filesystem::remove_all(root);
+    }
+    return true;
+}
+
 // A missing status file reads status_ok=false, status=0; a present temp
 // still reads.
 bool test_missing_status() {
@@ -131,6 +160,7 @@ int main() {
     results.run_test("both files present: temp + status ladder read", test_both_files_present());
     results.run_test("status text ladder, unknown string reads 0", test_status_ladder());
     results.run_test("garbage temp reads temp_ok=false", test_garbage_temp());
+    results.run_test("temp trailing junk rejected, whitespace fine", test_temp_trailing_junk());
     results.run_test("missing status reads status_ok=false", test_missing_status());
     results.run_test("absent root reads all-unknown, no throw", test_root_absent());
     results.print_summary();

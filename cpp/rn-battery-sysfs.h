@@ -1,7 +1,10 @@
 #pragma once
 
+#include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <string>
 
 namespace rnllama {
@@ -21,6 +24,35 @@ struct rn_battery_sysfs {
     int8_t status = 0;
 };
 
+// The temp file holds one integer line. "301junk" is a malformed read, not
+// 301: after the optional sign and digits only whitespace may follow, and
+// the value must fit int32 (strtol saturates without failing on its own).
+inline bool parse_battery_temp_line(const std::string & line, int32_t * out) {
+    const std::size_t begin = line.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos) {
+        return false;
+    }
+    const std::size_t end = line.find_last_not_of(" \t\r\n");
+    for (std::size_t i = begin; i <= end; ++i) {
+        const char c = line[i];
+        const bool digit = c >= '0' && c <= '9';
+        const bool sign = (c == '-' || c == '+') && i == begin && end > begin;
+        if (!digit && !sign) {
+            return false;
+        }
+    }
+    errno = 0;
+    char * stop = nullptr;
+    const long value = std::strtol(line.c_str() + begin, &stop, 10);
+    if (errno == ERANGE || stop != line.c_str() + end + 1 ||
+        value < std::numeric_limits<int32_t>::min() ||
+        value > std::numeric_limits<int32_t>::max()) {
+        return false;
+    }
+    *out = static_cast<int32_t>(value);
+    return true;
+}
+
 /** Reads <root>/battery/temp (integer, tenths of C on Qualcomm Android) and
  *  <root>/battery/status ("Charging" 1, "Discharging" 2, "Not charging" 3,
  *  "Full" 4, anything else 0). A missing or non-numeric temp reads
@@ -30,9 +62,9 @@ inline rn_battery_sysfs rn_battery_sysfs_read(const std::string & root) {
     rn_battery_sysfs probe;
     const auto read_temp = [&probe](const std::string & path) {
         std::ifstream in(path);
-        long value = 0;
-        if (in.is_open() && (in >> value)) {
-            probe.temp_tenths_c = static_cast<int32_t>(value);
+        std::string line;
+        if (in.is_open() && std::getline(in, line) &&
+            parse_battery_temp_line(line, &probe.temp_tenths_c)) {
             probe.temp_ok = true;
         }
     };

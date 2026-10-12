@@ -64,11 +64,19 @@ inline rn_battery_sysfs rn_battery_sysfs_read(const std::string & root) {
     const auto read_temp = [&probe](const std::string & path) {
         std::ifstream in(path);
         std::string line;
+        if (!in.is_open() || !std::getline(in, line)) {
+            return;
+        }
+        // A sysfs node holds one value: any non-blank line past the first
+        // ("301\n\njunk" included) means this is not the kernel node we take
+        // it for, even when the first line parses.
         std::string extra;
-        if (in.is_open() && std::getline(in, line) &&
-            !(std::getline(in, extra) &&
-              extra.find_first_not_of(" \t\r\n") != std::string::npos) &&
-            parse_battery_temp_line(line, &probe.temp_tenths_c)) {
+        while (std::getline(in, extra)) {
+            if (extra.find_first_not_of(" \t\r\n") != std::string::npos) {
+                return;
+            }
+        }
+        if (parse_battery_temp_line(line, &probe.temp_tenths_c)) {
             probe.temp_ok = true;
         }
     };

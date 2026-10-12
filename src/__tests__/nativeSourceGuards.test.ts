@@ -210,8 +210,21 @@ test('decode-path observation hooks stay wired', () => {
     'samples_.last_step(',
   ]
   expect(recordMutators.filter((mutator) => before.includes(mutator))).toEqual([])
+  const governorCpp = cpp('rn-governor.cpp')
+  // Every record mutator call exists EXACTLY ONCE in rn-governor.cpp - the
+  // class definitions in rn-governor-samples.h aside, commit_window owns
+  // these three and reset_observation_record owns the reset - so no second
+  // site can grow beside them.
+  const mutatorCalls = [...recordMutators, 'samples_.reset(']
+  expect(
+    mutatorCalls.filter((mutator) => governorCpp.split(mutator).length - 1 !== 1),
+  ).toEqual([])
   const decode = governorFn(/int32_t rn_governor::decode\(llama_batch batch\)/)
-  expect(decode.indexOf('result == 0')).toBeLessThan(decode.indexOf('commit_window('))
+  // The commit is the whole body of the rc-0 branch - nothing commits when
+  // the step did not run.
+  expect(decode).toMatch(
+    /if \(decode_legs_ != nullptr && batch\.n_tokens == 1 && result == 0\) {\n {12}commit_window\(ggml_time_us\(\) \/ 1000\);\n {8}}/,
+  )
   const commit = governorFn(/void rn_governor::commit_window\(int64_t step_end_ms\)/)
   expect(recordMutators.filter((mutator) => !commit.includes(mutator))).toEqual([])
   const stage = governorFn(/void rn_governor::stage_window\(int64_t now_ms/)

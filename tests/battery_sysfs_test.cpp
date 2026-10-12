@@ -105,12 +105,14 @@ bool test_garbage_temp() {
 
 // Trailing junk after the integer is a malformed read ("301junk" must not
 // answer 301), while whitespace around it is the kernel's own formatting. A
-// sysfs node holds one value, so a second non-empty line rejects too; a bare
-// newline after the value ("301\n", the kernel's own format) accepts.
+// sysfs node holds one value, so any further non-blank line rejects - right
+// after the value ("301\nextra") or after blank lines ("301\n\njunk") - while
+// a bare newline after the value ("301\n", the kernel's own format) accepts.
 bool test_temp_trailing_junk() {
     const std::vector<std::pair<std::string, bool>> cases = {
         {"301junk", false}, {"301 trailing", false}, {"-", false},
-        {"301\nextra", false}, {"301\n", true}, {" 301 \t", true}, {"-5", true},
+        {"301\nextra", false}, {"301\n\njunk", false},
+        {"301\n", true}, {"301\n\n", true}, {" 301 \t", true}, {"-5", true},
     };
     for (const auto & temp_case : cases) {
         const auto root = make_temp_root("kalsa_battery_sysfs_junk");

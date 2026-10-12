@@ -2301,6 +2301,15 @@ json llama_rn_context_completion::bench(int pp, int tg, int pl, int nr) {
         return true;
     };
 
+    // Every bench run restarts the sequence from position 0, so the governor
+    // restarts with it - the same reset as completion start. Without it, a
+    // boundary staged by an earlier (failed) run would commit onto this one,
+    // and the binding hop mirror would stay ahead of the engine's counter
+    // after any decode that returned nonzero.
+    if (parent_ctx->governor) {
+        parent_ctx->resetGovernorPrefillStats();
+    }
+
     // warm up like the CLI benchmark
     llama_batch_clear(&batch);
     const int warmup_tokens = std::min(16, n_kv_max);
@@ -2335,6 +2344,10 @@ json llama_rn_context_completion::bench(int pp, int tg, int pl, int nr) {
         }
 
         llama_memory_clear(mem, false);
+        // Fresh sequence, fresh hop clock and observation record.
+        if (parent_ctx->governor) {
+            parent_ctx->resetGovernorPrefillStats();
+        }
 
         const auto t_pp_start = ggml_time_us();
         if (!decode_helper(batch, n_batch, false)) {

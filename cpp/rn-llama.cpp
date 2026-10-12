@@ -1391,6 +1391,10 @@ llama_governor_stats llama_rn_context::governorStats() const {
     return governor == nullptr ? llama_governor_stats{} : governor->stats();
 }
 
+rn_governor_samples llama_rn_context::governorSamples() const {
+    return governor == nullptr ? rn_governor_samples{} : governor->samples();
+}
+
 bool llama_rn_context::loadModel(
     common_params &params_,
     const llama_governor_params * governor_params,

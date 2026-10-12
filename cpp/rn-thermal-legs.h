@@ -35,7 +35,22 @@ public:
         // The GPU decode leg; NaN on a device without gpu zones (the hop's
         // availability input, not an error).
         float gpu_headroom_c = std::numeric_limits<float>::quiet_NaN();
+        // The hottest zone temp per leg (max over the zones, unlike the
+        // headroom's min), read in the same sample() loop; NaN under the
+        // same rule - no usable zone, or one zone of the leg went dark.
+        float cpu_hot_c = std::numeric_limits<float>::quiet_NaN();
+        float npu_hot_c = std::numeric_limits<float>::quiet_NaN();
+        float gpu_hot_c = std::numeric_limits<float>::quiet_NaN();
     };
+
+    // The passive-trip spread of one leg, in C; NaN when the leg has no
+    // usable zone.
+    struct trip_range {
+        float min_c = std::numeric_limits<float>::quiet_NaN();
+        float max_c = std::numeric_limits<float>::quiet_NaN();
+    };
+
+    enum class leg { cpu, npu, gpu };
 
     explicit rn_thermal_legs(const std::string & sysfs_root);
 
@@ -44,6 +59,10 @@ public:
     // leg unknown - the min over the survivors would hide exactly the
     // hottest block. Never throws.
     headroom sample() const;
+
+    // Passive trip in C (milli-C / 1000, like the zone headroom), min and
+    // max over the leg's zones; NaN for an empty leg.
+    trip_range trip_range_c(leg which) const;
 
     int cpu_zone_count() const { return static_cast<int>(cpu_zones_.size()); }
     int npu_zone_count() const { return static_cast<int>(npu_zones_.size()); }

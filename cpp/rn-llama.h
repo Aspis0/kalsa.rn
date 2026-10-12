@@ -25,6 +25,7 @@
 using json = nlohmann::ordered_json;
 
 #include "rn-governor-params.h"
+#include "rn-governor-samples.h"
 
 namespace kalsa { class MoeStream; }
 
@@ -223,6 +224,9 @@ struct llama_rn_context {
     // Bench route dev hook: "cpu" | "gpu" | "auto" parsed by the JSI layer.
     bool setPrefillOverride(int mode);
     llama_governor_stats governorStats() const;
+    // Stage 0 observation: the governor's per-completion decode-hop record;
+    // an empty record without a governor.
+    rn_governor_samples governorSamples() const;
     // Record the session degrade after a decode failure attributed to a
     // batch the HTP device ran (htp_runtime_failure) with the lane
     // engaged: the fallback reason (stats/KALSA_GOVERNOR) and the

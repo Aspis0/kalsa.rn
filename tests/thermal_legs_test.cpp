@@ -233,6 +233,54 @@ bool test_dark_gpu_zone() {
     return ok;
 }
 
+// The hot temp is the MAX over the leg's zones, read in the same loop as the
+// headroom (one temp read per zone): S23 CPU zones 50.0/60.0 -> 60.0, NPU
+// 88.0 -> 88.0, GPU 70.0 -> 70.0.
+bool test_hot_is_max_over_the_leg() {
+    const auto root = make_s23_tree();
+    const rn_thermal_legs legs(root.string());
+    const auto reading = legs.sample();
+    const bool ok = close_to(reading.cpu_hot_c, 60.0f) && close_to(reading.npu_hot_c, 88.0f) &&
+        close_to(reading.gpu_hot_c, 70.0f) && close_to(reading.cpu_headroom_c, 55.0f);
+    std::filesystem::remove_all(root);
+    return ok;
+}
+
+// One dark zone makes BOTH fields of the leg unknown: a hot temp over the
+// survivors would flatter the leg the same way a survivor-min headroom would.
+bool test_dark_zone_nans_hot_and_headroom() {
+    const auto root = make_s23_tree();
+    const rn_thermal_legs legs(root.string());
+    std::error_code ec;
+    std::filesystem::remove(root / "thermal_zone0" / "temp", ec);
+    if (ec) { return false; }
+    const auto reading = legs.sample();
+    const bool ok = is_unknown(reading.cpu_headroom_c) && is_unknown(reading.cpu_hot_c) &&
+        close_to(reading.npu_hot_c, 88.0f) && close_to(reading.gpu_hot_c, 70.0f);
+    std::filesystem::remove_all(root);
+    return ok;
+}
+
+// The passive-trip range per leg in C: min and max over the leg's zones
+// (S23 CPU 108/115, NPU 95, GPU 110), and an empty leg reads NaN.
+bool test_trip_range() {
+    const auto root = make_s23_tree();
+    const rn_thermal_legs legs(root.string());
+    const auto cpu = legs.trip_range_c(rn_thermal_legs::leg::cpu);
+    const auto npu = legs.trip_range_c(rn_thermal_legs::leg::npu);
+    const auto gpu = legs.trip_range_c(rn_thermal_legs::leg::gpu);
+    const bool s23 = close_to(cpu.min_c, 108.0f) && close_to(cpu.max_c, 115.0f) &&
+        close_to(npu.min_c, 95.0f) && close_to(npu.max_c, 95.0f) &&
+        close_to(gpu.min_c, 110.0f) && close_to(gpu.max_c, 110.0f);
+    const auto empty_root = make_temp_root("kalsa_thermal_legs_trip_empty");
+    const rn_thermal_legs empty(empty_root.string());
+    const auto none = empty.trip_range_c(rn_thermal_legs::leg::cpu);
+    const bool ok = s23 && is_unknown(none.min_c) && is_unknown(none.max_c);
+    std::filesystem::remove_all(root);
+    std::filesystem::remove_all(empty_root);
+    return ok;
+}
+
 } // namespace
 
 int main() {
@@ -245,6 +293,9 @@ int main() {
     results.run_test("invalid passive trip (-274000) ignored", test_invalid_passive_trip_ignored());
     results.run_test("GPU leg: gpuss zones, min decides, active-only dropped", test_gpu_leg_zones());
     results.run_test("dark GPU zone darkens only the GPU leg", test_dark_gpu_zone());
+    results.run_test("hot temp is max over the leg's zones", test_hot_is_max_over_the_leg());
+    results.run_test("dark zone NaNs hot and headroom together", test_dark_zone_nans_hot_and_headroom());
+    results.run_test("trip range: min/max in C, empty leg NaN", test_trip_range());
     results.print_summary();
     return (results.passed_tests == results.total_tests) ? 0 : 1;
 }

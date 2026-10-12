@@ -85,6 +85,24 @@ fi
 echo "✓ platform_thermal_test built successfully"
 
 echo ""
+echo "Building governor_samples_test..."
+make governor_samples_test -j4
+if [ ! -f "governor_samples_test" ]; then
+    echo "Error: Failed to build governor_samples_test"
+    exit 1
+fi
+echo "✓ governor_samples_test built successfully"
+
+echo ""
+echo "Building battery_sysfs_test..."
+make battery_sysfs_test -j4
+if [ ! -f "battery_sysfs_test" ]; then
+    echo "Error: Failed to build battery_sysfs_test"
+    exit 1
+fi
+echo "✓ battery_sysfs_test built successfully"
+
+echo ""
 echo "=== Build Successful ==="
 echo ""
 echo "Built executables:"
@@ -95,6 +113,8 @@ echo "  - governor_params_test (governor thermo parse tests)"
 echo "  - governor_v3_precedence_test (decode rule v3 precedence tests)"
 echo "  - legs_table_test (one-copy capability table tests)"
 echo "  - platform_thermal_test (mid-turn platform thermal status tests)"
+echo "  - governor_samples_test (Stage 0 observation record tests)"
+echo "  - battery_sysfs_test (Stage 0 battery sysfs probe tests)"
 echo ""
 echo "To run the tests:"
 echo "  cd tests/build"
@@ -105,7 +125,9 @@ echo "  ./governor_params_test    # Run governor thermo parse tests"
 echo "  ./governor_v3_precedence_test # Run decode rule v3 precedence tests"
 echo "  ./legs_table_test         # Run one-copy capability table tests"
 echo "  ./platform_thermal_test   # Run mid-turn platform thermal status tests"
+echo "  ./governor_samples_test   # Run Stage 0 observation record tests"
+echo "  ./battery_sysfs_test      # Run Stage 0 battery sysfs probe tests"
 echo ""
 echo "Or run all:"
-echo "  ./rnllama_tests && ./parallel_decoding_test && ./chat_parse_utf8_test && ./governor_params_test && ./governor_v3_precedence_test && ./legs_table_test && ./platform_thermal_test"
+echo "  ./rnllama_tests && ./parallel_decoding_test && ./chat_parse_utf8_test && ./governor_params_test && ./governor_v3_precedence_test && ./legs_table_test && ./platform_thermal_test && ./governor_samples_test && ./battery_sysfs_test"
 echo ""

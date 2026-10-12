@@ -58,6 +58,18 @@ if [ ! -f "platform_thermal_test" ]; then
     exit 1
 fi
 
+if [ ! -f "governor_samples_test" ]; then
+    echo "Error: governor_samples_test executable not found"
+    echo "Please run ./build_and_test.sh first"
+    exit 1
+fi
+
+if [ ! -f "battery_sysfs_test" ]; then
+    echo "Error: battery_sysfs_test executable not found"
+    echo "Please run ./build_and_test.sh first"
+    exit 1
+fi
+
 echo "Found all test executables"
 
 TESTS_PASSED=0
@@ -143,8 +155,32 @@ fi
 
 echo ""
 
+# Run Stage 0 governor observation record tests (host-only)
+echo "--- Running Governor Samples Tests ---"
+if ./governor_samples_test; then
+    echo "✓ Governor samples tests passed"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ Governor samples tests failed"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+echo ""
+
+# Run Stage 0 battery sysfs probe tests (host-only)
+echo "--- Running Battery Sysfs Tests ---"
+if ./battery_sysfs_test; then
+    echo "✓ Battery sysfs tests passed"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ Battery sysfs tests failed"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+echo ""
+
 # Run KV-cache-reuse tests (only if the GGUF models have been downloaded)
-TOTAL_SUITES=7
+TOTAL_SUITES=9
 if [ -f "kv_cache_reuse_test" ] && ls ../models/*.gguf >/dev/null 2>&1; then
     TOTAL_SUITES=8
     echo "--- Running KV-cache-reuse Tests ---"

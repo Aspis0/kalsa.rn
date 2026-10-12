@@ -68,6 +68,38 @@ static const char * governorThermalStateName(llama_governor_thermal_state state)
     return "Unknown";
 }
 
+// Stage 0 observation cells: NaN and the -1 codes cross as null - JSON has no
+// NaN, and -1 is "unknown" for every one of these cells.
+static jsi::Value governorFloatCell(jsi::Runtime& rt, float value) {
+    return std::isfinite(value) ? jsi::Value(static_cast<double>(value)) : jsi::Value::null();
+}
+
+static jsi::Value governorIntCell(jsi::Runtime& rt, int32_t value) {
+    return value >= 0 ? jsi::Value(static_cast<double>(value)) : jsi::Value::null();
+}
+
+// The 13 observation cells of one window sample, struct order (the column
+// order documented on src/types.ts decode_window_samples).
+static jsi::Array governorSampleCells(jsi::Runtime& rt, const rnllama::rn_window_sample& sample) {
+    jsi::Array cells(rt, 13);
+    cells.setValueAtIndex(rt, 0, static_cast<double>(sample.tokens));
+    cells.setValueAtIndex(rt, 1, governorIntCell(rt, sample.leg_prev));
+    cells.setValueAtIndex(rt, 2, governorFloatCell(rt, sample.headroom));
+    cells.setValueAtIndex(rt, 3, governorIntCell(rt, sample.headroom_age_ms));
+    cells.setValueAtIndex(rt, 4, governorIntCell(rt, sample.status));
+    cells.setValueAtIndex(rt, 5, governorIntCell(rt, sample.status_age_ms));
+    cells.setValueAtIndex(rt, 6, governorIntCell(rt, sample.app_age_ms));
+    cells.setValueAtIndex(rt, 7, governorFloatCell(rt, sample.cpu_hot_c));
+    cells.setValueAtIndex(rt, 8, governorFloatCell(rt, sample.npu_hot_c));
+    cells.setValueAtIndex(rt, 9, governorFloatCell(rt, sample.gpu_hot_c));
+    cells.setValueAtIndex(rt, 10, governorFloatCell(rt, sample.applied_headroom));
+    cells.setValueAtIndex(rt, 11, governorIntCell(rt, sample.applied_status));
+    // The duty lives in (0,1]; -1 codes "no step of this completion yet".
+    cells.setValueAtIndex(rt, 12, std::isfinite(sample.duty_last) && sample.duty_last > 0
+        ? jsi::Value(static_cast<double>(sample.duty_last)) : jsi::Value::null());
+    return cells;
+}
+
 // Consolidated logging function
 enum class LogLevel { LOG_DEBUG, LOG_INFO, LOG_ERROR };
 
@@ -919,6 +951,9 @@ namespace rnllama_jsi {
                     [contextId]() -> PromiseResultGenerator {
                         auto ctx = getContextOrThrow(contextId);
                         const auto stats = ctx->governorStats();
+                        // Stage 0: read beside governorStats, in the same
+                        // task, so both copies see one completion boundary.
+                        const auto samples = ctx->governorSamples();
                         const auto failure = ctx->governorFailureReason();
                         const bool active = ctx->hasGovernor();
                         // Mutex-guarded copies: the load thread sets the
@@ -935,7 +970,7 @@ namespace rnllama_jsi {
                         const std::string kvTypeK = ctx->governorKvTypeK();
                         const std::string kvTypeV = ctx->governorKvTypeV();
                         const std::string kvPlacement = ctx->governorKvPlacement();
-                        return [stats, failure, active, hasNpuDevice, npuDevice,
+                        return [stats, samples, failure, active, hasNpuDevice, npuDevice,
                                 hasNpuFallback, npuFallback, kvTypeK, kvTypeV,
                                 kvPlacement](jsi::Runtime& rt) {
                             jsi::Object result(rt);
@@ -979,6 +1014,40 @@ namespace rnllama_jsi {
                             result.setProperty(rt, "platform_thermal_status", (double) stats.platform_thermal_status);
                             result.setProperty(rt, "state_source",
                                 jsi::String::createFromUtf8(rt, stats.state_source));
+                            // Stage 0 observation (rn-governor-samples.h):
+                            // per-leg decode microseconds (as the engine
+                            // names them) and the per-completion record.
+                            result.setProperty(rt, "decode_us_cpu", (double) stats.decode_us_cpu);
+                            result.setProperty(rt, "decode_us_npu", (double) stats.decode_us_npu);
+                            result.setProperty(rt, "decode_us_gpu", (double) stats.decode_us_gpu);
+                            result.setProperty(rt, "decode_first_step_ms", (double) samples.first_step_ms());
+                            result.setProperty(rt, "decode_last_step_ms", (double) samples.last_step_ms());
+                            result.setProperty(rt, "decode_first_sample", governorSampleCells(rt, samples.first()));
+                            const rnllama::rn_battery_sysfs battery = samples.battery();
+                            jsi::Array battSysfs(rt, 4);
+                            battSysfs.setValueAtIndex(rt, 0, (double) (battery.temp_ok ? 1 : 0));
+                            battSysfs.setValueAtIndex(rt, 1, battery.temp_ok
+                                ? jsi::Value((double) battery.temp_tenths_c) : jsi::Value::null());
+                            battSysfs.setValueAtIndex(rt, 2, (double) (battery.status_ok ? 1 : 0));
+                            battSysfs.setValueAtIndex(rt, 3, battery.status_ok
+                                ? jsi::Value((double) battery.status) : jsi::Value::null());
+                            result.setProperty(rt, "decode_batt_sysfs", battSysfs);
+                            const rnllama::rn_leg_trips trips = samples.trips();
+                            jsi::Array zoneTrips(rt, 6);
+                            zoneTrips.setValueAtIndex(rt, 0, governorFloatCell(rt, trips.cpu_min_c));
+                            zoneTrips.setValueAtIndex(rt, 1, governorFloatCell(rt, trips.cpu_max_c));
+                            zoneTrips.setValueAtIndex(rt, 2, governorFloatCell(rt, trips.npu_min_c));
+                            zoneTrips.setValueAtIndex(rt, 3, governorFloatCell(rt, trips.npu_max_c));
+                            zoneTrips.setValueAtIndex(rt, 4, governorFloatCell(rt, trips.gpu_min_c));
+                            zoneTrips.setValueAtIndex(rt, 5, governorFloatCell(rt, trips.gpu_max_c));
+                            result.setProperty(rt, "decode_zone_trips", zoneTrips);
+                            const std::vector<rnllama::rn_window_sample> windowSamples = samples.samples();
+                            jsi::Array windows(rt, windowSamples.size());
+                            for (size_t w = 0; w < windowSamples.size(); ++w) {
+                                windows.setValueAtIndex(rt, w, governorSampleCells(rt, windowSamples[w]));
+                            }
+                            result.setProperty(rt, "decode_window_samples", windows);
+                            result.setProperty(rt, "decode_window_samples_overflow", samples.overflow());
                             result.setProperty(rt, "failure_reason", jsi::String::createFromUtf8(rt, failure));
                             // Plan fields for KALSA_GOVERNOR_PLAN: the resolved
                             // prefill device and the degrade reason (null when the lane is on).

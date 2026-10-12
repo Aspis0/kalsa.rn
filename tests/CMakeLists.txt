@@ -170,3 +170,22 @@ target_include_directories(platform_thermal_test PRIVATE ${RNLLAMA_INCLUDE_DIRS}
 if(UNIX AND NOT APPLE)
     target_link_libraries(platform_thermal_test PRIVATE m)
 endif()
+
+# Stage 0 observation record: the module is header-only (cpp/rn-governor-samples.h,
+# which the test TU includes directly), so like governor_params_test this is a
+# host-only fast target with no library TU. Drives ring order, the overflow
+# flag, reset, the first-step latch and the trips.
+add_executable(governor_samples_test governor_samples_test.cpp)
+target_include_directories(governor_samples_test PRIVATE ${RNLLAMA_INCLUDE_DIRS})
+if(UNIX AND NOT APPLE)
+    target_link_libraries(governor_samples_test PRIVATE m)
+endif()
+
+# Stage 0 battery sysfs probe: header-only module too (cpp/rn-battery-sysfs.h);
+# drives it on fake power_supply trees in a temp dir -- same shape as
+# thermal_legs_test above.
+add_executable(battery_sysfs_test battery_sysfs_test.cpp)
+target_include_directories(battery_sysfs_test PRIVATE ${RNLLAMA_INCLUDE_DIRS})
+if(UNIX AND NOT APPLE)
+    target_link_libraries(battery_sysfs_test PRIVATE m)
+endif()

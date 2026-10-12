@@ -100,21 +100,47 @@ rn_thermal_legs::rn_thermal_legs(const std::string & sysfs_root) {
 }
 
 rn_thermal_legs::headroom rn_thermal_legs::sample() const {
-    const auto leg_headroom = [](const std::vector<rn_thermal_zone> & zones) {
-        float best = std::numeric_limits<float>::quiet_NaN();
+    headroom reading;
+    const auto leg_sample = [](const std::vector<rn_thermal_zone> & zones, float * headroom_c,
+                               float * hot_c) {
         for (const auto & zone : zones) {
             long temp_mc = 0;
             if (!read_long(zone.temp_path, &temp_mc)) {
                 // One dark zone makes the whole leg unknown: the min over the
                 // survivors would hide exactly the hottest block.
-                return std::numeric_limits<float>::quiet_NaN();
+                return false;
             }
-            const float headroom_c = static_cast<float>(zone.passive_trip_mc - temp_mc) / 1000.0f;
-            best = std::isfinite(best) ? std::min(best, headroom_c) : headroom_c;
+            const float zone_headroom_c =
+                static_cast<float>(zone.passive_trip_mc - temp_mc) / 1000.0f;
+            const float zone_temp_c = static_cast<float>(temp_mc) / 1000.0f;
+            *headroom_c =
+                std::isfinite(*headroom_c) ? std::min(*headroom_c, zone_headroom_c) : zone_headroom_c;
+            *hot_c = std::isfinite(*hot_c) ? std::max(*hot_c, zone_temp_c) : zone_temp_c;
         }
-        return best;
+        return true;
     };
-    return {leg_headroom(cpu_zones_), leg_headroom(npu_zones_), leg_headroom(gpu_zones_)};
+    float * headrooms[3] = {&reading.cpu_headroom_c, &reading.npu_headroom_c, &reading.gpu_headroom_c};
+    float * hots[3] = {&reading.cpu_hot_c, &reading.npu_hot_c, &reading.gpu_hot_c};
+    const std::vector<rn_thermal_zone> * legs[3] = {&cpu_zones_, &npu_zones_, &gpu_zones_};
+    for (int i = 0; i < 3; ++i) {
+        if (!leg_sample(*legs[i], headrooms[i], hots[i])) {
+            *headrooms[i] = std::numeric_limits<float>::quiet_NaN();
+            *hots[i] = std::numeric_limits<float>::quiet_NaN();
+        }
+    }
+    return reading;
+}
+
+rn_thermal_legs::trip_range rn_thermal_legs::trip_range_c(leg which) const {
+    const std::vector<rn_thermal_zone> & zones =
+        which == leg::cpu ? cpu_zones_ : (which == leg::npu ? npu_zones_ : gpu_zones_);
+    trip_range range;
+    for (const auto & zone : zones) {
+        const float trip_c = static_cast<float>(zone.passive_trip_mc) / 1000.0f;
+        range.min_c = std::isfinite(range.min_c) ? std::min(range.min_c, trip_c) : trip_c;
+        range.max_c = std::isfinite(range.max_c) ? std::max(range.max_c, trip_c) : trip_c;
+    }
+    return range;
 }
 
 } // namespace rnllama

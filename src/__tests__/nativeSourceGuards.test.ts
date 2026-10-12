@@ -139,3 +139,12 @@ test('governor stats wire decode_tokens_gpu beside the cpu/npu counters', () => 
     /result\.setProperty\(rt, "decode_tokens_cpu"[^\n]*\n[^\n]*"decode_tokens_npu"[^\n]*\n[^\n]*"decode_tokens_gpu"/,
   )
 })
+
+test('governor stats wire decode_us_* adjacency', () => {
+  // Stage 0's per-leg decode time is the tok/s evidence (tok x 1e6 / us);
+  // pin the three fields' adjacency on the wire, same shape as the
+  // decode_tokens_* guard above.
+  expect(cpp('jsi/RNLlamaJSI.cpp')).toMatch(
+    /result\.setProperty\(rt, "decode_us_cpu"[^\n]*\n[^\n]*"decode_us_npu"[^\n]*\n[^\n]*"decode_us_gpu"/,
+  )
+})

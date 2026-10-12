@@ -10,6 +10,30 @@
 
 namespace rnllama {
 
+namespace {
+
+// Ages of the freshness stamps in ms; -1 when the stamp is 0 (never read).
+int32_t age_ms(int64_t now_ms, int64_t stamp_us) {
+    return stamp_us == 0 ? -1 : static_cast<int32_t>(now_ms - stamp_us / 1000);
+}
+
+// The leg that ran the last step, in the wire's coding (0 cpu 1 gpu 2 npu).
+int8_t observed_leg(llama_governor_engine engine) {
+    switch (engine) {
+        case llama_governor_engine::CPU:
+            return 0;
+        case llama_governor_engine::GPU:
+            return 1;
+        case llama_governor_engine::NPU:
+            return 2;
+        case llama_governor_engine::GPU_COOLMODE:
+            return -1;
+    }
+    return -1;
+}
+
+} // namespace
+
 rn_governor::rn_governor(llama_model * prefill_model, llama_model * decode_model,
                          llama_context_params prefill_params, llama_context_params decode_params,
                          const llama_governor_params & params)
@@ -26,6 +50,7 @@ rn_governor::rn_governor(llama_model * prefill_model, llama_model * decode_model
         throw std::runtime_error(failure_reason_);
     }
     log_platform_thermal_availability();
+    log_battery_sysfs();
     init_hop_reader(params);
 }
 
@@ -55,6 +80,7 @@ rn_governor::rn_governor(llama_model * model, const llama_governor_leg * legs, u
                 legs[i].engine == llama_governor_engine::NPU ? "NPU" : "GPU");
         }
     }
+    log_battery_sysfs();
     init_hop_reader(params);
 }
 
@@ -69,7 +95,18 @@ void rn_governor::init_hop_reader(const llama_governor_params & params) {
         LOG_INFO("governor: decode hop thermal legs cpu=%d npu=%d gpu=%d zones",
                  decode_legs_->cpu_zone_count(), decode_legs_->npu_zone_count(),
                  decode_legs_->gpu_zone_count());
+        const rn_thermal_legs::trip_range cpu = decode_legs_->trip_range_c(rn_thermal_legs::leg::cpu);
+        const rn_thermal_legs::trip_range npu = decode_legs_->trip_range_c(rn_thermal_legs::leg::npu);
+        const rn_thermal_legs::trip_range gpu = decode_legs_->trip_range_c(rn_thermal_legs::leg::gpu);
+        samples_.set_trips({cpu.min_c, cpu.max_c, npu.min_c, npu.max_c, gpu.min_c, gpu.max_c});
     }
+}
+
+void rn_governor::log_battery_sysfs() const {
+    const rn_battery_sysfs probe = rn_battery_sysfs_read(k_battery_sysfs_root);
+    LOG_INFO("KALSA_GOVERNOR_BATTERY_SYSFS {temp_ok:%d, temp_tenths_c:%d, status_ok:%d, status:%d}",
+             probe.temp_ok ? 1 : 0, probe.temp_tenths_c, probe.status_ok ? 1 : 0,
+             probe.status);
 }
 
 void rn_governor::log_platform_thermal_availability() const {
@@ -158,6 +195,8 @@ void rn_governor::reset_prefill_stats() {
     // beginCompletion is one caller); keep the mirror in step.
     std::lock_guard<std::mutex> lock(engine_mutex_);
     decode_tokens_since_prefill_ = 0;
+    // The record is per completion: this is its start.
+    samples_.reset();
     llama_governor_reset_prefill_stats(governor_);
 }
 
@@ -178,15 +217,50 @@ void rn_governor::before_decode_batch(int n_tokens) {
         decode_tokens_since_prefill_ = 0;
         return;
     }
+    const int64_t now_ms = ggml_time_us() / 1000;
     if (decode_tokens_since_prefill_ % decode_hop_tokens_ == 0) {
-        feed_decode_headroom();
+        const rn_thermal_legs::headroom legs = feed_decode_headroom();
+        observe_window(now_ms, legs);
     }
+    samples_.last_step(now_ms);
     ++decode_tokens_since_prefill_;
 }
 
-void rn_governor::feed_decode_headroom() {
+void rn_governor::observe_window(int64_t now_ms, const rn_thermal_legs::headroom & legs) {
+    rn_window_sample sample;
+    sample.tokens = decode_tokens_since_prefill_;
+    sample.headroom = observed_headroom_.load(std::memory_order_relaxed);
+    sample.headroom_age_ms = age_ms(now_ms, observed_headroom_read_us_.load(std::memory_order_relaxed));
+    sample.status = observed_status_.load(std::memory_order_relaxed);
+    sample.status_age_ms = age_ms(now_ms, observed_status_read_us_.load(std::memory_order_relaxed));
+    sample.app_age_ms = age_ms(now_ms, observed_app_sample_us_.load(std::memory_order_relaxed));
+    sample.cpu_hot_c = legs.cpu_hot_c;
+    sample.npu_hot_c = legs.npu_hot_c;
+    sample.gpu_hot_c = legs.gpu_hot_c;
+    if (decode_tokens_since_prefill_ == 0) {
+        // The completion's first window: no step of this completion has run,
+        // so the engine's cumulative leg/duty/applied values belong to the
+        // previous completion and stay unknown. One battery probe per
+        // completion, here.
+        samples_.first_step(now_ms, sample,
+                            rn_battery_sysfs_read(k_battery_sysfs_root));
+    } else {
+        // The engine's "last" values are exactly the inputs that produced
+        // duty_last: pairing them here pairs duty with what it realized on,
+        // not with this boundary's snapshot.
+        llama_governor_stats stats{};
+        llama_governor_get_stats(governor_, &stats);
+        sample.leg_prev = observed_leg(stats.decode_engine);
+        sample.applied_headroom = stats.decode_pacing_headroom_last;
+        sample.applied_status = stats.platform_thermal_status;
+        sample.duty_last = stats.decode_pacing_duty_last;
+    }
+    samples_.record(sample);
+}
+
+rn_thermal_legs::headroom rn_governor::feed_decode_headroom() {
     if (decode_legs_ == nullptr) {
-        return;
+        return {};
     }
     const rn_thermal_legs::headroom legs = decode_legs_->sample();
     // The GPU value is NaN without gpu zones (no GPU leg): the engine's hop
@@ -194,6 +268,7 @@ void rn_governor::feed_decode_headroom() {
     // and Jelly behaviour.
     llama_governor_set_decode_headroom(governor_, legs.cpu_headroom_c, legs.npu_headroom_c,
                                        legs.gpu_headroom_c);
+    return legs;
 }
 
 bool rn_governor::set_thermo_profile(const llama_governor_thermo_profile & profile) {
@@ -227,6 +302,9 @@ bool rn_governor::set_thermo_profile(const llama_governor_thermo_profile & profi
     }
     if (profile_valid_) {
         thermo_profile_ = merged;
+        // The app profile carries the battery inputs: this is the app sample
+        // the window observation ages.
+        observed_app_sample_us_.store(ggml_time_us(), std::memory_order_relaxed);
         // An app profile cancels a pending native escalation only when it
         // changes the status.
         if (status_changed) {
@@ -265,7 +343,10 @@ void rn_governor::refresh_platform_thermal() {
         return;
     }
     if (status != k_platform_thermal_absent) {
-        platform_native_valid_us_ = ggml_time_us();
+        const int64_t now_us = ggml_time_us();
+        platform_native_valid_us_ = now_us;
+        observed_status_.store(status, std::memory_order_relaxed);
+        observed_status_read_us_.store(now_us, std::memory_order_relaxed);
     }
     const int32_t previous = thermo_profile_.platform_thermal_status;
     const auto decision = rn_platform_thermal_should_send(
@@ -307,6 +388,10 @@ void rn_governor::refresh_platform_thermal() {
         return;
     }
     thermo_profile_ = updated;
+    // The accepted native profile is what the engine applies from here; the
+    // forecast stamp is the read it came from.
+    observed_headroom_.store(headroom, std::memory_order_relaxed);
+    observed_headroom_read_us_.store(platform_headroom_state_.read_us, std::memory_order_relaxed);
     if (decision.send) {
         LOG_INFO("KALSA_GOVERNOR_PLATFORM {status:%d, prev:%d, source:\"native\", sent:1}",
                  status, previous);
@@ -330,6 +415,11 @@ llama_governor_stats rn_governor::stats() const {
     std::lock_guard<std::mutex> lock(engine_mutex_);
     llama_governor_get_stats(governor_, &result);
     return result;
+}
+
+rn_governor_samples rn_governor::samples() const {
+    std::lock_guard<std::mutex> lock(engine_mutex_);
+    return samples_;
 }
 
 } // namespace rnllama

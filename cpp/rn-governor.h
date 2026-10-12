@@ -2,11 +2,14 @@
 
 #include "llama-ext.h"
 #include "llama.h"
+#include "rn-battery-sysfs.h"
+#include "rn-governor-samples.h"
 #include "rn-platform-thermal.h"
 #include "rn-thermal-legs.h"
 
 #include <atomic>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -50,6 +53,10 @@ public:
     // Bench route dev hook: 0=auto, 1=cpu, 2=gpu (engine validates).
     bool set_prefill_override(int mode);
     llama_governor_stats stats() const;
+    // Stage 0 observation: a copy of the per-completion decode-hop record
+    // (stamps, first sample, battery probe, window ring, trips), taken under
+    // engine_mutex_ like stats().
+    rn_governor_samples samples() const;
 
     // The only sanctioned KV rewind under a governor (both contexts, both
     // watermarks); see llama_governor_trim_sequence. False only when even the
@@ -68,10 +75,19 @@ private:
     // when decode_hop_tokens > 0, so a hop-less governor does no sysfs work.
     void init_hop_reader(const llama_governor_params & params);
     void log_platform_thermal_availability() const;
+    // The one-time OPEN 4 probe, logged on its own tag: KALSA_GOVERNOR_PLATFORM
+    // stays status-only by contract.
+    void log_battery_sysfs() const;
     // Samples the legs and hands the headroom to the engine; a no-op when
     // there is no reader (decode_hop_tokens == 0). Called only from
-    // before_decode_batch, which holds engine_mutex_.
-    void feed_decode_headroom();
+    // before_decode_batch, which holds engine_mutex_. Returns the combined
+    // reading so the observation record reuses it (one sysfs read per window).
+    rn_thermal_legs::headroom feed_decode_headroom();
+    // Stage 0 observation of one window boundary: the freshness snapshot, the
+    // combined zone reading just taken, and the engine's applied values; at
+    // the completion's first step also the first-step latch and one battery
+    // probe. Caller holds engine_mutex_.
+    void observe_window(int64_t now_ms, const rn_thermal_legs::headroom & legs);
     // Reads status and headroom on their own intervals, then forwards a
     // changed status or headroom under profile_mutex_.
     void refresh_platform_thermal();
@@ -110,6 +126,19 @@ private:
     int64_t platform_native_valid_us_ = 0;
     bool platform_refusal_logged_ = false;
     std::string failure_reason_;
+    // Stage 0 observation record; decode thread writes it under engine_mutex_.
+    rn_governor_samples samples_;
+    // Freshness of the thermo inputs for the window observation, written
+    // wherever a profile is accepted under profile_mutex_ and read lock-free
+    // by observe_window (engine_mutex_ is already held there; taking
+    // profile_mutex_ first would invert the lock order above). The five
+    // stamps are independently atomic, so one sample can mix generations -
+    // the ages it logs are approximate, which Stage 0 never treats as exact.
+    std::atomic<float> observed_headroom_{std::numeric_limits<float>::quiet_NaN()};
+    std::atomic<int64_t> observed_headroom_read_us_{0};
+    std::atomic<int32_t> observed_status_{k_platform_thermal_absent};
+    std::atomic<int64_t> observed_status_read_us_{0};
+    std::atomic<int64_t> observed_app_sample_us_{0};
 };
 
 } // namespace rnllama

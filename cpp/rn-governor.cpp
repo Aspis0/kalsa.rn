@@ -163,12 +163,12 @@ int32_t rn_governor::decode(llama_batch batch) {
     {
         std::lock_guard<std::mutex> lock(engine_mutex_);
         result = llama_governor_decode(governor_, batch);
-        // Observation stamp AFTER the step ran: before_decode_batch stamps
-        // ahead of it, so without this the recorded last step would exclude
-        // the step's own compute time. rc 0 is the one outcome where the
-        // single-token step actually ran (-2 is flow control: no step).
+        // Observation commits only after the step ran: rc 0 is the one
+        // outcome where the single-token step actually ran (-2 is flow
+        // control: no step, and a paused first batch must leave the record
+        // empty). The stamp after the call bounds the steps' compute time.
         if (decode_legs_ != nullptr && batch.n_tokens == 1 && result == 0) {
-            samples_.last_step(ggml_time_us() / 1000);
+            commit_window(ggml_time_us() / 1000);
         }
     }
     if (governor_decode_failed(result, governor_->is_failed())) {
@@ -204,7 +204,7 @@ void rn_governor::clear_cache(bool clear_data) {
     // clock that no longer exists.
     std::lock_guard<std::mutex> lock(engine_mutex_);
     decode_tokens_since_prefill_ = 0;
-    samples_.reset();
+    reset_observation_record();
     llama_governor_clear_cache(governor_, clear_data);
 }
 
@@ -214,7 +214,7 @@ void rn_governor::reset_prefill_stats() {
     std::lock_guard<std::mutex> lock(engine_mutex_);
     decode_tokens_since_prefill_ = 0;
     // The record is per completion: this is its start.
-    samples_.reset();
+    reset_observation_record();
     llama_governor_reset_prefill_stats(governor_);
 }
 
@@ -233,22 +233,24 @@ void rn_governor::before_decode_batch(int n_tokens) {
     // decision, first window included.
     if (n_tokens > 1) {
         decode_tokens_since_prefill_ = 0;
+        // The prefill restarts the hop clock; a boundary staged for the
+        // abandoned sequence must never commit.
+        pending_valid_ = false;
         return;
     }
     const int64_t now_ms = ggml_time_us() / 1000;
     if (decode_tokens_since_prefill_ % decode_hop_tokens_ == 0) {
         const rn_thermal_legs::headroom legs = feed_decode_headroom();
-        observe_window(now_ms, legs);
+        stage_window(now_ms, legs);
     }
-    samples_.last_step(now_ms);
     ++decode_tokens_since_prefill_;
 }
 
-void rn_governor::observe_window(int64_t now_ms, const rn_thermal_legs::headroom & legs) {
+void rn_governor::stage_window(int64_t now_ms, const rn_thermal_legs::headroom & legs) {
     rn_window_sample sample;
     sample.tokens = decode_tokens_since_prefill_;
-    sample.headroom = observed_headroom_.load(std::memory_order_relaxed);
-    sample.headroom_age_ms = age_ms(now_ms, observed_headroom_read_us_.load(std::memory_order_relaxed));
+    sample.headroom = observed_headroom_;
+    sample.headroom_age_ms = age_ms(now_ms, observed_headroom_read_us_);
     sample.status = observed_status_.load(std::memory_order_relaxed);
     sample.status_age_ms = age_ms(now_ms, observed_status_read_us_.load(std::memory_order_relaxed));
     sample.app_age_ms = age_ms(now_ms, observed_app_sample_us_.load(std::memory_order_relaxed));
@@ -258,10 +260,10 @@ void rn_governor::observe_window(int64_t now_ms, const rn_thermal_legs::headroom
     if (decode_tokens_since_prefill_ == 0) {
         // The completion's first window: no step of this completion has run,
         // so the engine's cumulative leg/duty/applied values belong to the
-        // previous completion and stay unknown. One battery probe per
-        // completion, here.
-        samples_.first_step(now_ms, sample,
-                            rn_battery_sysfs_read(k_battery_sysfs_root));
+        // previous completion and stay unknown. One battery sysfs probe per
+        // completion, staged here and committed with the first step.
+        pending_battery_ = rn_battery_sysfs_read(k_battery_sysfs_root);
+        pending_first_window_ = true;
     } else {
         // The engine's "last" values are exactly the inputs that produced
         // duty_last: pairing them here pairs duty with what it realized on,
@@ -273,7 +275,32 @@ void rn_governor::observe_window(int64_t now_ms, const rn_thermal_legs::headroom
         sample.applied_status = stats.platform_thermal_status;
         sample.duty_last = stats.decode_pacing_duty_last;
     }
-    samples_.record(sample);
+    pending_sample_ = sample;
+    pending_boundary_ms_ = now_ms;
+    pending_valid_ = true;
+}
+
+void rn_governor::commit_window(int64_t step_end_ms) {
+    // Only a step that ran (the rc 0 gate at the caller) may touch the
+    // record: a paused first batch leaves the stamps 0 and the ring empty
+    // (types.ts: "0 when no step has run"), and the ring length tracks
+    // tokens that actually ran.
+    samples_.last_step(step_end_ms);
+    if (!pending_valid_) {
+        return;
+    }
+    if (pending_first_window_) {
+        samples_.first_step(pending_boundary_ms_, pending_sample_, pending_battery_);
+        pending_first_window_ = false;
+    }
+    samples_.record(pending_sample_);
+    pending_valid_ = false;
+}
+
+void rn_governor::reset_observation_record() {
+    samples_.reset();
+    pending_valid_ = false;
+    pending_first_window_ = false;
 }
 
 rn_thermal_legs::headroom rn_governor::feed_decode_headroom() {
@@ -384,11 +411,16 @@ void rn_governor::refresh_platform_thermal() {
         // make it look ever staler on the observation wire. The value follows
         // what the engine would see (NaN once the carry expires); the stamp
         // advances only on a finite read, which is exactly when
-        // rn_platform_thermal_headroom_forward refreshes read_us.
-        observed_headroom_.store(headroom, std::memory_order_relaxed);
-        if (std::isfinite(headroom)) {
-            observed_headroom_read_us_.store(platform_headroom_state_.read_us,
-                                             std::memory_order_relaxed);
+        // rn_platform_thermal_headroom_forward refreshes read_us. Both go
+        // under engine_mutex_ - the lock the window staging reads them under -
+        // taken here under profile_mutex_, the sanctioned order, so a sample
+        // can never pair one read's value with another read's stamp.
+        {
+            std::lock_guard<std::mutex> engine_lock(engine_mutex_);
+            observed_headroom_ = headroom;
+            if (std::isfinite(headroom)) {
+                observed_headroom_read_us_ = platform_headroom_state_.read_us;
+            }
         }
     }
     // NaN is a value here too: two unknowns are the same headroom.

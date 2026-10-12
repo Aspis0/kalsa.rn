@@ -55,15 +55,19 @@ inline bool parse_battery_temp_line(const std::string & line, int32_t * out) {
 
 /** Reads <root>/battery/temp (integer, tenths of C on Qualcomm Android) and
  *  <root>/battery/status ("Charging" 1, "Discharging" 2, "Not charging" 3,
- *  "Full" 4, anything else 0). A missing or non-numeric temp reads
- *  temp_ok=false, temp_tenths_c=-1; a missing status reads status_ok=false,
- *  status=0. Never throws. */
+ *  "Full" 4, anything else 0). A sysfs node holds one value, so a temp with
+ *  trailing junk on its line or a second non-empty line is a malformed read:
+ *  temp_ok=false, temp_tenths_c=-1 (a missing status reads status_ok=false,
+ *  status=0). Never throws. */
 inline rn_battery_sysfs rn_battery_sysfs_read(const std::string & root) {
     rn_battery_sysfs probe;
     const auto read_temp = [&probe](const std::string & path) {
         std::ifstream in(path);
         std::string line;
+        std::string extra;
         if (in.is_open() && std::getline(in, line) &&
+            !(std::getline(in, extra) &&
+              extra.find_first_not_of(" \t\r\n") != std::string::npos) &&
             parse_battery_temp_line(line, &probe.temp_tenths_c)) {
             probe.temp_ok = true;
         }

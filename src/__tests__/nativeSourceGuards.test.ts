@@ -161,7 +161,7 @@ test('window observation stays fresh on unchanged forecasts', () => {
   // item 1). Pin the store ahead of that early return, inside the read.
   const refresh = governorFn(/void rn_governor::refresh_platform_thermal\(\)/)
   const read = refresh.indexOf('if (headroom_due)')
-  const stamp = refresh.indexOf('observed_headroom_read_us_.store')
+  const stamp = refresh.indexOf('observed_headroom_read_us_ = platform_headroom_state_.read_us')
   const earlyReturn = refresh.indexOf('if (!decision.send && !headroom_changed)')
   expect(read).toBeGreaterThan(-1)
   expect(stamp).toBeGreaterThan(read)
@@ -194,17 +194,28 @@ test('KALSA_GOVERNOR_BATTERY_SYSFS line parses as JSON', () => {
 
 test('decode-path observation hooks stay wired', () => {
   // The host tests drive the record's own API, so nothing fails if the
-  // governor stops calling it. Pin the wiring: the window sample is recorded
-  // on the before_decode_batch path, the last-step stamp also lands AFTER
-  // the engine call inside decode (so first/last bound the steps' compute
-  // time, hostile audit item 5), and gpu-coolmode carries its own leg marker
-  // instead of reading as unknown (item 4).
+  // governor stops calling it. Pin the whole chain: both completion loops
+  // reach before_decode_batch, that stages the window (no record mutator
+  // runs there - a paused first batch must leave the record empty, the
+  // commit happens only past the rc 0 gate in decode), commit_window is the
+  // one place the record mutators live, and gpu-coolmode carries its own
+  // leg marker instead of reading as unknown.
+  const calls = cpp('rn-completion.cpp').match(/->before_decode_batch\(/g)
+  expect(calls?.length).toBe(2)
   const before = governorFn(/void rn_governor::before_decode_batch\(int n_tokens\)/)
-  expect(before).toContain('observe_window(now_ms, legs)')
+  expect(before).toContain('stage_window(now_ms, legs)')
+  const recordMutators = [
+    'samples_.record(',
+    'samples_.first_step(',
+    'samples_.last_step(',
+  ]
+  expect(recordMutators.filter((mutator) => before.includes(mutator))).toEqual([])
   const decode = governorFn(/int32_t rn_governor::decode\(llama_batch batch\)/)
-  expect(
-    decode.indexOf('llama_governor_decode(governor_, batch)'),
-  ).toBeLessThan(decode.indexOf('samples_.last_step'))
+  expect(decode.indexOf('result == 0')).toBeLessThan(decode.indexOf('commit_window('))
+  const commit = governorFn(/void rn_governor::commit_window\(int64_t step_end_ms\)/)
+  expect(recordMutators.filter((mutator) => !commit.includes(mutator))).toEqual([])
+  const stage = governorFn(/void rn_governor::stage_window\(int64_t now_ms/)
+  expect(stage).toContain('pending_valid_ = true')
   expect(cpp('rn-governor.cpp')).toMatch(
     /case llama_governor_engine::GPU_COOLMODE:\n {12}return 3;/,
   )

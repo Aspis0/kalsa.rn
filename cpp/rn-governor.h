@@ -86,10 +86,19 @@ private:
     // reading so the observation record reuses it (one sysfs read per window).
     rn_thermal_legs::headroom feed_decode_headroom();
     // Stage 0 observation of one window boundary: the freshness snapshot, the
-    // combined zone reading just taken, and the engine's applied values; at
-    // the completion's first step also the first-step latch and one battery
-    // probe. Caller holds engine_mutex_.
-    void observe_window(int64_t now_ms, const rn_thermal_legs::headroom & legs);
+    // combined zone reading just taken, and the engine's applied values are
+    // held PENDING - committed by commit_window only once the decode step
+    // this boundary precedes actually ran, so a paused first batch leaves the
+    // record empty. Caller holds engine_mutex_.
+    void stage_window(int64_t now_ms, const rn_thermal_legs::headroom & legs);
+    // Commits the pending window (plus the first-step latch and its battery
+    // probe for the completion's first window) and advances the last-step
+    // stamp; called only after a 1-token decode step returned rc 0. Caller
+    // holds engine_mutex_.
+    void commit_window(int64_t step_end_ms);
+    // Completion start and cache clear: the record and any staged boundary
+    // restart together. Caller holds engine_mutex_.
+    void reset_observation_record();
     // Reads status and headroom on their own intervals, then forwards a
     // changed status or headroom under profile_mutex_.
     void refresh_platform_thermal();
@@ -128,19 +137,29 @@ private:
     int64_t platform_native_valid_us_ = 0;
     bool platform_refusal_logged_ = false;
     std::string failure_reason_;
-    // Stage 0 observation record; decode thread writes it under engine_mutex_.
+    // Stage 0 observation record; the decode thread writes it under engine_mutex_.
     rn_governor_samples samples_;
-    // Freshness of the thermo inputs for the window observation, written
-    // wherever a profile is accepted under profile_mutex_ and read lock-free
-    // by observe_window (engine_mutex_ is already held there; taking
-    // profile_mutex_ first would invert the lock order above). The five
-    // stamps are independently atomic, so one sample can mix generations -
-    // the ages it logs are approximate, which Stage 0 never treats as exact.
-    std::atomic<float> observed_headroom_{std::numeric_limits<float>::quiet_NaN()};
-    std::atomic<int64_t> observed_headroom_read_us_{0};
+    // Freshness of the thermo inputs for the window observation. The status
+    // and app stamps are single relaxed atomics written wherever a profile
+    // read answers (under profile_mutex_; the staging reads them lock-free
+    // under engine_mutex_, because taking profile_mutex_ there would invert
+    // the lock order above), so those ages are approximate and may mix
+    // generations - Stage 0 never treats an age as exact. The forecast pair
+    // is different: its value and stamp must belong to one read, so they are
+    // plain fields both written and read under engine_mutex_ (the refresh
+    // path takes that lock under profile_mutex_, the sanctioned order).
     std::atomic<int32_t> observed_status_{k_platform_thermal_absent};
     std::atomic<int64_t> observed_status_read_us_{0};
     std::atomic<int64_t> observed_app_sample_us_{0};
+    float observed_headroom_ = std::numeric_limits<float>::quiet_NaN();
+    int64_t observed_headroom_read_us_ = 0;
+    // The window staged at the last boundary, pending until the step it
+    // precedes ran (stage_window / commit_window).
+    rn_window_sample pending_sample_{};
+    rn_battery_sysfs pending_battery_{};
+    int64_t pending_boundary_ms_ = 0;
+    bool pending_first_window_ = false;
+    bool pending_valid_ = false;
 };
 
 } // namespace rnllama

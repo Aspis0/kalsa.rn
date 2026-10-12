@@ -353,8 +353,9 @@ export type GovernorStats = {
   /** Stage 0 observation. The first decode step's sample, in the
    *  decode_window_samples column order below. */
   decode_first_sample: Array<number | null>
-  /** Stage 0 observation. One battery sysfs probe taken at the first decode
-   *  step: [temp_ok 0|1, battery temp in tenths of C | null, status_ok 0|1,
+  /** Stage 0 observation. One battery sysfs probe per completion, staged at
+   *  its first window boundary and committed when the first step runs:
+   *  [temp_ok 0|1, battery temp in tenths of C | null, status_ok 0|1,
    *  Android battery status | null]. */
   decode_batt_sysfs: Array<number | null>
   /** Stage 0 observation. Passive-trip range in C per leg (milli-C / 1000

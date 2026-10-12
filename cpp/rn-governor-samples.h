@@ -56,10 +56,13 @@ struct rn_leg_trips {
 };
 
 // The per-completion observation record of the decode hop: first/last step
-// stamps, the first step's snapshot and battery probe, and a 256-entry ring
-// of window samples with an overflow flag (route_chunks precedent). Decode
-// thread only, under rn_governor::engine_mutex_ - the JSI-side copy takes
-// that same lock in rn_governor::samples(); no internal locking.
+// stamps, the first step's boundary snapshot and battery probe, and a
+// 256-entry ring of window samples with an overflow flag (route_chunks
+// precedent). The governor stages each window at its boundary and commits it
+// only once the decode step it precedes actually ran, so an empty record
+// means no step of the completion ran. Decode thread only, under
+// rn_governor::engine_mutex_ - the JSI side copies it through
+// rn_governor::stats_with_samples(); no internal locking.
 //
 // Header-only for the same reason as rn-battery-sysfs.h: the HTP skel
 // fingerprint covers every cmake list a .cpp would have to be registered in,
@@ -73,9 +76,9 @@ public:
     // Once per governor, at init_hop_reader.
     void set_trips(const rn_leg_trips & trips) { trips_ = trips; }
 
-    // Completion start (reset_prefill_stats): ring empty, stamps 0, the
-    // first-step latch open. Trips survive: they are per governor, not per
-    // completion.
+    // Completion start (reset_prefill_stats) and cache clear: ring empty,
+    // stamps 0, the first-step latch open. Trips survive: they are per
+    // governor, not per completion.
     void reset() {
         first_ = {};
         battery_ = {};
@@ -88,8 +91,9 @@ public:
         // stale cells past count_ are never read.
     }
 
-    // The completion's first 1-token decode batch with its boundary snapshot
-    // and one battery probe; later calls are ignored.
+    // The completion's first window - the boundary its first step started
+    // from - with its snapshot and one battery probe; committed when that
+    // step runs, later calls ignored.
     void first_step(int64_t now_ms, const rn_window_sample & snapshot,
                     const rn_battery_sysfs & battery) {
         if (first_step_done_) {
@@ -101,7 +105,8 @@ public:
         first_step_ms_ = now_ms;
     }
 
-    // Every 1-token decode batch, the first included.
+    // The end of every 1-token decode step that ran (rc 0), the first
+    // included.
     void last_step(int64_t now_ms) { last_step_ms_ = now_ms; }
 
     // One window boundary sample; once the ring is full, further samples are

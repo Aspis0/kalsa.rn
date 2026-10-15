@@ -255,14 +255,17 @@ enum class onecopy_load_result {
 
 // The one-copy three-leg load (FABLE (b), step 6): ONE model load per the
 // engine's load contract, legs built through the one-model governor. Every
-// refusal here demotes to today's loads - never to an NPU load without the
-// OpenCL HOST leg (J(1)).
+// refusal here demotes to today's loads. With the GPU not Fit (gpu_allowed
+// false) the load is {HTP0} only, with no OpenCL leg (J(1) does not hold): the
+// CPU computes the output projection, slower, accepted (legs.cpp, "not the
+// one-copy configuration the load promised").
 onecopy_load_result load_governor_one_model(
         llama_rn_context & owner,
         const llama_governor_params & onecopy_params,
         const llama_governor_thermo_profile & governor_thermo,
         const governor_load_options & load_options,
-        const rn_leg_set & leg_set) {
+        const rn_leg_set & leg_set,
+        bool gpu_allowed) {
     auto demote = [](const char * reason) {
         LOG_ERROR("KALSA_GOVERNOR_FALLBACK {stage:\"onecopy\", models_loaded:0, reason:\"%s\"}",
                   reason);
@@ -322,7 +325,12 @@ onecopy_load_result load_governor_one_model(
     }
     common_params params = owner.params;
     // Raw array contract: the loader stops at the first nullptr (llama_prepare_model_devices), never past this vector's storage.
-    params.devices = { npu, gpu, nullptr };
+    // Without the GPU (gpu_allowed false) the one-copy weights go to the HTP alone.
+    if (gpu_allowed) {
+        params.devices = { npu, gpu, nullptr };
+    } else {
+        params.devices = { npu, nullptr };
+    }
     params.tensor_split[0] = 1.0f;
     params.tensor_split[1] = 0.0f;
     params.n_gpu_layers = 99;
@@ -381,6 +389,15 @@ onecopy_load_result load_governor_one_model(
         { llama_governor_engine::GPU, gpu_leg_devices, gpu_leg_params },
         { llama_governor_engine::CPU, nullptr, leg_params },
     };
+    // Without the GPU the GPU leg is left out, not given null devices: a leg
+    // with no devices is logged as absent by rn_governor's constructor.
+    const ggml_backend_dev_t npu_only_devices[] = { npu, nullptr };
+    const llama_governor_leg lane_only_legs[] = {
+        { llama_governor_engine::NPU, npu_only_devices, leg_params },
+        { llama_governor_engine::CPU, nullptr, leg_params },
+    };
+    const llama_governor_leg * governor_legs = gpu_allowed ? legs : lane_only_legs;
+    const uint32_t n_governor_legs = gpu_allowed ? 3 : 2;
     // F4 + precedence (audit F1/P1): the caller's governor params pass
     // through with the matched row's rule v3 tuning as the DEFAULT of every
     // key the app JSON left absent (owner decisions 2026-10-07 and
@@ -396,7 +413,7 @@ onecopy_load_result load_governor_one_model(
     // those caller facts decide as they always did.
     try {
         owner.governor = std::make_unique<rn_governor>(
-            owner.governor_onecopy_init->model(), legs, 3, onecopy_params);
+            owner.governor_onecopy_init->model(), governor_legs, n_governor_legs, onecopy_params);
     } catch (const std::exception & error) {
         return fail_onecopy(error.what());
     }
@@ -442,6 +459,8 @@ bool load_governor_models(llama_rn_context & owner,
     const rn_hw_facts hw_facts = rn_read_hw_facts();
     const rn_leg_set leg_set = rn_legs_for(hw_facts);
     const bool onecopy_requested = leg_set.one_copy && governor_params.npu_lane_enabled;
+    const bool gpu_allowed = governor_gpu_placement_allowed(
+        governor_params.npu_lane_enabled, governor_params.gpu_fit);
     const llama_governor_params effective_v3 = onecopy_requested
         ? merge_leg_row_defaults(governor_params, load_options.v3_sent, leg_set)
         : governor_params;
@@ -495,7 +514,7 @@ bool load_governor_models(llama_rn_context & owner,
                 htp_init_reason);
         } else {
             switch (load_governor_one_model(owner, effective_v3, governor_thermo,
-                                            load_options, leg_set)) {
+                                            load_options, leg_set, gpu_allowed)) {
             case onecopy_load_result::loaded:
                 log_legs_outcome("onecopy", true);
                 return true;
@@ -522,6 +541,7 @@ bool load_governor_models(llama_rn_context & owner,
     // are the default (unqualified) GPU. Reporting keeps reading
     // governor_params.
     llama_governor_params policy_params = governor_params;
+    bool prefill_cpu_only = false;
     if (governor_params.npu_lane_enabled) {
         // Lane asked for: resolve the device and fill the plan fields. With
         // the lane off (today's default) the resolver is skipped and both
@@ -589,6 +609,20 @@ bool load_governor_models(llama_rn_context & owner,
                     ggml_type_name(requested_k), ggml_type_name(requested_v));
             }
         }
+        // The decode model's device list may not carry the OpenCL GPU either,
+        // even when the HTP lane resolved, while the GPU does not fit.
+        if (!gpu_allowed) {
+            decode_params.devices = { nullptr };
+        }
+        if (!governor_prefill_offloads(true, device_plan, governor_params.gpu_fit)) {
+            // An empty explicit list keeps the engine from sweeping the default
+            // devices, which on Android include the OpenCL GPU.
+            prefill_params.devices = { nullptr };
+            prefill_cpu_only = true;
+            LOG_INFO("KALSA_PREFILL_CPU {reason:\"%s\", gpu_fit:%d}",
+                     device_plan.npu_fallback != nullptr ? device_plan.npu_fallback : "none",
+                     (int) governor_params.gpu_fit);
+        }
 #if defined(__ANDROID__)
     } else {
         // Lane off: what the CPU/OpenCL-only build did, byte for byte — HTP
@@ -616,7 +650,7 @@ bool load_governor_models(llama_rn_context & owner,
         ggml_type_name(prefill_params.cache_type_k),
         ggml_type_name(prefill_params.cache_type_v),
         prefill_params.no_kv_offload ? "host" : "device");
-    prefill_params.n_gpu_layers = 99;
+    prefill_params.n_gpu_layers = prefill_cpu_only ? 0 : 99;
     decode_params.n_gpu_layers = 0;
     prefill_params.n_parallel = 1;
     decode_params.n_parallel = 1;

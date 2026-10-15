@@ -404,6 +404,15 @@ bool governor_lane_policy_enabled(
     return lane_enabled && plan.use_device;
 }
 
+bool governor_gpu_placement_allowed(bool lane_requested, llama_governor_fit gpu_fit) {
+    return !lane_requested || gpu_fit == llama_governor_fit::Fit;
+}
+
+bool governor_prefill_offloads(
+        bool lane_requested, const governor_prefill_device_plan & plan, llama_governor_fit gpu_fit) {
+    return plan.use_device || governor_gpu_placement_allowed(lane_requested, gpu_fit);
+}
+
 bool htp_runtime_failure(
         int32_t n_tokens, llama_governor_engine prefill_engine,
         llama_governor_engine decode_engine, int32_t rc,

@@ -330,6 +330,66 @@ static bool test_lane_policy_flag_follows_resolution() {
     return true;
 }
 
+// The prefill offload and GPU placement gates (rn-governor-params.h). The rows
+// are written out, not derived from the helpers, so a flipped condition in
+// either one fails a row. A lane the app did not ask for keeps today's
+// placement whatever the fit; a lane asked for, unresolved, with the GPU not
+// Fit, is the only prefill that stays on CPU.
+static bool test_prefill_offload_truth_table() {
+    using fit = llama_governor_fit;
+    struct offload_case {
+        bool lane_requested;
+        bool use_device;
+        fit gpu_fit;
+        bool offloads;
+    };
+    const offload_case offloads[] = {
+        {false, false, fit::Unknown, true},
+        {false, false, fit::NotFit, true},
+        {false, false, fit::Fit, true},
+        {false, true, fit::Unknown, true},
+        {false, true, fit::NotFit, true},
+        {false, true, fit::Fit, true},
+        {true, true, fit::Unknown, true},
+        {true, true, fit::NotFit, true},
+        {true, true, fit::Fit, true},
+        {true, false, fit::Unknown, false},
+        {true, false, fit::NotFit, false},
+        {true, false, fit::Fit, true},
+    };
+    for (const auto & c : offloads) {
+        governor_prefill_device_plan plan{};
+        plan.use_device = c.use_device;
+        if (governor_prefill_offloads(c.lane_requested, plan, c.gpu_fit) != c.offloads) {
+            std::cerr << "offload wrong: lane_requested=" << c.lane_requested
+                      << " use_device=" << c.use_device
+                      << " gpu_fit=" << static_cast<int>(c.gpu_fit) << std::endl;
+            return false;
+        }
+    }
+    struct gate_case {
+        bool lane_requested;
+        fit gpu_fit;
+        bool allowed;
+    };
+    const gate_case gates[] = {
+        {false, fit::Unknown, true},
+        {false, fit::NotFit, true},
+        {false, fit::Fit, true},
+        {true, fit::Unknown, false},
+        {true, fit::NotFit, false},
+        {true, fit::Fit, true},
+    };
+    for (const auto & c : gates) {
+        if (governor_gpu_placement_allowed(c.lane_requested, c.gpu_fit) != c.allowed) {
+            std::cerr << "gpu gate wrong: lane_requested=" << c.lane_requested
+                      << " gpu_fit=" << static_cast<int>(c.gpu_fit) << std::endl;
+            return false;
+        }
+    }
+    return true;
+}
+
 // devices_excluding_registry backs the lane-off prefill pin (rn-llama.cpp):
 // once the Hexagon backend registers, reproducing today's device list means
 // dropping every HTP session and keeping the rest in registry order. The
@@ -637,6 +697,7 @@ int main() {
     results.run_test("generation V81 parses, unknown arch refuses", test_generation_parses_v81());
     results.run_test("prefill device plan degrades / opens HTP0", test_prefill_device_plan());
     results.run_test("lane policy flag follows resolution", test_lane_policy_flag_follows_resolution());
+    results.run_test("prefill offload and GPU placement follow the fit gate", test_prefill_offload_truth_table());
     results.run_test("runtime htp reason degrades the next load", test_htp_runtime_reason_degrades_next_load());
     results.run_test("only a batch the HTP device ran kills the lane", test_htp_runtime_failure_attribution());
     results.run_test("registry exclusion keeps non-HTP order", test_devices_excluding_registry());

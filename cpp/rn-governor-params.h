@@ -127,6 +127,21 @@ governor_prefill_device_plan decide_governor_prefill_device(
 bool governor_lane_policy_enabled(
     bool lane_enabled, const governor_prefill_device_plan & plan);
 
+/** Whether a load may put a layer or a graph leg on the OpenCL GPU. Once the
+ *  lane is asked for, the GPU needs gpu_fit == Fit: the app prices a lane-only
+ *  load without the GPU weights (~800 MiB on Adreno). A load that did not ask
+ *  for the lane keeps its default placement. Pure. */
+bool governor_gpu_placement_allowed(bool lane_requested, llama_governor_fit gpu_fit);
+
+/** Whether the prefill context may offload layers. A resolved HTP lane always
+ *  may (its own device); otherwise the GPU gate decides. False means the
+ *  prefill stays on CPU: n_gpu_layers 0 and an explicit empty device list, so
+ *  the engine does not sweep the default devices. Pure. */
+bool governor_prefill_offloads(
+    bool lane_requested,
+    const governor_prefill_device_plan & plan,
+    llama_governor_fit gpu_fit);
+
 /** Registered devices minus every device of the `excluded` registry, order
  *  preserved. Inputs may carry the null terminator the engine's device loop
  *  expects (JSI lists append one); terminators pass through skipped — the

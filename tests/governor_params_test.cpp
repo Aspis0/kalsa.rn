@@ -455,6 +455,65 @@ static bool test_gpu_leg_parse_contract() {
     return true;
 }
 
+// The handoff switch defaults the other way from gpu_leg: absent or null is
+// false, because the rule it gates is the one the R2 oracle still fails, so an
+// app that never sends the field cannot turn a GPU prefill on by accident.
+// Non-boolean is refused exactly as gpu_leg's is.
+static bool test_prefill_thermal_handoff_parse_contract() {
+    llama_governor_params params{};
+    llama_governor_thermo_profile thermo{};
+    rnllama::governor_load_options options{};
+
+    auto absent = base_governor();
+    if (!parse_governor_params(absent, params, thermo, options) ||
+        params.prefill_thermal_handoff) {
+        std::cerr << "prefill_thermal_handoff absent must default false" << std::endl;
+        return false;
+    }
+
+    auto nulled = base_governor();
+    nulled["prefill_thermal_handoff"] = nullptr;
+    if (!parse_governor_params(nulled, params, thermo, options) ||
+        params.prefill_thermal_handoff) {
+        std::cerr << "prefill_thermal_handoff null must default false" << std::endl;
+        return false;
+    }
+
+    auto on = base_governor();
+    on["prefill_thermal_handoff"] = true;
+    if (!parse_governor_params(on, params, thermo, options) ||
+        !params.prefill_thermal_handoff) {
+        std::cerr << "prefill_thermal_handoff true must survive the parse" << std::endl;
+        return false;
+    }
+
+    auto off = base_governor();
+    off["prefill_thermal_handoff"] = false;
+    if (!parse_governor_params(off, params, thermo, options) ||
+        params.prefill_thermal_handoff) {
+        std::cerr << "prefill_thermal_handoff false must survive the parse" << std::endl;
+        return false;
+    }
+
+    for (const char * bad : {"\"true\"", "0", "1"}) {
+        auto typed = base_governor();
+        typed["prefill_thermal_handoff"] = nlohmann::ordered_json::parse(bad);
+        bool threw = false;
+        try {
+            parse_governor_params(typed, params, thermo, options);
+        } catch (const std::invalid_argument & error) {
+            threw = std::string(error.what()) ==
+                "governor.prefill_thermal_handoff must be a boolean";
+        }
+        if (!threw) {
+            std::cerr << "prefill_thermal_handoff " << bad << " must be refused"
+                      << std::endl;
+            return false;
+        }
+    }
+    return true;
+}
+
 // devices_excluding_registry backs the lane-off prefill pin (rn-llama.cpp):
 // once the Hexagon backend registers, reproducing today's device list means
 // dropping every HTP session and keeping the rest in registry order. The
@@ -764,6 +823,8 @@ int main() {
     results.run_test("lane policy flag follows resolution", test_lane_policy_flag_follows_resolution());
     results.run_test("prefill offload and GPU placement follow the fit and leg gates", test_prefill_offload_truth_table());
     results.run_test("gpu_leg defaults true and refuses a non-boolean", test_gpu_leg_parse_contract());
+    results.run_test("prefill_thermal_handoff defaults false and refuses a non-boolean",
+                     test_prefill_thermal_handoff_parse_contract());
     results.run_test("runtime htp reason degrades the next load", test_htp_runtime_reason_degrades_next_load());
     results.run_test("only a batch the HTP device ran kills the lane", test_htp_runtime_failure_attribution());
     results.run_test("registry exclusion keeps non-HTP order", test_devices_excluding_registry());

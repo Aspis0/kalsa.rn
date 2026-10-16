@@ -35,16 +35,6 @@ const char * leg_label(llama_governor_engine engine) {
     return "?";
 }
 
-float load_step_of(const llama_governor_params & params, llama_governor_engine engine) {
-    switch (engine) {
-        case llama_governor_engine::CPU: return params.decode_load_step_cpu_c;
-        case llama_governor_engine::GPU: return params.decode_load_step_gpu_c;
-        case llama_governor_engine::NPU: return params.decode_load_step_npu_c;
-        case llama_governor_engine::GPU_COOLMODE: break;
-    }
-    return 0.0f;
-}
-
 float heat_per_token_of(const llama_governor_params & params, llama_governor_engine engine) {
     switch (engine) {
         case llama_governor_engine::CPU: return params.decode_heat_per_token_cpu;
@@ -86,6 +76,18 @@ int heat_rank_fit(const llama_governor_params & params, const llama_governor_eng
 }
 
 } // namespace
+
+// Outside the anonymous namespace because prefill_engine docks the GPU by the
+// same step, so the hop rule and the prefill placement read one definition.
+float load_step_of(const llama_governor_params & params, llama_governor_engine engine) {
+    switch (engine) {
+        case llama_governor_engine::CPU: return params.decode_load_step_cpu_c;
+        case llama_governor_engine::GPU: return params.decode_load_step_gpu_c;
+        case llama_governor_engine::NPU: return params.decode_load_step_npu_c;
+        case llama_governor_engine::GPU_COOLMODE: break;
+    }
+    return 0.0f;
+}
 
 void llama_governor_policy::set_decode_headroom(float cpu_headroom_c, float npu_headroom_c,
                                                  float gpu_headroom_c) {

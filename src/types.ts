@@ -246,6 +246,13 @@ export type NativeContextParams = {
     // verdict, so it can read "Fit" while this is false. Omit or send null and
     // the binding keeps today's placement (gpu_leg defaults true).
     gpu_leg?: boolean
+    // Owner switch for the NPU-hot prefill handoff (FIX 2): a live NPU lane
+    // under the decode guard hands the prefill to a GPU that clears guard +
+    // hysteresis, one sample per turn read from the leg thermal zones.
+    // Default false, and omit or send null to keep it off - GPU prefill is
+    // still FAIL on the R2 logit oracle for V75/V81, so a generation is
+    // switched on only after its own correctness check.
+    prefill_thermal_handoff?: boolean
     bench_force_gpu_prefill?: boolean
     npu_lane_enabled?: boolean
     reload_budget_available?: boolean

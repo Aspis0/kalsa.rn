@@ -118,10 +118,9 @@ int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {
         // admit_prefill's job and runs on every call.
         // One latch, one mode: the latch re-arms at the next prefill entry
         // from another phase, at clear_cache, or at a stats reset.
-        // engine equals requested; a non-CPU admission (GPU_COOLMODE
-        // included) keeps the GPU route - owner rule: the CPU heats more,
-        // do not take the GPU away.
-        prefill_route_ = admission.engine == llama_governor_engine::CPU ? prefill_route::CPU : prefill_route::GPU;
+        // engine equals requested; a non-CPU admission never latches the CPU
+        // route - owner rule: the CPU heats more, do not take the GPU away.
+        prefill_route_ = prefill_route_of(admission.engine);
         stats_.prefill_engine = admission.engine;
         // Snapshot the override inputs with the route: every fact of this
         // latch reports the same mode and the same causal decision.
@@ -252,6 +251,7 @@ void llama_governor::clear_cache(bool clear_data) {
     decode_tokens_since_prefill_ = 0;
     forced_window_ = UINT32_MAX;
     policy_.reset_decode_hop();
+    policy_.clear_prefill_headroom();
     // a fully cached turn's 1-token batch never enters the prefill branch,
     // so the floor refresh lives here too (one-model only)
     if (!legs.empty()) {
@@ -301,6 +301,9 @@ void llama_governor::reset_prefill_stats() {
     decode_tokens_since_prefill_ = 0;
     forced_window_ = UINT32_MAX;
     policy_.reset_decode_hop();
+    // The route re-armed, so last turn's zone sample does too: a turn the
+    // binding does not resample must read as unknown (NPU), not as stale heat.
+    policy_.clear_prefill_headroom();
     // a fully cached turn's 1-token batch never enters the prefill branch,
     // so the floor refresh lives here too (one-model only)
     if (!legs.empty()) {
@@ -347,6 +350,14 @@ bool llama_governor::set_decode_legs(bool npu, bool gpu, bool cpu) {
     return true;
 }
 
+bool llama_governor::set_prefill_headroom(float npu_headroom_c, float gpu_headroom_c) {
+    if (!policy_enabled_) {
+        return false;
+    }
+    policy_.set_prefill_headroom(npu_headroom_c, gpu_headroom_c);
+    return true;
+}
+
 bool llama_governor::set_prefill_override(int mode) {
     if (!policy_enabled_) {
         return false;
@@ -388,7 +399,7 @@ llama_context * llama_governor::context() const { return last_ctx; }
 // two-model: the two named contexts; one-model: the accelerator-role leg
 // (NPU, else GPU, else CPU) and the CPU leg
 llama_context * llama_governor::prefill_context() const {
-    return legs.empty() ? ctx_prefill : prefill_ctx(false);
+    return legs.empty() ? ctx_prefill : prefill_ctx(llama_governor_engine::NPU);
 }
 llama_context * llama_governor::decode_context() const {
     return legs.empty() ? ctx_decode : leg_ctx(llama_governor_engine::CPU);
@@ -467,6 +478,11 @@ bool llama_governor_set_decode_headroom(llama_governor * governor,
 
 bool llama_governor_set_decode_legs(llama_governor * governor, bool npu, bool gpu, bool cpu) {
     return governor && governor->set_decode_legs(npu, gpu, cpu);
+}
+
+bool llama_governor_set_prefill_headroom(llama_governor * governor,
+                                         float npu_headroom_c, float gpu_headroom_c) {
+    return governor && governor->set_prefill_headroom(npu_headroom_c, gpu_headroom_c);
 }
 
 bool llama_governor_set_prefill_override(llama_governor * governor, int mode) {

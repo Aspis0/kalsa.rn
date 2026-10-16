@@ -69,13 +69,17 @@ bool has_speculative_mode(const common_params & params) {
 
 void log_governor_fallback(const char * stage, int models_loaded,
                            const std::string & reason,
-                           llama_governor_fit gpu_fit, bool gpu_leg, bool profile_valid) {
+                           llama_governor_fit gpu_fit, bool gpu_leg,
+                           bool prefill_thermal_handoff, bool profile_valid) {
     // gpu_fit is the truthful fit verdict and gpu_leg is the load's own choice,
     // so a postmortem reads "the GPU did not fit" apart from "the GPU was left
     // out for the NPU lane" - two different faults that used to look identical.
+    // prefill_thermal_handoff rides along for the same reason: a fallback turn
+    // is where a reader asks whether the prefill rule was even on.
     LOG_ERROR(
-        "KALSA_GOVERNOR_FALLBACK {stage:\"%s\", models_loaded:%d, reason:\"%s\", gpu_fit:%d, gpu_leg:%d, profile_valid:%d}",
-        stage, models_loaded, reason.c_str(), (int) gpu_fit, (int) gpu_leg, (int) profile_valid);
+        "KALSA_GOVERNOR_FALLBACK {stage:\"%s\", models_loaded:%d, reason:\"%s\", gpu_fit:%d, gpu_leg:%d, prefill_thermal_handoff:%d, profile_valid:%d}",
+        stage, models_loaded, reason.c_str(), (int) gpu_fit, (int) gpu_leg,
+        (int) prefill_thermal_handoff, (int) profile_valid);
 }
 
 #if defined(__ANDROID__)
@@ -624,10 +628,13 @@ bool load_governor_models(llama_rn_context & owner,
             prefill_params.devices = { nullptr };
             prefill_cpu_only = true;
             // gpu_leg beside gpu_fit: a postmortem must be able to tell "the GPU
-            // did not fit" from "the GPU was left out for the NPU lane".
-            LOG_INFO("KALSA_PREFILL_CPU {reason:\"%s\", gpu_fit:%d, gpu_leg:%d}",
+            // did not fit" from "the GPU was left out for the NPU lane". The
+            // handoff switch rides with them: it is the other half of "why
+            // did prefill stay on the NPU".
+            LOG_INFO("KALSA_PREFILL_CPU {reason:\"%s\", gpu_fit:%d, gpu_leg:%d, prefill_thermal_handoff:%d}",
                      device_plan.npu_fallback != nullptr ? device_plan.npu_fallback : "none",
-                     (int) governor_params.gpu_fit, (int) governor_params.gpu_leg);
+                     (int) governor_params.gpu_fit, (int) governor_params.gpu_leg,
+                     (int) governor_params.prefill_thermal_handoff);
         }
 #if defined(__ANDROID__)
     } else {
@@ -682,6 +689,7 @@ bool load_governor_models(llama_rn_context & owner,
                     const std::string & reason) {
         log_governor_fallback(stage, models_loaded, reason,
                               governor_params.gpu_fit, governor_params.gpu_leg,
+                              governor_params.prefill_thermal_handoff,
                               profile_valid);
         cleanup();
         log_legs_outcome("plain", false);
@@ -723,6 +731,7 @@ bool load_governor_models(llama_rn_context & owner,
                                     reason.find("Route") != std::string::npos;
         log_governor_fallback(route_rejected ? "route_reject" : "init", 2, reason,
                               governor_params.gpu_fit, governor_params.gpu_leg,
+                              governor_params.prefill_thermal_handoff,
                               runtime_profile_valid);
         // CPU retry belongs to LlamaService/S4. Native owns only cleanup and
         // returns failure so that retry can recreate the single-context path.
@@ -738,6 +747,7 @@ bool load_governor_models(llama_rn_context & owner,
         log_governor_fallback("init", 2,
                               "governor initialized without an active context",
                               governor_params.gpu_fit, governor_params.gpu_leg,
+                              governor_params.prefill_thermal_handoff,
                               profile_valid);
         cleanup();
         log_legs_outcome("plain", false);
@@ -1466,6 +1476,7 @@ bool llama_rn_context::loadModel(
                 "Governor mode does not support speculative or MTP decoding",
                 governor_params->gpu_fit,
                 governor_params->gpu_leg,
+                governor_params->prefill_thermal_handoff,
                 governor_thermo != nullptr &&
                     governor_thermo_profile_is_valid(*governor_thermo));
             throw std::runtime_error("Governor mode does not support speculative or MTP decoding");

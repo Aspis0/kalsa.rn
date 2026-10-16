@@ -269,7 +269,7 @@ enum class llama_governor_generation {
     V73,
     V75,
     V79,
-    V81,           // GPU prefill fallback, owner decision 2026-10-11 (default plan: NPU lane wins when live; JS override and bench force outrank it).
+    V81,           // GPU prefill fallback, owner decision 2026-10-11 (JS override and bench force outrank it; with a live NPU lane the GPU is reached only by prefill_thermal_handoff).
 };
 
 enum class llama_governor_model_kind {
@@ -339,6 +339,12 @@ struct llama_governor_params {
     llama_governor_model_kind model_kind = llama_governor_model_kind::Unknown;
     llama_governor_fit gpu_fit = llama_governor_fit::Unknown;
     bool gpu_leg = true; // false = the load left the GPU out for the NPU lane; gpu_fit stays the truthful fit verdict
+    // The NPU-hot GPU prefill handoff (FIX 2), per SoC generation and off until
+    // the owner enables one after the GPU-prefill correctness check: the raw
+    // R2 verdict is still FAIL on V75 and V81, so a hot NPU moving a routine
+    // prefill onto the GPU is an owner decision, not a default. Independent of
+    // gpu_prefill_measured, which the lane-off fallback still depends on.
+    bool prefill_thermal_handoff = false;
     llama_governor_fit npu_fit = llama_governor_fit::Unknown;
     bool htp_trunk_readable = false;
     bool htp_experts_readable = false;
@@ -384,9 +390,11 @@ struct llama_governor_params {
     float decode_load_step_npu_c = 0;
     float decode_load_step_gpu_c = 0;
     float decode_load_step_cpu_c = 0;
-    // Used only by HEAT_RANK: the headroom (C) below which the current leg is
-    // left. Invalid values (NaN, negative, infinite) are rejected to 5 at
-    // construction.
+    // The headroom (C) below which the current leg is left. Read by the
+    // decode hop's HEAT_RANK candidates and by the prefill placement, which
+    // reads it as the line a NPU must fall under to be handed over and the
+    // base of the bar a GPU must clear to take it. Invalid values (NaN,
+    // negative, infinite) are rejected to 5 at construction.
     float decode_guard_headroom_c = 5;
     // Forced decode-leg rotation (F5 proof hook; off by default): when
     // forced_leg_tokens > 0, decode follows forced_leg_sequence
@@ -747,6 +755,21 @@ LLAMA_API bool llama_governor_set_decode_headroom(
         float cpu_headroom_c,
         float npu_headroom_c,
         float gpu_headroom_c = std::numeric_limits<float>::quiet_NaN());
+
+/** Update the prefill-placement thermal headroom: the margin in C between the
+ *  NPU / GPU leg's temperature and its first passive trip. The binding is
+ *  expected to push one per turn, right before a prefill batch; nothing does
+ *  today, so both margins stay NaN and prefill stays on the NPU. NaN = unknown
+ *  leg, which likewise keeps prefill on the NPU, as does an infinite one.
+ *  Unlike the decode samples these survive reset_decode_hop, which runs at
+ *  prefill entry - after the sample - but they are dropped when the turn's
+ *  route re-arms (reset_prefill_stats, clear_cache), so a turn the binding
+ *  does not sample reads as unknown rather than stale. Same decode-thread
+ *  contract as set_thermo_profile. */
+LLAMA_API bool llama_governor_set_prefill_headroom(
+        struct llama_governor * governor,
+        float npu_headroom_c,
+        float gpu_headroom_c);
 
 /** Declare which decode legs exist and may hop (rule v2): the one-model
  *  governor sets this from its leg table (a leg the floors dropped is

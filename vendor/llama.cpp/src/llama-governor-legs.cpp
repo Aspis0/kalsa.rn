@@ -67,6 +67,14 @@ void require_npu_leg_gpu_admits_output(const llama_model * model, const ggml_bac
     }
 }
 
+// ggml's name for the device a leg was built on, empty when it has none. This
+// is the leg's first device, which llama_context already treats as the device
+// its layers run on (llama-context.cpp), so it is the honest label for a chunk
+// that executed on the leg.
+std::string leg_device_name(const ggml_backend_dev_t * devices) {
+    return devices && devices[0] ? ggml_backend_dev_name(devices[0]) : std::string();
+}
+
 } // namespace
 
 llama_governor::llama_governor(llama_model * model, const llama_governor_leg * leg_specs,
@@ -162,7 +170,7 @@ llama_governor::llama_governor(llama_model * model, const llama_governor_leg * l
                 throw std::runtime_error("failed to create governor leg " +
                                          std::to_string(static_cast<int>(spec.engine)));
             }
-            legs.push_back({ spec.engine, ctx, side_state{} });
+            legs.push_back({ spec.engine, ctx, leg_device_name(devices), side_state{} });
         }
         if (leg_ctx(llama_governor_engine::CPU) == nullptr) {
             throw std::runtime_error("one-model governor requires the CPU leg");
@@ -176,7 +184,7 @@ llama_governor::llama_governor(llama_model * model, const llama_governor_leg * l
                 }
             }
         }
-        prefill_layers_device_ = context_layers_device(prefill_ctx(false));
+        prefill_layers_device_ = context_layers_device(prefill_ctx(llama_governor_engine::NPU));
         decode_layers_device_ = context_layers_device(decode_ctx(llama_governor_engine::CPU));
     } catch (...) {
         for (auto & l : legs) {
@@ -297,14 +305,45 @@ void llama_governor::refresh_decode_legs() {
                     true); // H-05: the CPU leg is never excludable
 }
 
-llama_context * llama_governor::prefill_ctx(bool cpu_route) const {
+llama_governor::prefill_route llama_governor::prefill_route_of(llama_governor_engine engine) {
+    // GPU_COOLMODE is a decode state, not a leg (the constructor above refuses
+    // it as one), so it latches the NPU route: the accelerator answer a cool
+    // prefill has always resolved to.
+    switch (engine) {
+        case llama_governor_engine::CPU:         return prefill_route::CPU;
+        case llama_governor_engine::GPU:         return prefill_route::GPU;
+        case llama_governor_engine::NPU:         return prefill_route::NPU;
+        case llama_governor_engine::GPU_COOLMODE: return prefill_route::NPU;
+    }
+    // WHY CPU, not Undecided: a route that is never latched re-arms the latch
+    // on every batch, so the pick is re-decided mid-turn. Unreachable while the
+    // enum and this switch agree; the fail-safe is CPU, as below.
+    return prefill_route::CPU;
+}
+
+llama_governor_engine llama_governor::prefill_engine_of(prefill_route route) {
+    // Undecided reaches prefill_ctx only while the policy is off (admit_prefill
+    // never ran to latch a route), and means that same accelerator answer.
+    switch (route) {
+        case prefill_route::Undecided: return llama_governor_engine::NPU;
+        case prefill_route::NPU:       return llama_governor_engine::NPU;
+        case prefill_route::GPU:       return llama_governor_engine::GPU;
+        case prefill_route::CPU:       return llama_governor_engine::CPU;
+    }
+    return llama_governor_engine::CPU;
+}
+
+llama_context * llama_governor::prefill_ctx(llama_governor_engine engine) const {
     if (legs.empty()) {
-        return cpu_route ? ctx_decode : ctx_prefill;
+        return engine == llama_governor_engine::CPU ? ctx_decode : ctx_prefill;
     }
-    if (cpu_route) {
-        return leg_ctx(llama_governor_engine::CPU);
+    if (llama_context * ctx = leg_ctx(engine)) {
+        return ctx;
     }
-    // today's ctx_prefill role: the accelerator context, NPU first
+    // WHY: a leg the load did not provide answers in today's order - NPU, else
+    // GPU, else CPU - which is what a lane-only load and a CPU-only build have
+    // always got. A forced GPU pick that DOES have a GPU leg now reaches it;
+    // that is what the route carrying the engine buys.
     if (llama_context * npu = leg_ctx(llama_governor_engine::NPU)) {
         return npu;
     }
@@ -312,6 +351,15 @@ llama_context * llama_governor::prefill_ctx(bool cpu_route) const {
         return gpu;
     }
     return leg_ctx(llama_governor_engine::CPU);
+}
+
+const std::string & llama_governor::layers_device_of(llama_context * ctx) const {
+    for (const auto & l : legs) {
+        if (l.ctx == ctx && !l.device_name.empty()) {
+            return l.device_name;
+        }
+    }
+    return prefill_layers_device_;
 }
 
 llama_context * llama_governor::decode_ctx(llama_governor_engine engine) const {

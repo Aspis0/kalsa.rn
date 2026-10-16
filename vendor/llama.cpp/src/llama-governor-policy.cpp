@@ -374,6 +374,45 @@ bool llama_governor_policy::gpu_prefill_capable() const {
             params_.generation == llama_governor_generation::V81);
 }
 
+bool llama_governor_policy::npu_hot_gpu_handoff() const {
+    // FAST and WARM are written out rather than reusing not_a_safety_state(),
+    // which the caller's top gate already implies: it has returned CPU for
+    // CRITICAL / Invalid / LOWBAT, and a valid profile leaves no other state
+    // (update_thermal classifies into exactly those five). COOLMODE is the one
+    // this drops: a cooling phone must not move prefill to the GPU (owner
+    // 2026-10-03, the ~3.7x heat integral per 1k tokens).
+    const bool may_move = state_ == llama_governor_thermal_state::FAST ||
+                          state_ == llama_governor_thermal_state::WARM;
+    if (!params_.prefill_thermal_handoff || !may_move ||
+        !npu_lane_live() || !gpu_prefill_capable()) {
+        return false;
+    }
+    const float npu = prefill_npu_headroom_c_;
+    const float gpu = prefill_gpu_headroom_c_;
+    // Unknown on either leg is not evidence of heat: keep the NPU. An infinity
+    // is not a headroom either, and it would sail through every compare below.
+    if (!std::isfinite(npu) || !std::isfinite(gpu)) {
+        return false;
+    }
+    // The hop's own dock (llama-governor-policy-hop.cpp): a leg already running
+    // decode has paid its load step and reads loaded, an idle one does not.
+    // Docking the GPU that just decoded would double-count its heat, and
+    // leaving the idle NPU undocked would overstate what it will have.
+    const auto loaded = [this](llama_governor_engine engine, float headroom_c) {
+        return headroom_c - (engine == decode_hop_leg_ ? 0.0f : load_step_of(params_, engine));
+    };
+    const float npu_c = loaded(llama_governor_engine::NPU, npu);
+    const float gpu_c = loaded(llama_governor_engine::GPU, gpu);
+    // Three bars, all borrowed: the NPU must be under the decode guard to be
+    // moved off, the GPU must clear guard + hysteresis the way a hop candidate
+    // does (so a GPU already near its own trip is never handed a prefill), and
+    // the gap between them must clear the hysteresis or sample noise buys a
+    // KV commit every turn.
+    return npu_c < params_.decode_guard_headroom_c &&
+           gpu_c >= params_.decode_guard_headroom_c + k_hop_hysteresis_c &&
+           gpu_c > npu_c + k_hop_hysteresis_c;
+}
+
 llama_governor_engine llama_governor_policy::prefill_engine(
         llama_governor_prefill_mode * mode_used, bool * override_decided) const {
     // One atomic load per call: the binding may push a new mode from another
@@ -421,11 +460,19 @@ llama_governor_engine llama_governor_policy::prefill_engine(
     // s23-heat-arms-engine commit 147b0351: 6.45 / 24.17 / 44.59 C*s per
     // 1k tokens NPU / GPU / CPU), so the lane stays eligible in FAST, WARM
     // and COOLMODE (owner 2026-10-03: a warm phone must not move prefill to
-    // the GPU, ~3.7x the NPU's heat integral per 1k tokens); the arms are measured, the old "hop thresholds pending the
-    // NPU heat arm" clause is closed. "GPU when the NPU is hot" needs an
-    // NPU temperature input that does not exist yet: a later step, not
-    // invented here. The bench/JS override above still outranks it, and
-    // every safety state returned above still keeps CPU.
+    // the GPU, ~3.7x the NPU's heat integral per 1k tokens); the arms are
+    // measured, the old "hop thresholds pending the NPU heat arm" clause is
+    // closed. "GPU when the NPU is hot" is the handoff below, which the owner
+    // switches on per SoC generation (prefill_thermal_handoff) once a
+    // generation has passed the GPU-prefill correctness check: the binding is
+    // expected to push the NPU and GPU zone margins before each prefill batch
+    // (llama_governor_set_prefill_headroom), and an NPU past the decode guard
+    // hands prefill to a GPU that is cooler by more than the hop hysteresis.
+    // Nothing pushes one today, so this is inert. The bench/JS override above
+    // still outranks it, and every safety state returned above still keeps CPU.
+    if (npu_hot_gpu_handoff()) {
+        return llama_governor_engine::GPU;
+    }
     if (npu_lane_live() && not_a_safety_state()) {
         return llama_governor_engine::NPU;
     }
@@ -435,10 +482,11 @@ llama_governor_engine llama_governor_policy::prefill_engine(
     // V81 is owner decision 2026-10-11, on the V75 effect-size yardstick (lab cell
     // qdc-oracle-onoff-41dc728f, REPORT.md addendum). The raw R2 verdict is still
     // FAIL, as it is for V75. Here GPU is the fallback. In the default plan the
-    // NPU branch above wins whenever the NPU lane is live; the bench/JS override
-    // above outranks both. FAST, WARM and COOLMODE reach this branch only with no
-    // live NPU lane, so no live NPU is ever left for the GPU. The alternative
-    // there is CPU, the hottest prefill backend measured (S23 heat arms above).
+    // NPU branch above wins whenever the NPU lane is live, and the one thing
+    // that takes it from a live lane is the thermal handoff above - the bench/
+    // JS override outranks both. FAST, WARM and COOLMODE otherwise reach this
+    // branch only with no live NPU lane. The alternative there is CPU, the
+    // hottest prefill backend measured (S23 heat arms above).
     // The generation list is duplicated in the app; the form refactor should
     // carry it once. It and the fit gate now live in gpu_prefill_capable(),
     // which carries params_.gpu_leg: a load that left the GPU out for the NPU
@@ -668,6 +716,21 @@ bool llama_governor_policy::hot_plugged() const { return hot_plugged_; }
 llama_governor_pacing_battery_lines llama_governor_policy::decode_battery_lines() const {
     const auto limits = get_thresholds();
     return { limits.cool_enter, k_warn_c };
+}
+
+void llama_governor_policy::set_prefill_headroom(float npu_headroom_c, float gpu_headroom_c) {
+    // Raw, not smoothed, and deliberately outside reset_decode_hop(): that
+    // runs at prefill entry, which is AFTER the binding's pre-batch sample.
+    prefill_npu_headroom_c_ = npu_headroom_c;
+    prefill_gpu_headroom_c_ = gpu_headroom_c;
+}
+
+void llama_governor_policy::clear_prefill_headroom() {
+    // Where the turn's route re-arms, not where the hop clock does: a sample
+    // the binding never refreshes must read as unknown (the NPU) rather than
+    // decide the next turn off an arbitrarily old reading.
+    prefill_npu_headroom_c_ = std::numeric_limits<float>::quiet_NaN();
+    prefill_gpu_headroom_c_ = std::numeric_limits<float>::quiet_NaN();
 }
 
 bool llama_governor_policy::set_prefill_override(int mode) {

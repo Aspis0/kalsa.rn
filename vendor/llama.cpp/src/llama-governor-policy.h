@@ -31,6 +31,12 @@ bool llama_governor_expert_substitution_would_displace(
 // commit. Starting value, to be tuned on the S23.
 constexpr float k_hop_hysteresis_c = 4.0f;
 
+// The C a leg is expected to give up while it runs (defined
+// llama-governor-policy-hop.cpp, where the hop docks each idle candidate by it).
+// The prefill placement docks by it under the same rule: a leg that is already
+// running has paid the step and reads loaded, an idle one does not.
+float load_step_of(const llama_governor_params & params, llama_governor_engine engine);
+
 struct llama_governor_prefill_admission {
     llama_governor_decision decision = llama_governor_decision::Wait;
     llama_governor_engine engine = llama_governor_engine::CPU;
@@ -83,6 +89,16 @@ public:
     // pushes its leg table here (floors may drop a leg); the default
     // NPU+CPU is the two-model form's set, so v1 decisions are unchanged.
     void set_decode_legs(bool npu, bool gpu, bool cpu);
+    // The prefill placement's own thermal input, in C to each leg's first
+    // passive trip (llama_governor_set_prefill_headroom): the binding is
+    // expected to push one right before a prefill batch. Per-turn state, but
+    // not the clock reset_decode_hop() owns - that runs at prefill entry,
+    // AFTER the sample - so it is dropped by clear_prefill_headroom() where
+    // the turn's route re-arms instead. Raw, not smoothed: prefill decides
+    // before any turn history exists. NaN = unknown leg, which leaves prefill
+    // on the NPU.
+    void set_prefill_headroom(float npu_headroom_c, float gpu_headroom_c);
+    void clear_prefill_headroom();
     // The one-model governor's lane proof: its NPU leg exists and its
     // admission was set, which stands in for the LaunchConfig's fit /
     // readable-streams facts. npu_lane_enabled (the binding's platform
@@ -161,11 +177,19 @@ private:
     bool not_a_safety_state() const;
     // The GPU is loaded (params_.gpu_leg), fits, and is a measured prefill
     // backend on a generation the owner enabled for GPU prefill: the whole
-    // "a GPU leg is really there to prefill on" fact, which prefill_engine's
-    // GPU fallback folds in so the leg flag is read in one place.
+    // "a GPU leg is really there to prefill on" fact. It gates both places
+    // prefill_engine can reach a GPU leg on its own - the fallback and the
+    // NPU-hot handoff - so the leg flag is read in one place.
     // prefill_engine's bench overrides read the leg directly instead -
     // bench A/Bs an unmeasured GPU.
     bool gpu_prefill_capable() const;
+    // FIX 2 (owner 2026-10-16): the NPU lane is live but too hot to prefill on,
+    // and the GPU - read at the temperature it will run at, by the hop's own
+    // dock rule - is cooler than the NPU by more than the hop hysteresis and
+    // clears the guard + hysteresis outright. FAST and WARM only: a COOLMODE
+    // phone must not move prefill to the GPU (owner 2026-10-03). Unknown or
+    // infinite headroom on either leg leaves prefill on the NPU.
+    bool npu_hot_gpu_handoff() const;
 
     // Rule 4's leg choice (llama-governor-policy-hop.cpp): called only at
     // window boundaries while the hop is active; decides decode_hop_leg_,
@@ -205,6 +229,14 @@ private:
     float decode_cpu_headroom_c_ = std::numeric_limits<float>::quiet_NaN();
     float decode_npu_headroom_c_ = std::numeric_limits<float>::quiet_NaN();
     float decode_gpu_headroom_c_ = std::numeric_limits<float>::quiet_NaN();
+    // The same NPU/GPU margins, but the prefill placement's own sample: the
+    // binding is expected to push one before a prefill batch, and nothing does
+    // today, so both stay NaN and the handoff never fires. Deliberately NOT
+    // dropped by reset_decode_hop(), which runs at prefill entry after the
+    // sample; clear_prefill_headroom() drops them where the turn's route
+    // re-arms, so an unsampled turn reads as unknown rather than stale.
+    float prefill_npu_headroom_c_ = std::numeric_limits<float>::quiet_NaN();
+    float prefill_gpu_headroom_c_ = std::numeric_limits<float>::quiet_NaN();
     // Per-leg EMA of those samples while decode_headroom_tau_s > 0,
     // indexed like llama_governor_engine (CPU, GPU, NPU); NaN = no finite
     // sample yet (or a NaN sample), so the next finite sample seeds rather

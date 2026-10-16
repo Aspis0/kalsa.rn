@@ -268,6 +268,13 @@ bool parse_governor_params(
     // Absent or null => true, so an app predating the leg flag keeps today's
     // placement. gpu_fit stays the truthful fit verdict either way.
     params.gpu_leg = bool_or_null_as_fallback(governor, "gpu_leg", true);
+    // Absent or null => false. gpu_leg's fallback is the permissive direction
+    // (an app predating the field keeps today's placement); this one is the
+    // safe one, because the rule it gates is the prefill placement the R2
+    // oracle still fails - so a payload that never mentions it cannot turn a
+    // GPU prefill on.
+    params.prefill_thermal_handoff =
+        bool_or_null_as_fallback(governor, "prefill_thermal_handoff", false);
     params.npu_fit = fit_from(string_or(governor, "npu_fit"), "npu_fit");
     params.htp_trunk_readable = bool_or(governor, "htp_trunk_readable", false);
     params.htp_experts_readable = bool_or(governor, "htp_experts_readable", false);

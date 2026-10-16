@@ -121,13 +121,18 @@ test('the vendored engine declares the API, the facts, and safety before overrid
   ;['index', 'requested', 'actual', 'tokens', 'prefill_ms', 'forced', 'layers_device'].forEach((field) =>
     expect(struct).toContain(field),
   )
-  // The safety gate must come before the override consult: slice from the
-  // function head to the first bench_force reference and compare the order.
+  // The whole order the override surface lives in, one slice: safety gate ->
+  // JS CPU override -> JS GPU override (leg + Fit gated) -> bench force ->
+  // the FIX 2 thermal handoff -> the first plan branch. The end marker is the
+  // plan's own npu_lane_live(), so an engine step that only adds a plan branch
+  // below it cannot move this text; a step that reorders an override, drops
+  // the gpu_leg/Fit gates or lets the handoff outrank the bench force still
+  // fails here.
   expect(
     block(
       vendored('llama-governor-policy.cpp'),
       'llama_governor_engine llama_governor_policy::prefill_engine(',
-      'if (params_.bench_force_gpu_prefill',
+      'if (npu_lane_live()',
     ),
   ).toBe(
     'llama_governor_engine llama_governor_policy::prefill_engine( ' +
@@ -147,7 +152,12 @@ test('the vendored engine declares the API, the facts, and safety before overrid
       'const bool fit = params_.gpu_fit == llama_governor_fit::Fit; ' +
       'if (override_decided != nullptr) { *override_decided = fit; } ' +
       'return fit ? llama_governor_engine::GPU : llama_governor_engine::CPU; } ' +
-      'if (params_.bench_force_gpu_prefill',
+      'if (params_.bench_force_gpu_prefill && params_.gpu_leg && ' +
+      'params_.gpu_fit == llama_governor_fit::Fit) { ' +
+      'return llama_governor_engine::GPU; } ' +
+      'if (npu_hot_gpu_handoff()) { ' +
+      'return llama_governor_engine::GPU; } ' +
+      'if (npu_lane_live()',
   )
   expect(ext).toContain('bool route_chunks_truncated = false;')
   // The public forced comment stays causal: safety preemption and the Fit

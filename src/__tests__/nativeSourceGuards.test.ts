@@ -171,6 +171,84 @@ test('governor stats wire decode_us_* adjacency', () => {
 const governorFn = (signature: RegExp): string =>
   cpp('rn-governor.cpp').match(new RegExp(signature.source + /[^\n]*[\S\s]*?\n}\n/.source))![0]
 
+test('the prefill thermal reader is built without the hop', () => {
+  // With decode_hop_tokens at its production default of 0 nothing read a zone
+  // at all, so the prefill placement had no margins to price. The reader is
+  // therefore built on its own account once a one-copy load has both legs it
+  // compares - and the hop's cadence (decode_hop_tokens_, which still gates
+  // every decode-path sample) stays a separate fact. rn_governor needs a model
+  // to construct, so the host tests cannot reach this; the structure is the
+  // contract.
+  const init = governorFn(/void rn_governor::init_hop_reader\(const llama_governor_params & params, bool prefill_thermal\)/)
+  expect(init).toMatch(
+    /if \(params\.decode_hop_tokens > 0\) {[\S\s]*?} else if \(!prefill_thermal\) {\n {8}return;\n {4}}\n {4}decode_legs_ = std::make_unique<rn_thermal_legs>/,
+  )
+  // The 1-token path must not divide by a cadence that was never configured.
+  const before = governorFn(/void rn_governor::before_decode_batch\(int n_tokens\)/)
+  expect(before).toMatch(
+    /if \(decode_hop_tokens_ == 0\) {[\S\s]*?return;\n {4}}\n {4}const int64_t now_ms/,
+  )
+  // One-copy asks for the reader with the legs the engine actually built - a
+  // demoted leg is one the handoff could never reach - and the two-model form
+  // has no GPU leg to price, so it passes false.
+  const constructors = cpp('rn-governor.cpp')
+  expect(constructors.split('init_hop_reader(params, npu_leg_built && gpu_leg_built)').length - 1).toBe(1)
+  expect(constructors.split('init_hop_reader(params, false)').length - 1).toBe(1)
+  expect(constructors).toMatch(
+    /llama_governor_leg_ctx\(governor_, legs\[i]\.engine\) == nullptr\) {[\S\s]*?continue;\n {8}}[\S\s]*?init_hop_reader\(params, npu_leg_built && gpu_leg_built\)/,
+  )
+})
+
+test('the prefill margins are pushed once per turn, before admission', () => {
+  const before = governorFn(/void rn_governor::before_decode_batch\(int n_tokens\)/)
+  // The push lives in the multi-token branch only: a decode batch never
+  // re-prices the turn, and the latch makes the turn's first prefill batch the
+  // only one that reads the zones (a chunked prefill is several batches).
+  const prefillBranch = before.slice(before.indexOf('if (n_tokens > 1)'))
+  expect(prefillBranch).toMatch(
+    /if \(!prefill_headroom_sampled_\) {\n {12}prefill_headroom_sampled_ = true;\n {12}push_prefill_headroom\(\);\n {8}}/,
+  )
+  expect(before.indexOf('push_prefill_headroom()')).toBeLessThan(
+    before.indexOf('if (decode_hop_tokens_ == 0)'),
+  )
+  // The engine drops its copy wherever the route re-arms, so the latch does too:
+  // a turn the binding does not sample must read as unknown, not as stale heat.
+  expect(
+    ['clear_cache', 'reset_prefill_stats'].filter(
+      (fn) => !governorFn(new RegExp(`void rn_governor::${fn}\\(`)).includes('prefill_headroom_sampled_ = false'),
+    ),
+  ).toEqual([])
+  // And the push itself is one engine call plus the per-turn line.
+  const push = governorFn(/void rn_governor::push_prefill_headroom\(\)/)
+  expect(push).toContain('llama_governor_set_prefill_headroom(governor_, legs.npu_headroom_c, legs.gpu_headroom_c)')
+  expect(push).toContain('KALSA_GOVERNOR_PREFILL_THERMAL')
+})
+
+test('the per-turn thermal line parses as JSON, unknown leg as null', () => {
+  // Same reason as the battery line: the campaign parser drops a payload it
+  // cannot JSON.parse. The two margins are substituted, so this fails if the
+  // format ever carries a bare nan.
+  const push = governorFn(/void rn_governor::push_prefill_headroom\(\)/)
+  const format = push
+    .match(/"((?:[^"\\]|\\.)*)"/g)!
+    .map((literal) => literal.slice(1, -1))
+    .join('')
+  const tag = 'KALSA_GOVERNOR_PREFILL_THERMAL '
+  const payload = format.slice(format.indexOf(tag) + tag.length).replace(/\\"/g, '"')
+  expect(JSON.parse(payload.replace(/%s/g, 'null'))).toEqual({
+    npu_headroom_c: null,
+    gpu_headroom_c: null,
+  })
+  expect(JSON.parse(payload.replace(/%s/g, '7.5'))).toEqual({
+    npu_headroom_c: 7.5,
+    gpu_headroom_c: 7.5,
+  })
+  // And the formatter is what turns an unreadable leg into that null: never 0,
+  // never a printed nan.
+  const formatter = cpp('rn-governor.cpp').match(/std::string json_number\(float value\) {[\S\s]*?\n}\n/)![0]
+  expect(formatter).toContain('std::isfinite(value) ? std::to_string(value) : "null"')
+})
+
 test('window observation stays fresh on unchanged forecasts', () => {
   // A stable forecast is re-read every 2 s; the observation stamp must move
   // on every finite read even when the unchanged-value early return skips

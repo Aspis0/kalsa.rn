@@ -61,6 +61,12 @@ struct llama_governor {
     bool set_decode_headroom(float cpu_headroom_c, float npu_headroom_c,
                              float gpu_headroom_c = std::numeric_limits<float>::quiet_NaN());
     bool set_decode_legs(bool npu, bool gpu, bool cpu);
+    // Prefill-placement thermal headroom (llama_governor_set_prefill_headroom):
+    // the binding is expected to push one per turn right before a prefill
+    // batch, and nothing does today, so it stays NaN. NaN or infinite leg =
+    // unknown, which keeps prefill on the NPU. Same decode-thread contract as
+    // set_thermo_profile.
+    bool set_prefill_headroom(float npu_headroom_c, float gpu_headroom_c);
     // Bench route dev hook: validates mode (0..2) into the policy override.
     // Atomic store only - no stats refresh (threading contract above); it
     // takes effect at the next prefill latch.
@@ -82,6 +88,7 @@ struct llama_governor {
 
 private:
     friend struct llama_governor_pacing_test;
+    friend struct llama_governor_prefill_route_test;
     friend llama_governor * llama_governor_init_with_params_internal(
             llama_model *, llama_model *, llama_context_params, llama_context_params,
             llama_governor_params, std::string * failure_reason);
@@ -92,8 +99,8 @@ private:
 
     enum class phase { None, Prefill, Decode };
     // A turn chooses one prefill context at its first multi-token batch;
-    // later batches cannot switch between CPU and GPU.
-    enum class prefill_route { Undecided, GPU, CPU };
+    // later batches cannot switch engines.
+    enum class prefill_route { Undecided, NPU, GPU, CPU };
     // Internal control result; llama_decode uses 0, 1, 2, -1 and fatal values
     // below -1, so this cannot be mistaken for a native decode return.
     enum { k_prefill_chunked = -1001 };
@@ -120,10 +127,18 @@ private:
     int32_t fail(const char * message);
 
     // leg/context routing, shared by both forms (llama-governor-legs.cpp):
-    // the accelerator context of today's ctx_prefill role (NPU leg first,
-    // then the GPU leg, then the CPU leg; two-model: ctx_prefill itself,
-    // ctx_decode on the CPU route)
-    llama_context * prefill_ctx(bool cpu_route) const;
+    // the leg of the asked engine, and with that leg absent the accelerator
+    // context of today's ctx_prefill role (NPU leg first, then the GPU leg,
+    // then the CPU leg; two-model: ctx_prefill itself, ctx_decode on the CPU
+    // route)
+    llama_context * prefill_ctx(llama_governor_engine engine) const;
+    // the route/engine correspondence the prefill latch and prefill_ctx share
+    static prefill_route prefill_route_of(llama_governor_engine engine);
+    static llama_governor_engine prefill_engine_of(prefill_route route);
+    // the device a context that ran on this leg reports; a leg built on a
+    // device names it, and one without falls back to the accelerator role's
+    // name (which is also the two-model form's answer)
+    const std::string & layers_device_of(llama_context * ctx) const;
     // the decode context for the selected engine (one-model: its leg, the
     // CPU leg when absent; two-model: NPU on ctx_prefill, else ctx_decode)
     llama_context * decode_ctx(llama_governor_engine engine) const;
@@ -152,6 +167,11 @@ private:
     struct leg {
         llama_governor_engine engine = llama_governor_engine::CPU;
         llama_context * ctx = nullptr; // owned
+        // ggml's name for the device this leg was built on, which is the leg's
+        // first device and so the device its layers run on (llama-context.cpp);
+        // empty when the leg has none - the CPU leg passes the empty list, and
+        // on a host build every leg is CPU-only
+        std::string device_name;
         side_state state;
     };
     std::vector<leg> legs;

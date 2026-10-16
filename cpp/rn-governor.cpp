@@ -7,6 +7,7 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 namespace rnllama {
 
@@ -15,6 +16,13 @@ namespace {
 // Ages of the freshness stamps in ms; -1 when the stamp is 0 (never read).
 int32_t age_ms(int64_t now_ms, int64_t stamp_us) {
     return stamp_us == 0 ? -1 : static_cast<int32_t>(now_ms - stamp_us / 1000);
+}
+
+// One margin as strict JSON. A leg the reader could not see is null, never 0
+// and never "nan": the campaign parser JSON.parses these payloads verbatim and
+// drops one it cannot parse, and a 0 would read as a leg already at its trip.
+std::string json_number(float value) {
+    return std::isfinite(value) ? std::to_string(value) : "null";
 }
 
 // The leg that ran the last step, in the wire's coding: 0 cpu, 1 gpu, 2 npu,
@@ -55,7 +63,8 @@ rn_governor::rn_governor(llama_model * prefill_model, llama_model * decode_model
     }
     log_platform_thermal_availability();
     log_battery_sysfs();
-    init_hop_reader(params);
+    // The two-model form has no GPU leg, so there is no second reader to build.
+    init_hop_reader(params, false);
 }
 
 rn_governor::rn_governor(llama_model * model, const llama_governor_leg * legs, uint32_t n_legs,
@@ -74,6 +83,11 @@ rn_governor::rn_governor(llama_model * model, const llama_governor_leg * legs, u
     // OpenCL import) is a runtime demotion: logged once here, the hop simply
     // never uses that leg, and the load stays one-copy on the legs that did
     // build. The CPU leg cannot be absent - the engine refuses without it.
+    // The same walk answers whether the prefill thermal sample can run at all:
+    // it needs both an NPU and a GPU leg to price, and a demoted leg is one
+    // the prefill handoff could never reach.
+    bool npu_leg_built = false;
+    bool gpu_leg_built = false;
     for (uint32_t i = 0; i < n_legs; ++i) {
         if (legs[i].engine == llama_governor_engine::CPU) {
             continue;
@@ -82,28 +96,38 @@ rn_governor::rn_governor(llama_model * model, const llama_governor_leg * legs, u
             LOG_ERROR(
                 "KALSA_GOVERNOR_FALLBACK {stage:\"onecopy_leg_absent\", models_loaded:1, engine:\"%s\"}",
                 legs[i].engine == llama_governor_engine::NPU ? "NPU" : "GPU");
+            continue;
         }
+        npu_leg_built |= legs[i].engine == llama_governor_engine::NPU;
+        gpu_leg_built |= legs[i].engine == llama_governor_engine::GPU;
     }
     log_battery_sysfs();
-    init_hop_reader(params);
+    init_hop_reader(params, npu_leg_built && gpu_leg_built);
 }
 
-void rn_governor::init_hop_reader(const llama_governor_params & params) {
-    // The leg reader exists only when the hop is configured, so a hop-less
-    // governor does no sysfs work; the one-time counts say which legs the
-    // headroom rule can decide (both zero -> the engine's alternation
-    // fallback, e.g. Jelly/MTK denies the zones).
+void rn_governor::init_hop_reader(const llama_governor_params & params, bool prefill_thermal) {
+    // Two readers want the zones and they start at different times: the decode
+    // hop wants them when decode_hop_tokens > 0, and the prefill placement
+    // wants them on every one-copy load that has both an NPU and a GPU leg to
+    // price. With the hop off - the production default of 0 - the second one
+    // is the only reason a phone reads a zone at all. The hop's cadence is not
+    // touched by that: decode_hop_tokens_ still gates every decode-path
+    // sample, and the one-time counts say which legs the headroom rules can
+    // decide (both zero -> the engine's alternation fallback, e.g.
+    // Jelly/MTK denies the zones).
     if (params.decode_hop_tokens > 0) {
         decode_hop_tokens_ = params.decode_hop_tokens;
-        decode_legs_ = std::make_unique<rn_thermal_legs>("/sys/class/thermal");
-        LOG_INFO("governor: decode hop thermal legs cpu=%d npu=%d gpu=%d zones",
-                 decode_legs_->cpu_zone_count(), decode_legs_->npu_zone_count(),
-                 decode_legs_->gpu_zone_count());
-        const rn_thermal_legs::trip_range cpu = decode_legs_->trip_range_c(rn_thermal_legs::leg::cpu);
-        const rn_thermal_legs::trip_range npu = decode_legs_->trip_range_c(rn_thermal_legs::leg::npu);
-        const rn_thermal_legs::trip_range gpu = decode_legs_->trip_range_c(rn_thermal_legs::leg::gpu);
-        samples_.set_trips({cpu.min_c, cpu.max_c, npu.min_c, npu.max_c, gpu.min_c, gpu.max_c});
+    } else if (!prefill_thermal) {
+        return;
     }
+    decode_legs_ = std::make_unique<rn_thermal_legs>("/sys/class/thermal");
+    LOG_INFO("governor: thermal legs cpu=%d npu=%d gpu=%d zones, hop_tokens=%u",
+             decode_legs_->cpu_zone_count(), decode_legs_->npu_zone_count(),
+             decode_legs_->gpu_zone_count(), decode_hop_tokens_);
+    const rn_thermal_legs::trip_range cpu = decode_legs_->trip_range_c(rn_thermal_legs::leg::cpu);
+    const rn_thermal_legs::trip_range npu = decode_legs_->trip_range_c(rn_thermal_legs::leg::npu);
+    const rn_thermal_legs::trip_range gpu = decode_legs_->trip_range_c(rn_thermal_legs::leg::gpu);
+    samples_.set_trips({cpu.min_c, cpu.max_c, npu.min_c, npu.max_c, gpu.min_c, gpu.max_c});
 }
 
 void rn_governor::log_battery_sysfs() const {
@@ -205,14 +229,20 @@ void rn_governor::clear_cache(bool clear_data) {
     std::lock_guard<std::mutex> lock(engine_mutex_);
     decode_tokens_since_prefill_ = 0;
     reset_observation_record_locked();
+    // The engine drops its prefill margins here (clear_cache calls
+    // clear_prefill_headroom), so the next turn must sample again.
+    prefill_headroom_sampled_ = false;
     llama_governor_clear_cache(governor_, clear_data);
 }
 
 void rn_governor::reset_prefill_stats() {
     // The engine restarts its hop clock here too (the completion's
-    // beginCompletion is one caller); keep the mirror in step.
+    // beginCompletion is one caller), and it drops the prefill margins with it
+    // (reset_prefill_stats calls clear_prefill_headroom); keep both mirrors in
+    // step, so a turn that never prefills cannot leave last turn's sample.
     std::lock_guard<std::mutex> lock(engine_mutex_);
     decode_tokens_since_prefill_ = 0;
+    prefill_headroom_sampled_ = false;
     // The record is per completion: this is its start.
     reset_observation_record_locked();
     llama_governor_reset_prefill_stats(governor_);
@@ -236,6 +266,17 @@ void rn_governor::before_decode_batch(int n_tokens) {
         // The prefill restarts the hop clock; a boundary staged for the
         // abandoned sequence must never commit.
         pending_valid_ = false;
+        // The prefill placement prices the legs off this one sample, so it
+        // runs on the turn's first prefill batch and not on every chunk.
+        if (!prefill_headroom_sampled_) {
+            prefill_headroom_sampled_ = true;
+            push_prefill_headroom();
+        }
+        return;
+    }
+    if (decode_hop_tokens_ == 0) {
+        // The reader exists for the prefill sample alone (see
+        // init_hop_reader); the hop has no window to stage.
         return;
     }
     const int64_t now_ms = ggml_time_us() / 1000;
@@ -244,6 +285,23 @@ void rn_governor::before_decode_batch(int n_tokens) {
         stage_window(now_ms, legs);
     }
     ++decode_tokens_since_prefill_;
+}
+
+// The NPU and GPU margins, in C to each leg's first passive trip, pushed to
+// the engine's prefill placement (llama_governor_set_prefill_headroom) once
+// per turn. A leg with no usable zone reads NaN there, which the engine takes
+// as unknown and answers by keeping prefill on the NPU. Caller holds
+// engine_mutex_.
+void rn_governor::push_prefill_headroom() {
+    const rn_thermal_legs::headroom legs = decode_legs_->sample();
+    llama_governor_set_prefill_headroom(governor_, legs.npu_headroom_c, legs.gpu_headroom_c);
+    // Pushed whether or not prefill_thermal_handoff is on: with the switch
+    // false the engine's rule stays off, and the line is what the device
+    // check reads to prove the reader is built and the margins are finite.
+    const std::string npu_json = json_number(legs.npu_headroom_c);
+    const std::string gpu_json = json_number(legs.gpu_headroom_c);
+    LOG_INFO("KALSA_GOVERNOR_PREFILL_THERMAL {\"npu_headroom_c\":%s, \"gpu_headroom_c\":%s}",
+             npu_json.c_str(), gpu_json.c_str());
 }
 
 void rn_governor::stage_window(int64_t now_ms, const rn_thermal_legs::headroom & legs) {

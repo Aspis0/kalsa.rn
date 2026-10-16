@@ -281,6 +281,35 @@ bool test_trip_range() {
     return ok;
 }
 
+// The reader the prefill placement samples is built on every one-copy load
+// with an NPU and a GPU leg, hop or no hop (rn_governor::init_hop_reader), so
+// nothing about a fake tree may change its contract: the two margins it pushes
+// come from the same sample(), and a leg with no usable zone answers NaN there
+// too - the engine reads NaN as unknown and keeps prefill on the NPU. A 0
+// would read as a leg already sitting on its passive trip.
+bool test_prefill_leg_margins() {
+    const auto root = make_s23_tree();
+    const rn_thermal_legs legs(root.string());
+    // The values the per-turn line logs and the engine call carries: the NPU
+    // zone is the hot one (95000-88000), the GPU zone the cool one.
+    const auto warm = legs.sample();
+    if (!close_to(warm.npu_headroom_c, 7.0f) || !close_to(warm.gpu_headroom_c, 40.0f)) {
+        std::cerr << "prefill margins npu=" << warm.npu_headroom_c
+                  << " gpu=" << warm.gpu_headroom_c << std::endl;
+        return false;
+    }
+    // The hot leg reads finite and the unreadable one NaN: never a guess.
+    const auto hot_npu = make_temp_root("kalsa_thermal_legs_prefill_npu_only");
+    make_zone(hot_npu, 0, "nspss-0", {{"temp", "92000"},
+                                      {"trip_point_0_type", "passive"}, {"trip_point_0_temp", "95000"}});
+    const rn_thermal_legs npu_only(hot_npu.string());
+    const auto one = npu_only.sample();
+    const bool ok = !is_unknown(one.npu_headroom_c) && is_unknown(one.gpu_headroom_c);
+    std::filesystem::remove_all(root);
+    std::filesystem::remove_all(hot_npu);
+    return ok;
+}
+
 } // namespace
 
 int main() {
@@ -296,6 +325,7 @@ int main() {
     results.run_test("hot temp is max over the leg's zones", test_hot_is_max_over_the_leg());
     results.run_test("dark zone NaNs hot and headroom together", test_dark_zone_nans_hot_and_headroom());
     results.run_test("trip range: min/max in C, empty leg NaN", test_trip_range());
+    results.run_test("prefill margins: finite where a zone reads, NaN where none", test_prefill_leg_margins());
     results.print_summary();
     return (results.passed_tests == results.total_tests) ? 0 : 1;
 }

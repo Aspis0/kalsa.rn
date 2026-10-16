@@ -415,7 +415,7 @@ int32_t llama_governor::decode_impl(llama_batch batch, bool allow_chunking) {
     // a hop never needs a reload. The one-model form routes the same roles
     // through its legs (prefill_ctx / decode_ctx, llama-governor-legs.cpp).
     const bool cpu_prefill = is_prefill && prefill_route_ == prefill_route::CPU;
-    llama_context * target = is_prefill ? prefill_ctx(cpu_prefill)
+    llama_context * target = is_prefill ? prefill_ctx(prefill_engine_of(prefill_route_))
                                         : decode_ctx(decode_engine_);
     side_state * state = side_of(target);
     const phase next_phase = is_prefill ? phase::Prefill : phase::Decode;
@@ -517,11 +517,13 @@ int32_t llama_governor::decode_impl(llama_batch batch, bool allow_chunking) {
             // Causal: true only when prefill_engine() took the override
             // branch (no safety preemption, Fit gate passed for GPU).
             chunk.forced = turn_override_decided_;
-            // The CPU route runs on ctx_decode, so the device fact follows the
-            // context that executed the chunk, not `actual`.
+            // The device fact follows the context that executed the chunk, not
+            // `actual`: the CPU route runs on ctx_decode, and in the one-model
+            // form each leg reports the device it was built on.
+            const std::string & device = cpu_prefill ? decode_layers_device_
+                                                      : layers_device_of(target);
             std::snprintf(chunk.layers_device, sizeof(chunk.layers_device), "%s",
-                          cpu_prefill ? decode_layers_device_.c_str()
-                                      : prefill_layers_device_.c_str());
+                          device.c_str());
             ++stats_.route_chunk_count;
         } else {
             stats_.route_chunks_truncated = true;

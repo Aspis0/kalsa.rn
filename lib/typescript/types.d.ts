@@ -209,6 +209,7 @@ export type NativeContextParams = {
         model_kind?: 'Dense' | 'Hybrid' | 'MoE' | 'Unknown';
         gpu_fit?: 'Fit' | 'NoFit' | 'NotFit' | 'Unknown';
         gpu_leg?: boolean;
+        prefill_thermal_handoff?: boolean;
         bench_force_gpu_prefill?: boolean;
         npu_lane_enabled?: boolean;
         reload_budget_available?: boolean;

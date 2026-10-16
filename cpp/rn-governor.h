@@ -46,9 +46,11 @@ public:
     void reset_prefill_stats();
     // The completion's decode path calls this before every standard decode
     // batch, on the decode thread: it keeps the binding mirror of the
-    // engine's decode_tokens_since_prefill_ in step and feeds the fresh leg
-    // sample each hop window opens on (see before_decode_batch in the .cpp).
-    // No-op when the hop is off (no reader, no sysfs work).
+    // engine's decode_tokens_since_prefill_ in step, feeds the fresh leg
+    // sample each hop window opens on (see before_decode_batch in the .cpp),
+    // and pushes the turn's prefill margins on the first prefill batch.
+    // No-op when there is no reader (two-model load, or a one-copy load whose
+    // GPU leg was demoted).
     void before_decode_batch(int n_tokens);
     bool set_thermo_profile(const llama_governor_thermo_profile & profile);
     // Bench route dev hook: 0=auto, 1=cpu, 2=gpu (engine validates).
@@ -82,18 +84,25 @@ public:
     const std::string & failure_reason() const { return failure_reason_; }
 
 private:
-    // The decode-hop thermal-leg reader both constructors share: built only
-    // when decode_hop_tokens > 0, so a hop-less governor does no sysfs work.
-    void init_hop_reader(const llama_governor_params & params);
+    // The thermal-leg reader both constructors share: built when the decode hop
+    // is configured (decode_hop_tokens > 0) and, on a one-copy load that has
+    // both an NPU and a GPU leg built, for the prefill placement's own once-
+    // per-turn sample. prefill_thermal says the second case.
+    void init_hop_reader(const llama_governor_params & params, bool prefill_thermal);
     void log_platform_thermal_availability() const;
     // The one-time OPEN 4 probe, logged on its own tag: KALSA_GOVERNOR_PLATFORM
     // stays status-only by contract.
     void log_battery_sysfs() const;
-    // Samples the legs and hands the headroom to the engine; a no-op when
-    // there is no reader (decode_hop_tokens == 0). Called only from
+    // Samples the legs and hands the headroom to the engine; a no-op while
+    // decode_hop_tokens == 0 (the reader may still exist for the prefill
+    // sample). Called only from
     // before_decode_batch, which holds engine_mutex_. Returns the combined
     // reading so the observation record reuses it (one sysfs read per window).
     rn_thermal_legs::headroom feed_decode_headroom();
+    // One sysfs read of the NPU and GPU margins, pushed to the engine's prefill
+    // placement and logged. Called once per turn, from before_decode_batch on
+    // the first prefill batch. Caller holds engine_mutex_.
+    void push_prefill_headroom();
     // Stage 0 observation of one window boundary: the freshness snapshot, the
     // combined zone reading just taken, and the engine's applied values are
     // held PENDING - committed by commit_window only once the decode step
@@ -119,8 +128,14 @@ private:
     uint32_t decode_tokens_since_prefill_ = 0;
     llama_governor_fit gpu_fit_ = llama_governor_fit::Unknown;
     bool gpu_leg_ = true;
-    // Decode-hop leg reader, built only when decode_hop_tokens > 0.
+    // Decode-hop leg reader, built when decode_hop_tokens > 0, and on a
+    // one-copy load with both an NPU and a GPU leg for the prefill sample.
     std::unique_ptr<rn_thermal_legs> decode_legs_;
+    // The engine drops its prefill margins wherever the turn's route re-arms
+    // (clear_cache, reset_prefill_stats), so this latch re-arms there too:
+    // one sample per turn, and a turn the binding does not sample reads as
+    // unknown rather than stale.
+    bool prefill_headroom_sampled_ = false;
     // Atomic: decode() writes it on the decode thread while the override
     // setter (allowed to overlap decode) reads it from a pool worker.
     std::atomic<bool> failed_{false};

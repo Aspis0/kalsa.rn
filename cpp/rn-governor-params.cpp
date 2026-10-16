@@ -468,4 +468,41 @@ std::vector<ggml_backend_dev_t> devices_excluding_registry(
     return kept;
 }
 
+governor_load_legs governor_two_model_legs(
+        bool lane_resolved, bool gpu_placement_allowed) {
+    governor_load_legs legs;
+    legs.npu = lane_resolved;
+    // A resolved lane pins the prefill context to the HTP alone, so the GPU leg
+    // is the gated GPU only when the lane did not take that context.
+    legs.gpu = gpu_placement_allowed && !lane_resolved;
+    return legs;
+}
+
+nlohmann::ordered_json governor_load_json(const governor_load_facts & facts) {
+    if (!facts.governor) {
+        return nullptr;
+    }
+    // An absent optional string crosses as null, never "": the same rule the
+    // getGovernorStats plan fields follow, so one report cannot read an
+    // unmatched row as a row whose SoC model is blank.
+    const auto optional = [](const std::string & value) {
+        return value.empty() ? nlohmann::ordered_json(nullptr) : nlohmann::ordered_json(value);
+    };
+    return nlohmann::ordered_json{
+        {"one_copy", facts.one_copy},
+        {"npu_leg", facts.legs.npu},
+        {"gpu_leg", facts.legs.gpu},
+        {"cpu_leg", facts.legs.cpu},
+        {"prefill_thermal_handoff", facts.prefill_thermal_handoff},
+        {"soc", optional(facts.soc)},
+        {"cache_type_k", optional(facts.cache_type_k)},
+        {"cache_type_v", optional(facts.cache_type_v)},
+        {"kv_reason", optional(facts.kv_reason)},
+        {"hop_tokens", facts.hop_tokens},
+        {"zones_cpu", facts.zones_cpu},
+        {"zones_npu", facts.zones_npu},
+        {"zones_gpu", facts.zones_gpu},
+    };
+}
+
 } // namespace rnllama

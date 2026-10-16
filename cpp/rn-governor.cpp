@@ -1,5 +1,6 @@
 #include "rn-governor.h"
 #include "llama-governor.h"
+#include "rn-governor-params.h"
 #include "rn-llama.h"
 
 #include "ggml.h"
@@ -63,6 +64,12 @@ rn_governor::rn_governor(llama_model * prefill_model, llama_model * decode_model
     }
     log_platform_thermal_availability();
     log_battery_sysfs();
+    // The two-model form builds no legs in this sense: one prefill context and
+    // one decode context, not one per engine, so there is nothing to probe and
+    // legBuilt reads false for both accelerators. What the two contexts run on
+    // is the placement the LOADER applied, and it owns that verdict - it is
+    // the only side that still knows the lane was asked for.
+    //
     // The two-model form has no GPU leg, so there is no second reader to build.
     init_hop_reader(params, false);
 }
@@ -101,6 +108,8 @@ rn_governor::rn_governor(llama_model * model, const llama_governor_leg * legs, u
         npu_leg_built |= legs[i].engine == llama_governor_engine::NPU;
         gpu_leg_built |= legs[i].engine == llama_governor_engine::GPU;
     }
+    npu_leg_built_ = npu_leg_built;
+    gpu_leg_built_ = gpu_leg_built;
     log_battery_sysfs();
     init_hop_reader(params, npu_leg_built && gpu_leg_built);
 }
@@ -217,6 +226,29 @@ bool rn_governor::trim_sequence(llama_pos p) const {
 
 bool rn_governor::engine_failed() const {
     return governor_ != nullptr && governor_->is_failed();
+}
+
+bool rn_governor::legBuilt(llama_governor_engine engine) const {
+    // The engine's own leg probe, so a leg the engine refused (the load logs it
+    // as onecopy_leg_absent) reads false. Only the one-model form has legs to
+    // probe: the two-model form builds a prefill context and a decode context
+    // instead, and reads false for both accelerators - which is not the same as
+    // "no accelerator ran", so the load's placement must not be derived from
+    // this. GPU_COOLMODE is a decode state, not a leg, and reads false too.
+    return engine == llama_governor_engine::NPU ? npu_leg_built_
+         : engine == llama_governor_engine::GPU ? gpu_leg_built_
+         : false;
+}
+
+rn_governor::zones_facts rn_governor::zones() const {
+    zones_facts out;
+    out.hop_tokens = decode_hop_tokens_;
+    if (decode_legs_ != nullptr) {
+        out.cpu = decode_legs_->cpu_zone_count();
+        out.npu = decode_legs_->npu_zone_count();
+        out.gpu = decode_legs_->gpu_zone_count();
+    }
+    return out;
 }
 
 void rn_governor::clear_cache(bool clear_data) {

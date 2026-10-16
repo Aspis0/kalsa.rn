@@ -144,6 +144,10 @@ export declare class LlamaContext {
     model: NativeLlamaContext['model'];
     androidLib: NativeLlamaContext['androidLib'];
     systemInfo: NativeLlamaContext['systemInfo'];
+    /** What the governor load decided; null on a non-governor load. Carried on
+     * the context so the app can log it next to the stats it describes, which is
+     * the only place these facts exist outside logcat. */
+    governorLoad: NativeLlamaContext['governor_load'];
     /**
      * Parallel processing namespace for non-blocking queue operations
      */
@@ -203,7 +207,7 @@ export declare class LlamaContext {
             remove: () => void;
         }>;
     };
-    constructor({ contextId, gpu, devices, reasonNoGPU, model, androidLib, systemInfo, }: NativeLlamaContext);
+    constructor({ contextId, gpu, devices, reasonNoGPU, model, androidLib, systemInfo, governor_load: governorLoad, }: NativeLlamaContext);
     loadSession(filepath: string): Promise<NativeSessionLoadResult>;
     saveSession(filepath: string, options?: {
         tokenSize: number;

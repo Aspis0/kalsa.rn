@@ -6,6 +6,8 @@
 
 #include "ggml-backend.h"
 
+#include <cstdint>
+#include <string>
 #include <vector>
 
 namespace rnllama {
@@ -37,6 +39,84 @@ struct governor_load_options {
     // one-copy load (merge_leg_row_defaults).
     governor_v3_keys v3_sent{};
 };
+
+/** Which accelerators one governor load put a context on, as that load resolved
+ *  them. The one-copy form reads this off the engine's own leg probe
+ *  (rn_governor::legBuilt, false for a leg the engine refused); the two-model
+ *  form from the placement the loader applied, because there the engine builds
+ *  contexts rather than legs and cannot answer. */
+struct governor_load_legs {
+    bool npu = false;
+    bool gpu = false;
+    // Always true: the one-model engine refuses a governor without the CPU leg,
+    // and the two-model form's decode context is CPU-resident.
+    bool cpu = true;
+};
+
+/** Which legs the two-model load put its prefill context on, from the two facts
+ *  that decided it. The engine cannot answer this there - it builds contexts,
+ *  not legs - so the load does (rn_governor::legBuilt is the one-model answer).
+ *
+ *  prefill_cpu_only is deliberately NOT an input: it is false whenever the lane
+ *  resolved, which is exactly the load whose prefill context is HTP-pinned
+ *  ({resolved.device, nullptr}, cpp/rn-llama.cpp) and runs no GPU at all, so a
+ *  GPU leg read off it claims a leg that load never placed. Pure, so the host
+ *  test drives it. */
+governor_load_legs governor_two_model_legs(
+    bool lane_resolved, bool gpu_placement_allowed);
+
+/** What one governor load built, as the app's governor_load record on the
+ *  init result (cpp/jsi/RNLlamaJSI.cpp). Every fact here used to reach the lab
+ *  only through logcat - the legs table row match, the KV override, the leg the
+ *  engine refused, the one-time zone counts - and the uploaded report reads the
+ *  JS console, so this record is how any of it reaches the app at all. Plain
+ *  data, so the host test drives the wire shape with literals. */
+struct governor_load_facts {
+    // False leaves the record off the init result: no governor load ran, so
+    // there are no governor facts to report.
+    bool governor = false;
+    // The one-model three-leg form: the legs table matched AND the app asked
+    // for the NPU lane. False with soc set means the row matched and the lane
+    // was off, so the two-model load ran instead.
+    bool one_copy = false;
+    // The legs a governor context runs on, as the load resolved them: a leg
+    // the engine refused is false. The CPU leg is always true - the engine
+    // refuses a governor without it.
+    governor_load_legs legs;
+    // The owner's per-generation prefill thermal handoff switch, as the load
+    // received it: whether rule 10 was armed at all on this generation.
+    bool prefill_thermal_handoff = false;
+    // The matched row's SoC model ("SM8550"); empty when no row matched. The
+    // model alone, never the Hexagon arch, the GPU name/version or the driver
+    // line the table also matches on: "a row matched" is the fact this reports,
+    // those are the hardware detail behind it.
+    std::string soc;
+    // The cache ggml type names BOTH governor contexts run with. Empty is not
+    // expected once a governor load ran; a non-governor load has no record.
+    std::string cache_type_k;
+    std::string cache_type_v;
+    // Why the KV types OR their placement differ from the request:
+    // "htp-prefill-kv" where the HTP lane upgraded a type it cannot write (so
+    // the types changed), "flash-attn-off" where the types stood unchanged and
+    // the load host-pinned KV instead (so only the placement changed - flash
+    // attention was off, which takes device KV off the table). Empty when the
+    // load left both the types and the placement as the caller sent them.
+    std::string kv_reason;
+    // The effective decode hop cadence, and the /sys/class/thermal zones per
+    // leg the one-time reader found. A zero cadence with zero zones is the
+    // engine's alternation fallback deciding every window, not a phone that
+    // has no zones.
+    uint32_t hop_tokens = 0;
+    int zones_cpu = 0;
+    int zones_npu = 0;
+    int zones_gpu = 0;
+};
+
+/** The governor_load wire shape: the init result's record, or JSON null when
+ *  no governor load ran. Numbers, booleans and short enum strings only, with
+ *  an absent optional string as null - no device strings, driver lines or
+ *  serials, which stay in logcat. */
+nlohmann::ordered_json governor_load_json(const governor_load_facts & facts);
 
 bool parse_governor_params(
     const nlohmann::ordered_json & governor,

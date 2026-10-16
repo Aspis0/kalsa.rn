@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <stdexcept>
 #include <vector>
@@ -55,6 +56,11 @@ void llama_governor::record_tally() {
 void llama_governor::refresh_policy_stats() {
     if (prefill_route_ == prefill_route::Undecided) {
         stats_.prefill_engine = policy_.prefill_engine();
+        // While no turn has latched a route the report follows the live sample,
+        // so a turn the binding does not sample reads NaN rather than the
+        // previous turn's heat. The latch below pins the reading it decided on.
+        stats_.prefill_npu_headroom_c = policy_.prefill_npu_headroom_c();
+        stats_.prefill_gpu_headroom_c = policy_.prefill_gpu_headroom_c();
     } else if (prefill_route_ == prefill_route::CPU) {
         stats_.prefill_engine = llama_governor_engine::CPU;
     }
@@ -75,6 +81,9 @@ void llama_governor::refresh_policy_stats() {
     stats_.decode_pacing_start_applied = ramp.decode_pacing_headroom_start;
     stats_.decode_pacing_full_applied = ramp.decode_pacing_headroom_full;
     stats_.decode_pacing_min_duty_applied = ramp.decode_pacing_min_duty;
+    // A params fact, refreshed whatever the route: whether the thermal handoff
+    // was armed at all is what separates a declined rule from an unarmed one.
+    stats_.prefill_thermal_handoff = ramp.prefill_thermal_handoff;
 }
 
 int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {
@@ -94,10 +103,17 @@ int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {
     }
     llama_governor_prefill_mode mode_used = llama_governor_prefill_mode::Auto;
     bool override_decided = false;
-    const auto requested = policy_.prefill_engine(&mode_used, &override_decided);
+    bool thermal_handoff = false;
+    const auto requested = policy_.prefill_engine(&mode_used, &override_decided, &thermal_handoff);
+    // Read with the decision they belong to, not at the latch below: the mode
+    // is atomic and the binding pushes it from another thread, and the margins
+    // are the policy's per-turn state, so a re-read after the decision could
+    // name inputs the turn did not run on.
+    const float npu_headroom_c = policy_.prefill_npu_headroom_c();
+    const float gpu_headroom_c = policy_.prefill_gpu_headroom_c();
     const float now_c = policy_.current_temperature_c();
     const auto admission = policy_.admit_prefill(
-            requested, static_cast<uint32_t>(batch.n_tokens), now_c, n_batch);
+            requested, static_cast<uint32_t>(batch.n_tokens), now_c, n_batch, thermal_handoff);
     stats_.last_router_rule = admission.rule;
     if (admission.decision == llama_governor_decision::Abort) {
         return fail("prefill admission aborted");
@@ -126,6 +142,17 @@ int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {
         // latch reports the same mode and the same causal decision.
         turn_prefill_mode_ = mode_used;
         turn_override_decided_ = override_decided;
+        // And the margins it decided on. reset_prefill_stats and clear_cache
+        // drop the policy's copy where the NEXT turn re-arms, so pinning them
+        // here is what lets this turn's end-of-turn report name the sample its
+        // route was taken on instead of the post-clear NaN.
+        stats_.prefill_npu_headroom_c = npu_headroom_c;
+        stats_.prefill_gpu_headroom_c = gpu_headroom_c;
+        // The rule this turn's route came from, numbered from the decision
+        // above rather than by re-reading the routing inputs - and the same
+        // number admit_prefill stamped into last_router_rule.
+        stats_.prefill_router_rule = static_cast<int32_t>(
+                policy_.prefill_rule_for(thermal_handoff, admission.engine));
     }
     if (admission.decision == llama_governor_decision::CPUFallback) {
         // Whole admission of a non-CPU request on its requested engine; the
@@ -145,7 +172,7 @@ int32_t llama_governor::admit_prefill(llama_batch batch, bool allow_chunking) {
     while (remaining > 0) {
         const auto next = policy_.admit_prefill(
                 requested, static_cast<uint32_t>(remaining),
-                policy_.current_temperature_c(), n_batch);
+                policy_.current_temperature_c(), n_batch, thermal_handoff);
         if (next.decision == llama_governor_decision::Wait) {
             // Defensive: under the threading contract the profile cannot change
             // inside one decode, and an admission that reached the planner
@@ -248,6 +275,13 @@ void llama_governor::clear_cache(bool clear_data) {
     last_ctx = nullptr;
     last_phase = phase::None;
     prefill_route_ = prefill_route::Undecided;
+    // The route re-armed, so the previous turn's rule and margins do not
+    // apply: a turn that has placed nothing reports 0 and unknown, rather
+    // than the turn before it. A completion that runs no batch never reaches
+    // refresh_policy_stats, so this is the only thing that clears them.
+    stats_.prefill_router_rule = 0;
+    stats_.prefill_npu_headroom_c = std::numeric_limits<float>::quiet_NaN();
+    stats_.prefill_gpu_headroom_c = std::numeric_limits<float>::quiet_NaN();
     decode_tokens_since_prefill_ = 0;
     forced_window_ = UINT32_MAX;
     policy_.reset_decode_hop();
@@ -294,6 +328,10 @@ void llama_governor::clear_cache(bool clear_data) {
 
 void llama_governor::reset_prefill_stats() {
     prefill_route_ = prefill_route::Undecided;
+    // Same as clear_cache: the next turn has placed no prefill yet.
+    stats_.prefill_router_rule = 0;
+    stats_.prefill_npu_headroom_c = std::numeric_limits<float>::quiet_NaN();
+    stats_.prefill_gpu_headroom_c = std::numeric_limits<float>::quiet_NaN();
     // The hop clock is per-turn routing state like the latch: the binding
     // calls this at every completion start, so a turn whose prompt was fully
     // cached (its 1-token batch never enters the prefill branch) still

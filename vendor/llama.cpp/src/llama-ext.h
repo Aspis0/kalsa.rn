@@ -559,6 +559,11 @@ struct llama_governor_stats {
     llama_governor_fit npu_fit = llama_governor_fit::Unknown;
     uint32_t prefill_token_cap = 0; // 0 represents LaunchConfig null.
     bool decode_requires_reload = false;
+    // Which rule made the LAST route decision - decode tokens overwrite it, so
+    // for a turn's prefill placement read prefill_router_rule below. The
+    // numbers are listed once, over llama_governor_policy::prefill_rule_for in
+    // llama-governor-policy.cpp; 3 and 4 are minted by select_decode there, the
+    // rest by prefill_rule_for.
     uint32_t last_router_rule = 0;
     uint64_t cpu_to_gpu_engagements = 0;
     // Decode-hop observability: decode-to-decode context switches executed,
@@ -642,6 +647,36 @@ struct llama_governor_stats {
     float decode_pacing_start_applied = std::numeric_limits<float>::quiet_NaN();
     float decode_pacing_full_applied = std::numeric_limits<float>::quiet_NaN();
     float decode_pacing_min_duty_applied = std::numeric_limits<float>::quiet_NaN();
+    // The prefill placement's thermal input in C to each leg's first passive
+    // trip, raw as the binding pushed it (llama_governor_set_prefill_headroom).
+    // They belong to ONE turn: pinned at its prefill latch from the sample read
+    // with the admission, so an end-of-turn report names the margins the route
+    // was actually taken on even though reset_prefill_stats / clear_cache drop
+    // the policy's copy where the next turn re-arms. NaN means this turn placed
+    // no prefill, or placed one on no sample - which is also the value they
+    // carry at those resets, since a completion that runs no batch never
+    // reaches a stats refresh to clear them.
+    float prefill_npu_headroom_c = std::numeric_limits<float>::quiet_NaN();
+    float prefill_gpu_headroom_c = std::numeric_limits<float>::quiet_NaN();
+    // The owner's per-generation switch (llama_governor_params
+    // ::prefill_thermal_handoff), reported so a log can say whether rule 10
+    // was even armed on the generation that ran: an NPU-first turn on an
+    // owner-off generation and a rule that declined to fire are the same two
+    // headroom readings otherwise.
+    bool prefill_thermal_handoff = false;
+    // Which rule placed THIS turn's prefill, pinned at its prefill latch beside
+    // the margins above and numbered from the same decision that chose the
+    // engine: 1 on a generation with no HTP lane at all, 10 for an NPU-hot
+    // handoff, 5 for any other GPU (a forced one or the lane-off fallback),
+    // 8 for a GPU_COOLMODE pick, 2 for the NPU, 9 for the CPU, 0 until the turn
+    // admits one - the full list is the comment block over
+    // llama_governor_policy::prefill_rule_for in llama-governor-policy.cpp.
+    // last_router_rule cannot answer this once decode starts, because every
+    // decode token overwrites it; while the turn is still prefilling the two
+    // agree, the admission stamping the same number. Zeroed with the route at
+    // reset_prefill_stats / clear_cache, so a turn that never prefills reports
+    // 0 rather than the turn before it.
+    int32_t prefill_router_rule = 0;
 };
 
 /** Cumulative optional telemetry supplied by a streaming/backend integration. */

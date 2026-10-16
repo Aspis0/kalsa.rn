@@ -127,7 +127,10 @@ test('the vendored engine declares the API, the facts, and safety before overrid
   // plan's own npu_lane_live(), so an engine step that only adds a plan branch
   // below it cannot move this text; a step that reorders an override, drops
   // the gpu_leg/Fit gates or lets the handoff outrank the bench force still
-  // fails here.
+  // fails here. The handoff also stamps its own thermal_handoff out-param, the
+  // flag rule 10 is numbered from: it is pinned here because it is decided on
+  // that branch, and a handoff that answered GPU without saying so would leave
+  // a GPU prefill indistinguishable from a forced or lane-off one.
   expect(
     block(
       vendored('llama-governor-policy.cpp'),
@@ -136,10 +139,12 @@ test('the vendored engine declares the API, the facts, and safety before overrid
     ),
   ).toBe(
     'llama_governor_engine llama_governor_policy::prefill_engine( ' +
-      'llama_governor_prefill_mode * mode_used, bool * override_decided) const { ' +
+      'llama_governor_prefill_mode * mode_used, bool * override_decided, ' +
+      'bool * thermal_handoff) const { ' +
       'const auto mode = prefill_override_.value.load(); ' +
       'if (mode_used != nullptr) { *mode_used = mode; } ' +
       'if (override_decided != nullptr) { *override_decided = false; } ' +
+      'if (thermal_handoff != nullptr) { *thermal_handoff = false; } ' +
       'if (!valid_schema(params_) || !profile_valid_ || !have_profile_ || ' +
       'state_ == llama_governor_thermal_state::CRITICAL || ' +
       'state_ == llama_governor_thermal_state::Invalid || ' +
@@ -156,6 +161,7 @@ test('the vendored engine declares the API, the facts, and safety before overrid
       'params_.gpu_fit == llama_governor_fit::Fit) { ' +
       'return llama_governor_engine::GPU; } ' +
       'if (npu_hot_gpu_handoff()) { ' +
+      'if (thermal_handoff != nullptr) { *thermal_handoff = true; } ' +
       'return llama_governor_engine::GPU; } ' +
       'if (npu_lane_live()',
   )

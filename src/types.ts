@@ -307,6 +307,45 @@ export type NativeContextParams = {
   }
 }
 
+/** What one governor load built, published on the init result so the uploaded
+ *  report carries the facts that otherwise only reach logcat. Numbers,
+ *  booleans and short enum strings only — no device strings, driver lines or
+ *  serials. */
+export type GovernorLoadFacts = {
+  /** The one-model three-leg form: the legs table matched AND the NPU lane was
+   *  asked for. false with a `soc` set means the row matched and the two-model
+   *  load ran anyway (lane off, or a demotion from one-copy). */
+  one_copy: boolean
+  /** The legs a governor context runs on, as the load resolved them: false for
+   *  a leg the engine refused. The CPU leg is always true — the engine refuses
+   *  a governor without it. */
+  npu_leg: boolean
+  gpu_leg: boolean
+  cpu_leg: boolean
+  /** Whether the owner's per-generation prefill thermal handoff was armed. */
+  prefill_thermal_handoff: boolean
+  /** The matched legs-table row's SoC model ("SM8550"); null when no row
+   *  matched. */
+  soc: string | null
+  /** The cache ggml type names both governor contexts run with, which the HTP
+   *  lane may have upgraded past the caller's. */
+  cache_type_k: string | null
+  cache_type_v: string | null
+  /** Why the KV types OR their placement differ from the request:
+   *  "htp-prefill-kv" where the lane upgraded one (types changed),
+   *  "flash-attn-off" where the types stood and the load host-pinned KV instead
+   *  (only the placement changed); null when neither changed. */
+  kv_reason: string | null
+  /** Effective decode hop cadence; 0 is the hop being off. */
+  hop_tokens: number
+  /** /sys/class/thermal zones per leg the one-time reader found. All zero at
+   *  a zero cadence is the engine's alternation fallback deciding every
+   *  window, not a phone without zones. */
+  zones_cpu: number
+  zones_npu: number
+  zones_gpu: number
+}
+
 export type GovernorStats = {
   active: boolean
   engine_prefill: string
@@ -348,6 +387,24 @@ export type GovernorStats = {
   prefill_ms: number
   prefill_chunks: string
   prefill_ctx_ngl: number
+  /** Which rule placed THIS turn's prefill, 0 until the turn admits one
+   *  (so a turn that never prefills reports 0, not the turn before it).
+   *  Unlike last_router_rule it is not overwritten by decode tokens, so an
+   *  end-of-turn read still names the turn's own placement. The numbers are
+   *  the engine's list: 1 (no HTP lane on this generation), 2 (the lane is
+   *  live and no lower rule took it), 5 (a plain GPU pick), 8 (GPU_COOLMODE,
+   *  a decode state rather than a leg - it ran on the NPU), 9 (CPU) and 10
+   *  (GPU because the NPU was too hot, the one GPU pick 5 cannot describe);
+   *  3 and 4 are decode-only. */
+  prefill_router_rule: number
+  /** Whether the owner's per-generation prefill thermal handoff was armed:
+   *  false rules out rule 10 as an explanation for a GPU prefill. */
+  prefill_thermal_handoff: boolean
+  /** Headroom to each leg's first passive trip in C, as the sample the route
+   *  was actually taken on (null when the turn placed no prefill, or one
+   *  placed on no sample). */
+  prefill_npu_headroom_c: number | null
+  prefill_gpu_headroom_c: number | null
   thermal_state: string
   /** Normalized platform thermal status the classifier last saw (-1 absent). */
   platform_thermal_status: number
@@ -826,6 +883,10 @@ export type NativeLlamaContext = {
   gpu: boolean
   reasonNoGPU: string
   systemInfo: string
+  /** What the governor load decided. null when this was not a governor load:
+   *  the key is always present, so read it as `result.governor_load?.…` without
+   *  a separate undefined check. */
+  governor_load: GovernorLoadFacts | null
 }
 
 export type NativeSessionLoadResult = {

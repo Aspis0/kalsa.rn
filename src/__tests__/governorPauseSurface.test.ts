@@ -9,8 +9,10 @@
  * `lib/typescript/types.d.ts` fails too.
  *
  * What stays unpinned without a native build: that the engine really stamps
- * rule 0 on a Wait and {2,3,9} on an admit (llama-governor-policy/runtime
- * behaviour — read, not executed), that a -2 actually flows decode →
+ * rule 0 on a Wait and a nonzero prefill rule on an admit
+ * ({1,2,5,8,9,10} in llama-governor-policy.cpp — rule 3 became decode-only and
+ * NoHTP prefill stamps 1, llama-governor-policy/runtime behaviour — read, not
+ * executed), that a -2 actually flows decode →
  * completion → JSON → JS, that row+1 makes the count<=1 guard unreachable at
  * runtime, and sensor freshness. `tests/` has the native harness for those,
  * but running it is a native build.

@@ -353,10 +353,15 @@ onecopy_load_result load_governor_one_model(
     const ggml_type requested_k = params.cache_type_k;
     const ggml_type requested_v = params.cache_type_v;
     const auto lane_kv = decide_governor_lane_kv(requested_k, requested_v, params.flash_attn_type);
+    // Why the effective types below or their placement differ from the
+    // request, published with them: null when neither changed, so an absent
+    // reason reads as "the load overrode nothing".
+    const char * kv_reason = nullptr;
     if (lane_kv.kv_on_device) {
         params.cache_type_k = lane_kv.type_k;
         params.cache_type_v = lane_kv.type_v;
         if (params.cache_type_k != requested_k || params.cache_type_v != requested_v) {
+            kv_reason = "htp-prefill-kv";
             LOG_INFO(
                 "KALSA_KV_TYPE_OVERRIDE {requested_k:\"%s\", requested_v:\"%s\", "
                 "effective_k:\"%s\", effective_v:\"%s\", reason:\"htp-prefill-kv\"}",
@@ -365,6 +370,7 @@ onecopy_load_result load_governor_one_model(
         }
     } else {
         params.no_kv_offload = true;
+        kv_reason = "flash-attn-off";
         LOG_INFO(
             "KALSA_KV_HOST_PIN {requested_k:\"%s\", requested_v:\"%s\", reason:\"flash-attn-off\"}",
             ggml_type_name(requested_k), ggml_type_name(requested_v));
@@ -438,7 +444,7 @@ onecopy_load_result load_governor_one_model(
     owner.setGovernorNpuFallback(nullptr);
     owner.setGovernorKvCache(
         ggml_type_name(params.cache_type_k), ggml_type_name(params.cache_type_v),
-        params.no_kv_offload ? "host" : "device");
+        params.no_kv_offload ? "host" : "device", kv_reason);
     if (owner.model == nullptr || owner.ctx == nullptr) {
         return fail_onecopy("one-copy governor without an active context");
     }
@@ -454,6 +460,32 @@ const char * leg_weighting_name(llama_governor_leg_weighting weighting) {
         case llama_governor_leg_weighting::HEAT_RANK: return "heat_rank";
     }
     return "npu_first";
+}
+
+// Fill and publish the governor_load record of a finished load (rn-governor-
+// params.h). Called on each success path, once the governor exists, because
+// each fact is known somewhere else: the row match and the KV decision belong
+// to this load, while which legs the ENGINE built and the zones it read belong
+// to the governor alone. The KV types ride the record the load already
+// published, so the two channels cannot disagree.
+void publish_governor_load(llama_rn_context & owner, const governor_load_legs & legs,
+                           bool one_copy, const std::string & soc,
+                           bool prefill_thermal_handoff) {
+    governor_load_facts facts;
+    facts.governor = true;
+    facts.one_copy = one_copy;
+    facts.legs = legs;
+    facts.prefill_thermal_handoff = prefill_thermal_handoff;
+    facts.soc = soc;
+    facts.cache_type_k = owner.governorKvTypeK();
+    facts.cache_type_v = owner.governorKvTypeV();
+    facts.kv_reason = owner.governorKvReason();
+    const rn_governor::zones_facts zones = owner.governor->zones();
+    facts.hop_tokens = zones.hop_tokens;
+    facts.zones_cpu = zones.cpu;
+    facts.zones_npu = zones.npu;
+    facts.zones_gpu = zones.gpu;
+    owner.setGovernorLoad(facts);
 }
 
 bool load_governor_models(llama_rn_context & owner,
@@ -522,9 +554,18 @@ bool load_governor_models(llama_rn_context & owner,
         } else {
             switch (load_governor_one_model(owner, effective_v3, governor_thermo,
                                             load_options, leg_set, gpu_allowed)) {
-            case onecopy_load_result::loaded:
+            case onecopy_load_result::loaded: {
                 log_legs_outcome("onecopy", true);
+                // The legs the ENGINE built: this is the only side that knows
+                // which of them it refused.
+                governor_load_legs legs;
+                legs.npu = owner.governor->legBuilt(llama_governor_engine::NPU);
+                legs.gpu = owner.governor->legBuilt(llama_governor_engine::GPU);
+                publish_governor_load(
+                    owner, legs, true, hw_facts.soc_model,
+                    governor_params.prefill_thermal_handoff);
                 return true;
+            }
             case onecopy_load_result::demoted:
                 break; // fall through to the two-model load below
             case onecopy_load_result::failed:
@@ -549,6 +590,10 @@ bool load_governor_models(llama_rn_context & owner,
     // governor_params.
     llama_governor_params policy_params = governor_params;
     bool prefill_cpu_only = false;
+    // Why the effective types below or their placement differ from the
+    // request, published with them at setGovernorKvCache and handed to JS by
+    // the governor_load record. Null when neither changed.
+    const char * kv_reason = nullptr;
     if (governor_params.npu_lane_enabled) {
         // Lane asked for: resolve the device and fill the plan fields. With
         // the lane off (today's default) the resolver is skipped and both
@@ -591,6 +636,8 @@ bool load_governor_models(llama_rn_context & owner,
             const ggml_type requested_v = prefill_params.cache_type_v;
             const auto lane_kv = decide_governor_lane_kv(
                 requested_k, requested_v, prefill_params.flash_attn_type);
+            // As in the one-copy branch: why the effective types differ from
+            // the caller's, published with them (null when they did not).
             if (lane_kv.kv_on_device) {
                 prefill_params.cache_type_k = lane_kv.type_k;
                 decode_params.cache_type_k = lane_kv.type_k;
@@ -598,6 +645,7 @@ bool load_governor_models(llama_rn_context & owner,
                 decode_params.cache_type_v = lane_kv.type_v;
                 if (prefill_params.cache_type_k != requested_k ||
                     prefill_params.cache_type_v != requested_v) {
+                    kv_reason = "htp-prefill-kv";
                     LOG_INFO(
                         "KALSA_KV_TYPE_OVERRIDE {requested_k:\"%s\", requested_v:\"%s\", "
                         "effective_k:\"%s\", effective_v:\"%s\", reason:\"htp-prefill-kv\"}",
@@ -610,6 +658,7 @@ bool load_governor_models(llama_rn_context & owner,
                 // table (decide_governor_lane_kv), so the load reverts to
                 // host-pinned KV with the caller's types.
                 prefill_params.no_kv_offload = true;
+                kv_reason = "flash-attn-off";
                 LOG_INFO(
                     "KALSA_KV_HOST_PIN {requested_k:\"%s\", requested_v:\"%s\", "
                     "reason:\"flash-attn-off\"}",
@@ -662,7 +711,7 @@ bool load_governor_models(llama_rn_context & owner,
     owner.setGovernorKvCache(
         ggml_type_name(prefill_params.cache_type_k),
         ggml_type_name(prefill_params.cache_type_v),
-        prefill_params.no_kv_offload ? "host" : "device");
+        prefill_params.no_kv_offload ? "host" : "device", kv_reason);
     prefill_params.n_gpu_layers = prefill_cpu_only ? 0 : 99;
     decode_params.n_gpu_layers = 0;
     prefill_params.n_parallel = 1;
@@ -754,6 +803,18 @@ bool load_governor_models(llama_rn_context & owner,
         return false;
     }
     log_legs_outcome("two_model", false);
+    // The legs here are the placement THIS load applied, which the engine
+    // cannot report back: it built contexts, not legs. The cleared lane flag is
+    // the loader's own verdict - true only when the lane resolved and the
+    // prefill context is HTP-pinned - and gpu_allowed is the gate that decides
+    // whether the prefill context may reach the OpenCL GPU at all.
+    // The row's SoC rides this path too: a load that matched a row and still
+    // landed here either had the lane off or demoted from one-copy, and only
+    // one_copy=false distinguishes those two for the reader.
+    publish_governor_load(
+        owner, governor_two_model_legs(policy_params.npu_lane_enabled, gpu_allowed),
+        false, leg_set.one_copy ? hw_facts.soc_model : std::string(),
+        governor_params.prefill_thermal_handoff);
     return true;
 }
 
@@ -1304,13 +1365,14 @@ int32_t llama_rn_context::decode(llama_batch batch) {
         // admission returned Wait without naming an engine — its heat refusal
         // (the warn-line ceiling, or a non-finite reading), and the only
         // signal here that the governor itself says thermal (every admit/chunk
-        // return stamps rule {2,3,9} in llama-governor-policy.cpp). A -2 that
-        // follows an admitted engine is a partition refusal the binding cannot
-        // name — the count<=1 guard is unreachable while the policy admits
-        // row+1 whole (6581c7a7b), yet logged, not asserted, there — so it is
-        // "unexplained", never "thermal": no host may cool-and-resume a retry
-        // that would repeat the same partition. Decode: reload-required when
-        // the stats say so, otherwise the profile wait.
+        // return stamps a nonzero prefill rule — {1,2,5,8,9,10} in
+        // llama-governor-policy.cpp — while both Wait paths return before that
+        // stamp). A -2 that follows an admitted engine is a partition refusal
+        // the binding cannot name — the count<=1 guard is unreachable while
+        // the policy admits row+1 whole (6581c7a7b), yet logged, not asserted,
+        // there — so it is "unexplained", never "thermal": no host may
+        // cool-and-resume a retry that would repeat the same partition. Decode:
+        // reload-required when the stats say so, otherwise the profile wait.
         const llama_governor_stats stats = governor->stats();
         if (batch.n_tokens > 1) {
             if (stats.thermal_state == llama_governor_thermal_state::Unknown) {
@@ -1381,11 +1443,13 @@ std::string llama_rn_context::governorNpuFallback() const {
 }
 
 void llama_rn_context::setGovernorKvCache(
-        const char * type_k, const char * type_v, const char * prefill_placement) {
+        const char * type_k, const char * type_v, const char * prefill_placement,
+        const char * reason) {
     std::lock_guard<std::mutex> lock(governor_kv_mutex_);
     governor_kv_type_k_ = type_k == nullptr ? "" : type_k;
     governor_kv_type_v_ = type_v == nullptr ? "" : type_v;
     governor_kv_placement_ = prefill_placement == nullptr ? "" : prefill_placement;
+    governor_kv_reason_ = reason == nullptr ? "" : reason;
 }
 
 std::string llama_rn_context::governorKvTypeK() const {
@@ -1401,6 +1465,19 @@ std::string llama_rn_context::governorKvTypeV() const {
 std::string llama_rn_context::governorKvPlacement() const {
     std::lock_guard<std::mutex> lock(governor_kv_mutex_);
     return governor_kv_placement_;
+}
+
+std::string llama_rn_context::governorKvReason() const {
+    std::lock_guard<std::mutex> lock(governor_kv_mutex_);
+    return governor_kv_reason_;
+}
+
+void llama_rn_context::setGovernorLoad(const governor_load_facts & facts) {
+    governor_load_ = facts;
+}
+
+governor_load_facts llama_rn_context::governorLoad() const {
+    return governor_load_;
 }
 
 void llama_rn_context::note_htp_runtime_fallback() {

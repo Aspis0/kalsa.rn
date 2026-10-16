@@ -204,18 +204,32 @@ struct llama_rn_context {
     // What the governor load built, published once per load by
     // load_governor_models: the cache ggml type names BOTH contexts run
     // with (the HTP lane upgrades HTP-unwritable caller types, so they can
-    // differ from params) and where the prefill KV buffers live ("device"
-    // | "host"). Same load-writer / JSI-reader split as the npu fields
+    // differ from params), where the prefill KV buffers live ("device"
+    // | "host"), and why the types or that placement differ from the request
+    // (nullptr = neither did). Same load-writer / JSI-reader split as the
+    // npu fields
     // above — mutex-guarded accessors, readers hold copies.
     void setGovernorKvCache(
-        const char * type_k, const char * type_v, const char * prefill_placement);
+        const char * type_k, const char * type_v, const char * prefill_placement,
+        const char * reason);
     std::string governorKvTypeK() const;
     std::string governorKvTypeV() const;
     std::string governorKvPlacement() const;
+    std::string governorKvReason() const;
     mutable std::mutex governor_kv_mutex_;
     std::string governor_kv_type_k_;
     std::string governor_kv_type_v_;
     std::string governor_kv_placement_;
+    std::string governor_kv_reason_;
+
+    // The one load's facts, published once when the governor load finishes and
+    // read only by the init result that same load returns (cpp/jsi/
+    // RNLlamaJSI.cpp), so load and reader are the same thread here and the
+    // record needs no lock - unlike the fields above, which the stats task
+    // reads from a worker while a later load may write.
+    void setGovernorLoad(const governor_load_facts & facts);
+    governor_load_facts governorLoad() const;
+    governor_load_facts governor_load_;
 
     bool hasGovernor() const;
     bool governorFailed() const;

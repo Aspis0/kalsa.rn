@@ -829,6 +829,13 @@ namespace rnllama_jsi {
                              {"model", modelDetailsJson(ctx)},
                              {"devices", usedDevices},
                              {"androidLib", androidLibName},
+                             // What the governor load decided: which legs it
+                             // built, the effective KV types, the matched
+                             // legs-table row, the hop cadence and the zone
+                             // counts. Null on a non-governor load - this load
+                             // published the record and reads it back on the
+                             // same thread.
+                             {"governor_load", rnllama::governor_load_json(ctx->governorLoad())},
                          });
 
                          return [result](jsi::Runtime& rt) {
@@ -1013,6 +1020,28 @@ namespace rnllama_jsi {
                             result.setProperty(rt, "prefill_ms", (double) stats.prefill_us / 1000.0);
                             result.setProperty(rt, "prefill_chunks", jsi::String::createFromUtf8(rt, stats.prefill_chunks));
                             result.setProperty(rt, "prefill_ctx_ngl", (double) stats.prefill_ctx_ngl);
+                            // How THIS turn's prefill was placed, which
+                            // last_router_rule can no longer answer: every
+                            // decode token overwrites it, so the turn's own
+                            // stamp and the margins it was taken on ride
+                            // beside it. 0 is a turn that placed no prefill;
+                            // the rule numbers are the list over
+                            // llama_governor_policy::prefill_rule_for.
+                            result.setProperty(rt, "prefill_router_rule", (double) stats.prefill_router_rule);
+                            // Whether the owner's thermal handoff was armed on
+                            // the generation that ran - what separates rule 10
+                            // declining to fire from an unarmed generation.
+                            result.setProperty(rt, "prefill_thermal_handoff", (bool) stats.prefill_thermal_handoff);
+                            // NaN (no sample, or no prefill placed) crosses as
+                            // null: JSON has no NaN.
+                            result.setProperty(rt, "prefill_npu_headroom_c",
+                                std::isfinite(stats.prefill_npu_headroom_c)
+                                    ? jsi::Value((double) stats.prefill_npu_headroom_c)
+                                    : jsi::Value::null());
+                            result.setProperty(rt, "prefill_gpu_headroom_c",
+                                std::isfinite(stats.prefill_gpu_headroom_c)
+                                    ? jsi::Value((double) stats.prefill_gpu_headroom_c)
+                                    : jsi::Value::null());
                             result.setProperty(rt, "thermal_state", governorThermalStateName(stats.thermal_state));
                             result.setProperty(rt, "platform_thermal_status", (double) stats.platform_thermal_status);
                             result.setProperty(rt, "state_source",

@@ -418,6 +418,11 @@ export class LlamaContext {
 
   systemInfo: NativeLlamaContext['systemInfo']
 
+  /** What the governor load decided; null on a non-governor load. Carried on
+   * the context so the app can log it next to the stats it describes, which is
+   * the only place these facts exist outside logcat. */
+  governorLoad: NativeLlamaContext['governor_load'] = null
+
   /**
    * Parallel processing namespace for non-blocking queue operations
    */
@@ -693,6 +698,7 @@ export class LlamaContext {
     model,
     androidLib,
     systemInfo,
+    governor_load: governorLoad,
   }: NativeLlamaContext) {
     this.id = contextId
     this.gpu = gpu
@@ -701,6 +707,7 @@ export class LlamaContext {
     this.model = model
     this.androidLib = androidLib
     this.systemInfo = systemInfo
+    this.governorLoad = governorLoad
   }
 
   async loadSession(filepath: string): Promise<NativeSessionLoadResult> {
@@ -1593,6 +1600,7 @@ export async function initLlama(
     model: modelDetails,
     androidLib,
     systemInfo,
+    governor_load: governorLoad,
   } = await llamaInitContext(
     contextId,
     {
@@ -1618,6 +1626,7 @@ export async function initLlama(
     model: modelDetails,
     androidLib,
     systemInfo,
+    governor_load: governorLoad,
   })
 }
 

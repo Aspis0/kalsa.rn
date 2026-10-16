@@ -171,6 +171,16 @@ if(UNIX AND NOT APPLE)
     target_link_libraries(platform_thermal_test PRIVATE m)
 endif()
 
+# The governor_load record the init result hands to JS: links the parse TU
+# (the mapping is pure) and drives the wire shape with literals -- same shape
+# as governor_params_test above, which owns the inputs.
+add_executable(governor_load_test governor_load_test.cpp
+    ${RNLLAMA_CPP_DIR}/rn-governor-params.cpp)
+target_include_directories(governor_load_test PRIVATE ${RNLLAMA_INCLUDE_DIRS})
+if(UNIX AND NOT APPLE)
+    target_link_libraries(governor_load_test PRIVATE m)
+endif()
+
 # Stage 0 observation record: the module is header-only (cpp/rn-governor-samples.h,
 # which the test TU includes directly), so like governor_params_test this is a
 # host-only fast target with no library TU. Drives ring order, the overflow

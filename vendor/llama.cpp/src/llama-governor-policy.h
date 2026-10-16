@@ -99,6 +99,12 @@ public:
     // on the NPU.
     void set_prefill_headroom(float npu_headroom_c, float gpu_headroom_c);
     void clear_prefill_headroom();
+    // The raw prefill sample as it stands right now: the turn's own until the route
+    // re-arms (clear_prefill_headroom). Read it here rather than the members -
+    // npu_hot_gpu_handoff is the only other reader, and a caller that wants the
+    // turn's report wants this value, not the one a later push may replace.
+    float prefill_npu_headroom_c() const { return prefill_npu_headroom_c_; }
+    float prefill_gpu_headroom_c() const { return prefill_gpu_headroom_c_; }
     // The one-model governor's lane proof: its NPU leg exists and its
     // admission was set, which stands in for the LaunchConfig's fit /
     // readable-streams facts. npu_lane_enabled (the binding's platform
@@ -112,7 +118,7 @@ public:
     void reset_decode_hop();
     llama_governor_prefill_admission admit_prefill(
             llama_governor_engine requested, uint32_t prompt_tokens, float now_c,
-            uint32_t n_batch = UINT32_MAX) const;
+            uint32_t n_batch = UINT32_MAX, bool thermal_handoff = false) const;
     // tokens_since_prefill is the caller's decode-hop clock: generated tokens
     // since the last prefill, which the governor restarts at every prefill
     // entry and at every reset_prefill_stats (the binding's per-completion
@@ -123,12 +129,24 @@ public:
             int64_t now_ms, uint32_t tokens_since_prefill = 0);
 
     // The optional outputs stamp the causal route facts: mode_used is the
-    // single mode load of this call (reported even when safety preempts) and
-    // override_decided is true only when an override branch decided.
+    // single mode load of this call (reported even when safety preempts),
+    // override_decided is true only when an override branch decided, and
+    // thermal_handoff is true only when the NPU-hot GPU handoff decided - the
+    // one GPU pick no other output distinguishes from a forced or fallback GPU.
     llama_governor_engine prefill_engine(
             llama_governor_prefill_mode * mode_used = nullptr,
-            bool * override_decided = nullptr) const;
+            bool * override_decided = nullptr,
+            bool * thermal_handoff = nullptr) const;
+    // thermal_handoff is the same flag prefill_engine reports for the
+    // request this admission is admitting, passed down so the rule it stamps is
+    // the rule that chose the engine: the routing inputs can move under the
+    // call (the mode is atomic and pushed cross-thread), and re-reading them
+    // here would name a turn that did not happen.
     uint32_t prefill_rule() const;
+    // The number for a placement ALREADY decided: prefill_rule for a caller
+    // that holds the decision (the runtime latch, admit_prefill), so no caller
+    // ever has to re-evaluate the routing inputs to label one.
+    uint32_t prefill_rule_for(bool thermal_handoff, llama_governor_engine engine) const;
     // Bench route dev hook: mode is validated against
     // llama_governor_prefill_mode (0..2); false on anything else.
     bool set_prefill_override(int mode);

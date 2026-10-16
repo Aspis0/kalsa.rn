@@ -414,7 +414,8 @@ bool llama_governor_policy::npu_hot_gpu_handoff() const {
 }
 
 llama_governor_engine llama_governor_policy::prefill_engine(
-        llama_governor_prefill_mode * mode_used, bool * override_decided) const {
+        llama_governor_prefill_mode * mode_used, bool * override_decided,
+        bool * thermal_handoff) const {
     // One atomic load per call: the binding may push a new mode from another
     // thread, and both outputs must describe the same decision.
     const auto mode = prefill_override_.value.load();
@@ -423,6 +424,9 @@ llama_governor_engine llama_governor_policy::prefill_engine(
     }
     if (override_decided != nullptr) {
         *override_decided = false;
+    }
+    if (thermal_handoff != nullptr) {
+        *thermal_handoff = false;
     }
     if (!valid_schema(params_) || !profile_valid_ || !have_profile_ ||
         state_ == llama_governor_thermal_state::CRITICAL || state_ == llama_governor_thermal_state::Invalid ||
@@ -471,6 +475,9 @@ llama_governor_engine llama_governor_policy::prefill_engine(
     // Nothing pushes one today, so this is inert. The bench/JS override above
     // still outranks it, and every safety state returned above still keeps CPU.
     if (npu_hot_gpu_handoff()) {
+        if (thermal_handoff != nullptr) {
+            *thermal_handoff = true;
+        }
         return llama_governor_engine::GPU;
     }
     if (npu_lane_live() && not_a_safety_state()) {
@@ -507,18 +514,67 @@ llama_governor_engine llama_governor_policy::prefill_engine(
     return llama_governor_engine::CPU;
 }
 
+// The rule numbers llama_governor_stats carries, listed once for the three
+// sites below that number a decision: prefill_rule_for (prefill),
+// admit_prefill (the same prefill number, stamped into last_router_rule) and
+// select_decode (decode).
+//   0  no rule ran - a prefill admission that returned before the planner
+//      (unknown or refused profile, a non-finite reading, Invalid/CRITICAL,
+//      an empty prompt, or a thermal Wait), and the stats' value before any
+//      decision
+//   1  prefill on a generation with no HTP lane at all (NoHTP)
+//   2  prefill on the NPU - the lane is live and no rule below took it
+// The rule numbers llama_governor_stats carries - last_router_rule, which the
+// last decision overwrites, and prefill_router_rule, which keeps the turn's own
+// prefill placement. They are numbered here and nowhere else, but 3 and 4 are
+// minted by select_decode in this file and 0 is read by the binding's bridge
+// (cpp/rn-llama.cpp, which prints a last_router_rule of 0 as the profile wait,
+// the same meaning the first entry below gives it).
+//   0  no rule ran - a prefill admission that returned before the planner
+//      (unknown or refused profile, a non-finite reading, Invalid/CRITICAL,
+//      an empty prompt, or a thermal Wait), and the stats' value before any
+//      decision
+//   1  prefill on a generation with no HTP lane at all (NoHTP)
+//   2  prefill on the NPU - the lane is live and no rule below took it
+//   3  decode outside the hop rule (select_decode's default: every wait, CPU
+//      window and GPU_COOLMODE reload). It was also the prefill GPU stamp
+//      before admit_prefill numbered its request through prefill_rule_for
+//   4  decode on the leg the hop rule picked (select_decode, hop active)
+//   5  prefill on a GPU - the /bench route override, bench_force_gpu_prefill,
+//      or the lane-off fallback (gpu_prefill_capable with no live NPU lane)
+//   8  prefill answered by GPU_COOLMODE, which is a decode STATE and not a leg:
+//      the latch routes it to the NPU leg (prefill_route_of, llama-governor-
+//      legs.cpp), so rule 8 means "picked as a cool prefill, ran on the NPU".
+//      Reached only when gpu_prefill_capable() is false, else 5 wins above it
+//   9  prefill on the CPU - a safety state, an override whose GPU does not fit,
+//      or no accelerator that qualified
+//  10  prefill on a GPU because the NPU was too hot (npu_hot_gpu_handoff) - the
+//      one GPU pick 5 cannot describe, and what tells a thermal handoff apart
+//      from a lane-off fallback or a forced GPU on the same two headrooms
+// 6 and 7 have never been assigned to anything.
 uint32_t llama_governor_policy::prefill_rule() const {
+    bool thermal_handoff = false;
+    const auto engine = prefill_engine(nullptr, nullptr, &thermal_handoff);
+    return prefill_rule_for(thermal_handoff, engine);
+}
+
+uint32_t llama_governor_policy::prefill_rule_for(bool thermal_handoff,
+                                                llama_governor_engine engine) const {
     if (params_.generation == llama_governor_generation::NoHTP) {
         return 1;
     }
-    const auto engine = prefill_engine();
-    return engine == llama_governor_engine::GPU ? 5 :
+    // Rule 10 before the engine map: the handoff is the only branch of
+    // prefill_engine whose GPU answer is its own, and the override that
+    // outranks it reads 5 like any other forced GPU.
+    return thermal_handoff ? 10 :
+           engine == llama_governor_engine::GPU ? 5 :
            engine == llama_governor_engine::GPU_COOLMODE ? 8 :
            engine == llama_governor_engine::NPU ? 2 : 9;
 }
 
 llama_governor_prefill_admission llama_governor_policy::admit_prefill(
-        llama_governor_engine requested, uint32_t prompt_tokens, float now_c, uint32_t n_batch) const {
+        llama_governor_engine requested, uint32_t prompt_tokens, float now_c, uint32_t n_batch,
+        bool thermal_handoff) const {
     llama_governor_prefill_admission result{};
     result.engine = llama_governor_engine::CPU;
     // Non-finite now_c is unknown heat: both the warn-line test and the delta
@@ -556,7 +612,7 @@ llama_governor_prefill_admission llama_governor_policy::admit_prefill(
     if (table == 0) {
         if (prompt_tokens < k_table_tokens[0] && prompt_tokens <= n_batch && below_warn) {
             result.tokens = prompt_tokens;
-            result.rule = requested == llama_governor_engine::NPU ? 2 : requested == llama_governor_engine::CPU ? 9 : 3;
+            result.rule = prefill_rule_for(thermal_handoff, requested);
             result.engine = requested;
             result.decision = requested == llama_governor_engine::CPU
                 ? llama_governor_decision::Admit : llama_governor_decision::CPUFallback;
@@ -589,7 +645,7 @@ llama_governor_prefill_admission llama_governor_policy::admit_prefill(
             result.tokens = prompt_tokens - 2;
         }
     }
-    result.rule = requested == llama_governor_engine::NPU ? 2 : requested == llama_governor_engine::CPU ? 9 : 3;
+    result.rule = prefill_rule_for(thermal_handoff, requested);
     // Every admitted piece runs on the requested engine; the runtime latch
     // reads this stamp to pick the turn's route.
     result.engine = requested;

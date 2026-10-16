@@ -166,6 +166,132 @@ test('governor stats wire decode_us_* adjacency', () => {
   )
 })
 
+test('the turn\'s prefill placement rides the stats wire', () => {
+  // last_router_rule cannot answer this: every decode token overwrites it, so
+  // the turn's own rule and the margins its route was taken on have to come
+  // from the fields the engine keeps per turn. A dropped or relocated
+  // setProperty still passes tsc, so pin the four together, in the prefill
+  // block they belong to.
+  const jsi = cpp('jsi/RNLlamaJSI.cpp')
+  expect(jsi).toMatch(
+    /"prefill_ctx_ngl"[^\n]*\n[\S\s]*?"prefill_router_rule", \(double\) stats\.prefill_router_rule[\S\s]*?"prefill_thermal_handoff", \(bool\) stats\.prefill_thermal_handoff[\S\s]*?"prefill_npu_headroom_c"[\S\s]*?"prefill_gpu_headroom_c"/,
+  )
+  // The rule is a count, the handoff a flag: neither may cross as a string.
+  expect(jsi).toContain('"prefill_thermal_handoff", (bool) stats.prefill_thermal_handoff')
+  // NaN has no JSON spelling, so a turn that placed no prefill (or one placed
+  // on no sample) must read as null, never as a number - the same rule the
+  // decode_pacing_headroom_last field above already follows.
+  ;['npu', 'gpu'].forEach((leg) => {
+    expect(jsi).toMatch(
+      new RegExp(
+        `"prefill_${leg}_headroom_c",\\s*\\n?[\\S\\s]{0,120}?std::isfinite\\(stats\\.prefill_${leg}_headroom_c\\)` +
+          `[\\S\\s]{0,120}?jsi::Value\\(\\(double\\) stats\\.prefill_${leg}_headroom_c\\)` +
+          `[\\S\\s]{0,40}?: jsi::Value::null\\(\\)`,
+      ),
+    )
+  })
+
+  // The TS type documents the rule numbers for the app author, so the engine's
+  // own list (the comment over prefill_rule_for) decides which numbers that
+  // documentation may name, and whether each is a prefill or a decode stamp.
+  // Word-bounded, so "1" cannot be satisfied by any other digit in the file.
+  const engine = fs.readFileSync(
+    path.join(__dirname, '../../vendor/llama.cpp/src/llama-governor-policy.cpp'),
+    'utf8',
+  )
+  const ruleKind = (rule: string): string =>
+    engine.match(new RegExp(`^//\\s+${rule}\\s+(\\w+)`, 'm'))?.[1] ?? ''
+  const doc = fs.readFileSync(path.join(__dirname, '../../src/types.ts'), 'utf8').match(
+    /\/\*\* Which rule placed THIS turn's prefill[\S\s]*?\*\//,
+  )![0]
+  const prefillRules = ['1', '2', '5', '8', '9', '10']
+  const decodeRules = ['3', '4']
+  // Each named number must exist in the engine's list under the same kind the
+  // TS doc claims, so a renumbering upstream cannot leave the docs behind.
+  expect(prefillRules.map(ruleKind)).toEqual(prefillRules.map(() => 'prefill'))
+  expect(decodeRules.map(ruleKind)).toEqual(decodeRules.map(() => 'decode'))
+  // ...and the doc itself must still name all of them.
+  expect(
+    [...prefillRules, ...decodeRules].filter((rule) => !new RegExp(`\\b${rule}\\b`).test(doc)),
+  ).toEqual([])
+  expect(doc).toContain('3 and 4 are decode-only')
+})
+
+test('the load hands JS a governor_load record, or none at all', () => {
+  // The uploaded report reads the JS console, so the load facts (which legs the
+  // engine built, the effective KV types, the matched row, the zone counts)
+  // reach the app only through this field. Pin it on the init result and the
+  // mapping it calls.
+  expect(cpp('jsi/RNLlamaJSI.cpp')).toContain(
+    '{"governor_load", rnllama::governor_load_json(ctx->governorLoad())}',
+  )
+  expect(cpp('rn-governor-params.cpp')).toContain(
+    'nlohmann::ordered_json governor_load_json(const governor_load_facts & facts)',
+  )
+  // A load that published nothing crosses as JSON null, never as an empty
+  // record: an empty one would read as a governor load that built no legs.
+  expect(cpp('rn-governor-params.cpp')).toMatch(
+    /if \(!facts\.governor\) {\n {8}return nullptr;\n {4}}/,
+  )
+  // Both governor success paths must publish, or a load loses its record
+  // silently while the field stays on the wire.
+  const loader = cpp('rn-llama.cpp')
+  expect(loader.split('publish_governor_load(').length - 1).toBe(3)
+  // The one-copy legs come from the ENGINE's probe: only it knows which legs it
+  // refused (a dropped leg is logged as onecopy_leg_absent and reads false).
+  expect(loader).toMatch(
+    /case onecopy_load_result::loaded: {[\S\s]*?legs\.npu = owner\.governor->legBuilt\(llama_governor_engine::NPU\);[\S\s]*?legs\.gpu = owner\.governor->legBuilt\(llama_governor_engine::GPU\);[\S\s]*?publish_governor_load\(\n {20}owner, legs, true, hw_facts\.soc_model,/,
+  )
+  // The two-model legs come from the placement THIS load applied, never from
+  // the engine: it builds contexts rather than legs, so legBuilt would report
+  // no accelerator on a load that ran one. They go through the pure resolver,
+  // which is where the HTP-pinned case is handled: a resolved lane puts
+  // ctx_prefill on the HTP alone ({resolved.device, nullptr}), so prefill_cpu_only
+  // is FALSE there and reading the GPU leg off it claims a leg that load never
+  // placed. The helper exists precisely to keep that trap out of the loader.
+  expect(loader).toMatch(
+    /publish_governor_load\(\n {8}owner, governor_two_model_legs\(policy_params\.npu_lane_enabled, gpu_allowed\),/,
+  )
+  expect(loader).not.toMatch(/legs\.gpu = !prefill_cpu_only;/)
+  expect(cpp('rn-governor-params.cpp')).toMatch(
+    /legs\.npu = lane_resolved;[\S\s]{0,240}?legs\.gpu = gpu_placement_allowed && !lane_resolved;/,
+  )
+  // The row's SoC rides the two-model path too: only one_copy=false tells a
+  // demotion apart from a load that matched nothing.
+  expect(loader).toMatch(
+    /governor_two_model_legs\([^\n]*\),\n {8}false, leg_set\.one_copy \? hw_facts\.soc_model : std::string\(\),/,
+  )
+})
+
+test('the governor_load keys agree across the wire, the types and the d.ts', () => {
+  // The mapping, the TS type and the generated declarations are three files
+  // that must name the same keys: a rename on one side silently drops the fact
+  // from the uploaded report. Parse each rather than substring-match, so a key
+  // that only appears in a comment cannot satisfy the check.
+  const cppKeys = Array.from(
+    cpp('rn-governor-params.cpp').match(
+      /return nlohmann::ordered_json{([\S\s]*?)};/,
+    )![1]!.matchAll(/{"([_a-z]+)",/g),
+  ).map((m) => m[1]!)
+
+  const tsKeys = (source: string): string[] => {
+    const body = source.match(/export type GovernorLoadFacts = {([\S\s]*?)\n}/)![1]!
+    // Indent-agnostic: tsc re-emits the declared file with four spaces.
+    return Array.from(body.matchAll(/^\s+([_a-z]+)[:?]/gm)).map((m) => m[1]!)
+  }
+
+  expect(cppKeys.length).toBeGreaterThan(0)
+  const source = fs.readFileSync(path.join(__dirname, '../../src/types.ts'), 'utf8')
+  expect(tsKeys(source)).toEqual(cppKeys)
+  expect(tsKeys(fs.readFileSync(path.join(__dirname, '../../lib/typescript/types.d.ts'), 'utf8')))
+    .toEqual(cppKeys)
+
+  // And the init result types the record as always present but nullable: the
+  // C++ emits the key on every load and JSON null on a non-governor one, so an
+  // optional field would let a reader believe the key itself can be missing.
+  expect(source).toMatch(/systemInfo: string\n {2}\/\*\*[\S\s]*?\*\/\n {2}governor_load: GovernorLoadFacts \| null\n}/)
+})
+
 // Body of one member function of rn-governor.cpp (its closing brace is the
 // first at column 0).
 const governorFn = (signature: RegExp): string =>

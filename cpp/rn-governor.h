@@ -82,6 +82,25 @@ public:
     // end-of-turn fallback line must report the load's own leg decision.
     bool gpu_leg() const { return gpu_leg_; }
     const std::string & failure_reason() const { return failure_reason_; }
+    // Whether the ENGINE built a leg for one of its engines, as its own
+    // llama_governor_leg_ctx probe answers: false for a leg the engine refused
+    // and for the two-model form, which builds contexts rather than legs. The
+    // load's placement (which accelerator a context actually runs on) is a
+    // different fact and belongs to the loader. Settled in the constructor;
+    // no lock, like gpu_fit() beside it.
+    bool legBuilt(llama_governor_engine engine) const;
+    // The once-per-load thermal reader's shape: the effective decode hop
+    // cadence and the /sys/class/thermal zones it found per leg. All zero when
+    // it built no reader (a two-model load without a hop) - and a reader that
+    // found no zones reads the same way, which is what the engine's
+    // alternation fallback means by it.
+    struct zones_facts {
+        uint32_t hop_tokens = 0;
+        int cpu = 0;
+        int npu = 0;
+        int gpu = 0;
+    };
+    zones_facts zones() const;
 
 private:
     // The thermal-leg reader both constructors share: built when the decode hop
@@ -128,6 +147,11 @@ private:
     uint32_t decode_tokens_since_prefill_ = 0;
     llama_governor_fit gpu_fit_ = llama_governor_fit::Unknown;
     bool gpu_leg_ = true;
+    // Which accelerator legs this governor got, from the engine's own leg
+    // probe in the one-model form and from the params placement in the
+    // two-model form (legBuilt).
+    bool npu_leg_built_ = false;
+    bool gpu_leg_built_ = false;
     // Decode-hop leg reader, built when decode_hop_tokens > 0, and on a
     // one-copy load with both an NPU and a GPU leg for the prefill sample.
     std::unique_ptr<rn_thermal_legs> decode_legs_;

@@ -241,6 +241,11 @@ export type NativeContextParams = {
     generation?: 'V73' | 'V75' | 'V79' | 'V81' | 'NoHTP' | 'Unknown'
     model_kind?: 'Dense' | 'Hybrid' | 'MoE' | 'Unknown'
     gpu_fit?: 'Fit' | 'NoFit' | 'NotFit' | 'Unknown'
+    // false = the app loaded the NPU lane alone and deliberately left the GPU
+    // out, because GPU+NPU together do not fit. gpu_fit stays the truthful fit
+    // verdict, so it can read "Fit" while this is false. Omit or send null and
+    // the binding keeps today's placement (gpu_leg defaults true).
+    gpu_leg?: boolean
     bench_force_gpu_prefill?: boolean
     npu_lane_enabled?: boolean
     reload_budget_available?: boolean

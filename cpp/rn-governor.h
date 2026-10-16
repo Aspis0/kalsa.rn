@@ -76,6 +76,9 @@ public:
     bool engine_failed() const;
     bool profile_valid() const;
     llama_governor_fit gpu_fit() const { return gpu_fit_; }
+    // Mirrored from params like gpu_fit_, and for the same reason: the
+    // end-of-turn fallback line must report the load's own leg decision.
+    bool gpu_leg() const { return gpu_leg_; }
     const std::string & failure_reason() const { return failure_reason_; }
 
 private:
@@ -115,6 +118,7 @@ private:
     // window k always opens at a mirror value of k * decode_hop_tokens_.
     uint32_t decode_tokens_since_prefill_ = 0;
     llama_governor_fit gpu_fit_ = llama_governor_fit::Unknown;
+    bool gpu_leg_ = true;
     // Decode-hop leg reader, built only when decode_hop_tokens > 0.
     std::unique_ptr<rn_thermal_legs> decode_legs_;
     // Atomic: decode() writes it on the decode thread while the override

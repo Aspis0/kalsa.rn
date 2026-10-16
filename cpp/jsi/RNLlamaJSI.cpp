@@ -737,8 +737,9 @@ namespace rnllama_jsi {
                         const bool profileValid =
                             rnllama::governor_thermo_profile_is_valid(governorThermo);
                         log(LogLevel::LOG_ERROR,
-                            "KALSA_GOVERNOR_FALLBACK {stage:\"accelerator_backend\", models_loaded:0, reason:\"no accelerator backend\", gpu_fit:%d, profile_valid:%d}",
-                            (int) governorParams.gpu_fit, (int) profileValid);
+                            "KALSA_GOVERNOR_FALLBACK {stage:\"accelerator_backend\", models_loaded:0, reason:\"no accelerator backend\", gpu_fit:%d, gpu_leg:%d, profile_valid:%d}",
+                            (int) governorParams.gpu_fit, (int) governorParams.gpu_leg,
+                            (int) profileValid);
                         throw std::runtime_error(
                             "Governor mode requires an available accelerator backend");
                     }

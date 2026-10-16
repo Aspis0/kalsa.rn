@@ -208,6 +208,7 @@ export type NativeContextParams = {
         generation?: 'V73' | 'V75' | 'V79' | 'V81' | 'NoHTP' | 'Unknown';
         model_kind?: 'Dense' | 'Hybrid' | 'MoE' | 'Unknown';
         gpu_fit?: 'Fit' | 'NoFit' | 'NotFit' | 'Unknown';
+        gpu_leg?: boolean;
         bench_force_gpu_prefill?: boolean;
         npu_lane_enabled?: boolean;
         reload_budget_available?: boolean;
@@ -312,6 +313,42 @@ export type GovernorStats = {
     platform_thermal_status: number;
     /** Which input decided thermal_state: "battery" | "platform". */
     state_source: string;
+    /** Stage 0 observation. Per-leg decode time in microseconds (engine
+     *  compute), cumulative since clear_cache. */
+    decode_us_cpu: number;
+    decode_us_npu: number;
+    decode_us_gpu: number;
+    /** Stage 0 observation. Monotonic ms stamps of the completion's first and
+     *  last single-token decode step; 0 when no step has run. */
+    decode_first_step_ms: number;
+    decode_last_step_ms: number;
+    /** Stage 0 observation. The first decode step's sample, in the
+     *  decode_window_samples column order below. */
+    decode_first_sample: Array<number | null>;
+    /** Stage 0 observation. One battery sysfs probe per completion, staged at
+     *  its first window boundary and committed when the first step runs:
+     *  [temp_ok 0|1, battery temp in tenths of C | null, status_ok 0|1,
+     *  Android battery status | null]. */
+    decode_batt_sysfs: Array<number | null>;
+    /** Stage 0 observation. Passive-trip range in C per leg (milli-C / 1000
+     *  at the reader): [cpu_min, cpu_max, npu_min, npu_max, gpu_min, gpu_max];
+     *  null = leg without usable zones. */
+    decode_zone_trips: Array<number | null>;
+    /** Stage 0 observation. One row per decode-hop window (oldest first), the
+     *  struct order of rn_window_sample: [tokens, leg_prev, headroom,
+     *  headroom_age_ms, status, status_age_ms, app_age_ms, cpu_hot_c, npu_hot_c,
+     *  gpu_hot_c, applied_headroom, applied_status, duty_last]. leg_prev codes
+     *  the leg of the previous step: 0 cpu, 1 gpu, 2 npu, and 3 as the explicit
+     *  gpu-coolmode marker (the engine books those tokens under
+     *  decode_tokens_cpu; exclude leg 3 rows from Stage 0 learning), null none.
+     *  applied_* are the forecast and status the engine applied for the step
+     *  whose realized duty is duty_last. The ages are APPROXIMATE: each stamp
+     *  updates independently, so one row can mix generations - never treat an
+     *  age as exact. */
+    decode_window_samples: Array<Array<number | null>>;
+    /** True when a completion outgrew the 256-sample ring (later windows
+     *  dropped). */
+    decode_window_samples_overflow: boolean;
     failure_reason: string;
     /** Resolved prefill device of the governor lane ("HTP0" | "GPU");
      *  null when the lane is off (npu_lane_enabled=false). */

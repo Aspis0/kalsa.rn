@@ -341,49 +341,114 @@ static bool test_prefill_offload_truth_table() {
         bool lane_requested;
         bool use_device;
         fit gpu_fit;
+        bool gpu_leg;
         bool offloads;
     };
+    // gpu_leg false with gpu_fit Fit is the DANGER row, and it is the one the
+    // old fit-only gate could not express: the GPU itself fits, but the load
+    // priced and shipped without it to afford the NPU lane, so no device of
+    // it may be named. use_device keeps the row above it off the GPU: a
+    // resolved HTP lane offloads to its own device whatever the leg says.
     const offload_case offloads[] = {
-        {false, false, fit::Unknown, true},
-        {false, false, fit::NotFit, true},
-        {false, false, fit::Fit, true},
-        {false, true, fit::Unknown, true},
-        {false, true, fit::NotFit, true},
-        {false, true, fit::Fit, true},
-        {true, true, fit::Unknown, true},
-        {true, true, fit::NotFit, true},
-        {true, true, fit::Fit, true},
-        {true, false, fit::Unknown, false},
-        {true, false, fit::NotFit, false},
-        {true, false, fit::Fit, true},
+        {false, false, fit::Unknown, true, true},
+        {false, false, fit::NotFit, true, true},
+        {false, false, fit::Fit, true, true},
+        {false, false, fit::Fit, false, true},
+        {false, true, fit::Unknown, true, true},
+        {false, true, fit::NotFit, true, true},
+        {false, true, fit::Fit, true, true},
+        {false, true, fit::Fit, false, true},
+        {true, true, fit::Unknown, true, true},
+        {true, true, fit::NotFit, true, true},
+        {true, true, fit::Fit, true, true},
+        {true, true, fit::Fit, false, true},
+        {true, false, fit::Unknown, true, false},
+        {true, false, fit::NotFit, true, false},
+        {true, false, fit::Fit, true, true},
+        {true, false, fit::Fit, false, false},
     };
     for (const auto & c : offloads) {
         governor_prefill_device_plan plan{};
         plan.use_device = c.use_device;
-        if (governor_prefill_offloads(c.lane_requested, plan, c.gpu_fit) != c.offloads) {
+        if (governor_prefill_offloads(c.lane_requested, plan, c.gpu_fit, c.gpu_leg) != c.offloads) {
             std::cerr << "offload wrong: lane_requested=" << c.lane_requested
                       << " use_device=" << c.use_device
-                      << " gpu_fit=" << static_cast<int>(c.gpu_fit) << std::endl;
+                      << " gpu_fit=" << static_cast<int>(c.gpu_fit)
+                      << " gpu_leg=" << c.gpu_leg << std::endl;
             return false;
         }
     }
     struct gate_case {
         bool lane_requested;
         fit gpu_fit;
+        bool gpu_leg;
         bool allowed;
     };
+    // lane_requested false keeps the load's default placement untouched: the
+    // leg flag only ever removes a GPU the lane priced out, never the placement
+    // a load that never asked for the lane has always had.
     const gate_case gates[] = {
-        {false, fit::Unknown, true},
-        {false, fit::NotFit, true},
-        {false, fit::Fit, true},
-        {true, fit::Unknown, false},
-        {true, fit::NotFit, false},
-        {true, fit::Fit, true},
+        {false, fit::Unknown, true, true},
+        {false, fit::NotFit, true, true},
+        {false, fit::Fit, true, true},
+        {false, fit::Fit, false, true},
+        {true, fit::Unknown, true, false},
+        {true, fit::NotFit, true, false},
+        {true, fit::Fit, true, true},
+        {true, fit::Fit, false, false},
     };
     for (const auto & c : gates) {
-        if (governor_gpu_placement_allowed(c.lane_requested, c.gpu_fit) != c.allowed) {
+        if (governor_gpu_placement_allowed(c.lane_requested, c.gpu_fit, c.gpu_leg) != c.allowed) {
             std::cerr << "gpu gate wrong: lane_requested=" << c.lane_requested
-                      << " gpu_fit=" << static_cast<int>(c.gpu_fit) << std::endl;
+                      << " gpu_fit=" << static_cast<int>(c.gpu_fit)
+                      << " gpu_leg=" << c.gpu_leg << std::endl;
+            return false;
+        }
+    }
+    return true;
+}
+
+// The leg flag is fail-safe by contract: a request that never mentions it
+// keeps today's placement, and a JSON null (what an app that never computed
+// the optional field sends) means the same as absent rather than a malformed
+// request. Anything else non-boolean is refused like every neighbouring
+// field, so a typo cannot silently read as "no GPU".
+static bool test_gpu_leg_parse_contract() {
+    llama_governor_params params{};
+    llama_governor_thermo_profile thermo{};
+    rnllama::governor_load_options options{};
+
+    auto absent = base_governor();
+    if (!parse_governor_params(absent, params, thermo, options) || !params.gpu_leg) {
+        std::cerr << "gpu_leg absent must default true" << std::endl;
+        return false;
+    }
+
+    auto nulled = base_governor();
+    nulled["gpu_leg"] = nullptr;
+    if (!parse_governor_params(nulled, params, thermo, options) || !params.gpu_leg) {
+        std::cerr << "gpu_leg null must default true" << std::endl;
+        return false;
+    }
+
+    auto left_out = base_governor();
+    left_out["gpu_leg"] = false;
+    if (!parse_governor_params(left_out, params, thermo, options) || params.gpu_leg) {
+        std::cerr << "gpu_leg false must survive the parse" << std::endl;
+        return false;
+    }
+
+    for (const char * bad : {"\"false\"", "0", "1"}) {
+        auto typed = base_governor();
+        typed["gpu_leg"] = nlohmann::ordered_json::parse(bad);
+        bool threw = false;
+        try {
+            parse_governor_params(typed, params, thermo, options);
+        } catch (const std::invalid_argument & error) {
+            threw = std::string(error.what()) == "governor.gpu_leg must be a boolean";
+        }
+        if (!threw) {
+            std::cerr << "gpu_leg " << bad << " must be refused" << std::endl;
             return false;
         }
     }
@@ -697,7 +762,8 @@ int main() {
     results.run_test("generation V81 parses, unknown arch refuses", test_generation_parses_v81());
     results.run_test("prefill device plan degrades / opens HTP0", test_prefill_device_plan());
     results.run_test("lane policy flag follows resolution", test_lane_policy_flag_follows_resolution());
-    results.run_test("prefill offload and GPU placement follow the fit gate", test_prefill_offload_truth_table());
+    results.run_test("prefill offload and GPU placement follow the fit and leg gates", test_prefill_offload_truth_table());
+    results.run_test("gpu_leg defaults true and refuses a non-boolean", test_gpu_leg_parse_contract());
     results.run_test("runtime htp reason degrades the next load", test_htp_runtime_reason_degrades_next_load());
     results.run_test("only a batch the HTP device ran kills the lane", test_htp_runtime_failure_attribution());
     results.run_test("registry exclusion keeps non-HTP order", test_devices_excluding_registry());

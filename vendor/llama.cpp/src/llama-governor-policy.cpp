@@ -365,6 +365,15 @@ bool llama_governor_policy::not_a_safety_state() const {
            state_ == llama_governor_thermal_state::COOLMODE;
 }
 
+bool llama_governor_policy::gpu_prefill_capable() const {
+    return params_.gpu_leg && params_.gpu_fit == llama_governor_fit::Fit &&
+           params_.gpu_prefill_measured &&
+           (params_.generation == llama_governor_generation::V73 ||
+            params_.generation == llama_governor_generation::V75 ||
+            params_.generation == llama_governor_generation::V79 ||
+            params_.generation == llama_governor_generation::V81);
+}
+
 llama_governor_engine llama_governor_policy::prefill_engine(
         llama_governor_prefill_mode * mode_used, bool * override_decided) const {
     // One atomic load per call: the binding may push a new mode from another
@@ -384,21 +393,26 @@ llama_governor_engine llama_governor_policy::prefill_engine(
     // Bench route dev hook: the override requests the engine only after the
     // safety verdict above. Force-GPU keeps the gpu_fit==Fit gate (the same
     // gate bench_force_gpu_prefill uses below); a failed gate falls through
-    // to the plan, which can only pick a Fit-guarded GPU path or CPU.
+    // to the plan, which can only pick a Fit-guarded GPU path or CPU. A load
+    // with no GPU leg (gpu_leg false) has no GPU to name, so the branch is
+    // skipped entirely and the request falls through to the plan like the
+    // bench knob's - override_decided stays false either way. A GPU that does
+    // not fit keeps its CPU veto (test-governor-bench-route).
     if (mode == llama_governor_prefill_mode::CPU) {
         if (override_decided != nullptr) {
             *override_decided = true;
         }
         return llama_governor_engine::CPU;
     }
-    if (mode == llama_governor_prefill_mode::GPU) {
+    if (mode == llama_governor_prefill_mode::GPU && params_.gpu_leg) {
         const bool fit = params_.gpu_fit == llama_governor_fit::Fit;
         if (override_decided != nullptr) {
             *override_decided = fit;
         }
         return fit ? llama_governor_engine::GPU : llama_governor_engine::CPU;
     }
-    if (params_.bench_force_gpu_prefill && params_.gpu_fit == llama_governor_fit::Fit) {
+    if (params_.bench_force_gpu_prefill && params_.gpu_leg &&
+        params_.gpu_fit == llama_governor_fit::Fit) {
         return llama_governor_engine::GPU;
     }
     // Owner rule (2026-09-28): NPU first for prefill, GPU when the NPU is
@@ -425,18 +439,18 @@ llama_governor_engine llama_governor_policy::prefill_engine(
     // above outranks both. FAST, WARM and COOLMODE reach this branch only with no
     // live NPU lane, so no live NPU is ever left for the GPU. The alternative
     // there is CPU, the hottest prefill backend measured (S23 heat arms above).
-    // The generation list is duplicated in the app; the form refactor should carry it once.
-    if ((params_.generation == llama_governor_generation::V73 ||
-         params_.generation == llama_governor_generation::V75 ||
-         params_.generation == llama_governor_generation::V79 ||
-         params_.generation == llama_governor_generation::V81) &&
-        params_.gpu_fit == llama_governor_fit::Fit && params_.gpu_prefill_measured) {
+    // The generation list is duplicated in the app; the form refactor should
+    // carry it once. It and the fit gate now live in gpu_prefill_capable(),
+    // which carries params_.gpu_leg: a load that left the GPU out for the NPU
+    // lane never claims one here.
+    if (gpu_prefill_capable()) {
         return llama_governor_engine::GPU;
     }
     // A platform-raised COOLMODE must not buy the cool prefill path;
     // only battery heat takes it.
     if (params_.generation == llama_governor_generation::V73 && params_.model_kind == llama_governor_model_kind::MoE &&
-        params_.cool_prefill_eligible && params_.gpu_fit == llama_governor_fit::Fit && !hot_plugged_ &&
+        params_.cool_prefill_eligible && params_.gpu_leg &&
+        params_.gpu_fit == llama_governor_fit::Fit && !hot_plugged_ &&
         !state_from_platform_) {
         return llama_governor_engine::GPU_COOLMODE;
     }
@@ -593,11 +607,14 @@ llama_governor_decode_selection llama_governor_policy::select_decode(
     // GPU_COOLMODE is the hottest decode backend per token on the owner's
     // heat arms (NPU coolest, CPU between, GPU hottest), so a COOLMODE the
     // platform floor raised must not buy it: decode keeps today's engine.
-    // Battery-derived COOLMODE eligibility is untouched.
+    // Battery-derived COOLMODE eligibility is untouched. params_.gpu_leg is
+    // in the gate because this branch would otherwise hand out a GPU leg the
+    // load does not have (the same trap the prefill branches avoid).
     const bool eligible = !hop_active && valid_schema(params_) && have_profile_ && profile_valid_ &&
         state_ == llama_governor_thermal_state::COOLMODE && !state_from_platform_ && !hot_plugged_ &&
         params_.generation == llama_governor_generation::V73 &&
-        params_.gpu_fit == llama_governor_fit::Fit && params_.cool_delta_measured && params_.kexp_cool_scope &&
+        params_.gpu_leg && params_.gpu_fit == llama_governor_fit::Fit &&
+        params_.cool_delta_measured && params_.kexp_cool_scope &&
         params_.cool_pays != llama_governor_cool_pays::No && params_.reload_budget_available && budget_ok;
     if (!eligible) {
         last_decode_engine_ = llama_governor_engine::CPU;

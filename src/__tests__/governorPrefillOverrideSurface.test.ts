@@ -143,7 +143,7 @@ test('the vendored engine declares the API, the facts, and safety before overrid
       'if (mode == llama_governor_prefill_mode::CPU) { ' +
       'if (override_decided != nullptr) { *override_decided = true; } ' +
       'return llama_governor_engine::CPU; } ' +
-      'if (mode == llama_governor_prefill_mode::GPU) { ' +
+      'if (mode == llama_governor_prefill_mode::GPU && params_.gpu_leg) { ' +
       'const bool fit = params_.gpu_fit == llama_governor_fit::Fit; ' +
       'if (override_decided != nullptr) { *override_decided = fit; } ' +
       'return fit ? llama_governor_engine::GPU : llama_governor_engine::CPU; } ' +

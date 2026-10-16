@@ -69,10 +69,13 @@ bool has_speculative_mode(const common_params & params) {
 
 void log_governor_fallback(const char * stage, int models_loaded,
                            const std::string & reason,
-                           llama_governor_fit gpu_fit, bool profile_valid) {
+                           llama_governor_fit gpu_fit, bool gpu_leg, bool profile_valid) {
+    // gpu_fit is the truthful fit verdict and gpu_leg is the load's own choice,
+    // so a postmortem reads "the GPU did not fit" apart from "the GPU was left
+    // out for the NPU lane" - two different faults that used to look identical.
     LOG_ERROR(
-        "KALSA_GOVERNOR_FALLBACK {stage:\"%s\", models_loaded:%d, reason:\"%s\", gpu_fit:%d, profile_valid:%d}",
-        stage, models_loaded, reason.c_str(), (int) gpu_fit, (int) profile_valid);
+        "KALSA_GOVERNOR_FALLBACK {stage:\"%s\", models_loaded:%d, reason:\"%s\", gpu_fit:%d, gpu_leg:%d, profile_valid:%d}",
+        stage, models_loaded, reason.c_str(), (int) gpu_fit, (int) gpu_leg, (int) profile_valid);
 }
 
 #if defined(__ANDROID__)
@@ -460,7 +463,7 @@ bool load_governor_models(llama_rn_context & owner,
     const rn_leg_set leg_set = rn_legs_for(hw_facts);
     const bool onecopy_requested = leg_set.one_copy && governor_params.npu_lane_enabled;
     const bool gpu_allowed = governor_gpu_placement_allowed(
-        governor_params.npu_lane_enabled, governor_params.gpu_fit);
+        governor_params.npu_lane_enabled, governor_params.gpu_fit, governor_params.gpu_leg);
     const llama_governor_params effective_v3 = onecopy_requested
         ? merge_leg_row_defaults(governor_params, load_options.v3_sent, leg_set)
         : governor_params;
@@ -614,14 +617,17 @@ bool load_governor_models(llama_rn_context & owner,
         if (!gpu_allowed) {
             decode_params.devices = { nullptr };
         }
-        if (!governor_prefill_offloads(true, device_plan, governor_params.gpu_fit)) {
+        if (!governor_prefill_offloads(true, device_plan, governor_params.gpu_fit,
+                                       governor_params.gpu_leg)) {
             // An empty explicit list keeps the engine from sweeping the default
             // devices, which on Android include the OpenCL GPU.
             prefill_params.devices = { nullptr };
             prefill_cpu_only = true;
-            LOG_INFO("KALSA_PREFILL_CPU {reason:\"%s\", gpu_fit:%d}",
+            // gpu_leg beside gpu_fit: a postmortem must be able to tell "the GPU
+            // did not fit" from "the GPU was left out for the NPU lane".
+            LOG_INFO("KALSA_PREFILL_CPU {reason:\"%s\", gpu_fit:%d, gpu_leg:%d}",
                      device_plan.npu_fallback != nullptr ? device_plan.npu_fallback : "none",
-                     (int) governor_params.gpu_fit);
+                     (int) governor_params.gpu_fit, (int) governor_params.gpu_leg);
         }
 #if defined(__ANDROID__)
     } else {
@@ -675,7 +681,8 @@ bool load_governor_models(llama_rn_context & owner,
     auto fail = [&](const char * stage, int models_loaded,
                     const std::string & reason) {
         log_governor_fallback(stage, models_loaded, reason,
-                              governor_params.gpu_fit, profile_valid);
+                              governor_params.gpu_fit, governor_params.gpu_leg,
+                              profile_valid);
         cleanup();
         log_legs_outcome("plain", false);
         return false;
@@ -715,7 +722,8 @@ bool load_governor_models(llama_rn_context & owner,
         const bool route_rejected = reason.find("route") != std::string::npos ||
                                     reason.find("Route") != std::string::npos;
         log_governor_fallback(route_rejected ? "route_reject" : "init", 2, reason,
-                              governor_params.gpu_fit, runtime_profile_valid);
+                              governor_params.gpu_fit, governor_params.gpu_leg,
+                              runtime_profile_valid);
         // CPU retry belongs to LlamaService/S4. Native owns only cleanup and
         // returns failure so that retry can recreate the single-context path.
         cleanup();
@@ -729,7 +737,8 @@ bool load_governor_models(llama_rn_context & owner,
     if (owner.model == nullptr || owner.ctx == nullptr) {
         log_governor_fallback("init", 2,
                               "governor initialized without an active context",
-                              governor_params.gpu_fit, profile_valid);
+                              governor_params.gpu_fit, governor_params.gpu_leg,
+                              profile_valid);
         cleanup();
         log_legs_outcome("plain", false);
         return false;
@@ -1272,10 +1281,11 @@ int32_t llama_rn_context::decode(llama_batch batch) {
         // reason on another thread's failed decode.
         const std::string npu_fallback = governorNpuFallback();
         LOG_ERROR(
-            "KALSA_GOVERNOR_FALLBACK {stage:\"%s\", models_loaded:2, reason:\"%s\", npu_fallback:\"%s\", gpu_fit:%d, profile_valid:%d}",
+            "KALSA_GOVERNOR_FALLBACK {stage:\"%s\", models_loaded:2, reason:\"%s\", npu_fallback:\"%s\", gpu_fit:%d, gpu_leg:%d, profile_valid:%d}",
             route_rejected ? "route_reject" : "decode",
             reason.c_str(), npu_fallback.c_str(),
-            (int) governor->gpu_fit(), (int) governor->profile_valid());
+            (int) governor->gpu_fit(), (int) governor->gpu_leg(),
+            (int) governor->profile_valid());
     }
     if (result == -2 && !governor->failed()) {
         // Flow-control -2s share one rc (rn-governor.h); the labels use only
@@ -1455,6 +1465,7 @@ bool llama_rn_context::loadModel(
                 "params", 0,
                 "Governor mode does not support speculative or MTP decoding",
                 governor_params->gpu_fit,
+                governor_params->gpu_leg,
                 governor_thermo != nullptr &&
                     governor_thermo_profile_is_valid(*governor_thermo));
             throw std::runtime_error("Governor mode does not support speculative or MTP decoding");

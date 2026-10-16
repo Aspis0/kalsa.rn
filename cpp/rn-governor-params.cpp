@@ -35,6 +35,21 @@ bool bool_or(const nlohmann::ordered_json & object, const char * name, bool fall
     return object.at(name).get<bool>();
 }
 
+// As bool_or, but an explicit null means "not specified" instead of a type
+// error. Used for gpu_leg, whose fallback (true) is today's behaviour for an
+// app that predates the field. That fallback is the permissive direction: a
+// new app must always send the field, which governorInputs.ts does.
+bool bool_or_null_as_fallback(
+    const nlohmann::ordered_json & object, const char * name, bool fallback) {
+    if (!object.contains(name) || object.at(name).is_null()) {
+        return fallback;
+    }
+    if (!object.at(name).is_boolean()) {
+        throw std::invalid_argument(std::string("governor.") + name + " must be a boolean");
+    }
+    return object.at(name).get<bool>();
+}
+
 std::string string_or(const nlohmann::ordered_json & object, const char * name) {
     if (!object.contains(name)) {
         return {};
@@ -250,6 +265,9 @@ bool parse_governor_params(
     params.generation = generation_from(string_or(governor, "generation"));
     params.model_kind = model_kind_from(string_or(governor, "model_kind"));
     params.gpu_fit = fit_from(string_or(governor, "gpu_fit"), "gpu_fit");
+    // Absent or null => true, so an app predating the leg flag keeps today's
+    // placement. gpu_fit stays the truthful fit verdict either way.
+    params.gpu_leg = bool_or_null_as_fallback(governor, "gpu_leg", true);
     params.npu_fit = fit_from(string_or(governor, "npu_fit"), "npu_fit");
     params.htp_trunk_readable = bool_or(governor, "htp_trunk_readable", false);
     params.htp_experts_readable = bool_or(governor, "htp_experts_readable", false);
@@ -404,13 +422,15 @@ bool governor_lane_policy_enabled(
     return lane_enabled && plan.use_device;
 }
 
-bool governor_gpu_placement_allowed(bool lane_requested, llama_governor_fit gpu_fit) {
-    return !lane_requested || gpu_fit == llama_governor_fit::Fit;
+bool governor_gpu_placement_allowed(
+        bool lane_requested, llama_governor_fit gpu_fit, bool gpu_leg) {
+    return !lane_requested || (gpu_fit == llama_governor_fit::Fit && gpu_leg);
 }
 
 bool governor_prefill_offloads(
-        bool lane_requested, const governor_prefill_device_plan & plan, llama_governor_fit gpu_fit) {
-    return plan.use_device || governor_gpu_placement_allowed(lane_requested, gpu_fit);
+        bool lane_requested, const governor_prefill_device_plan & plan,
+        llama_governor_fit gpu_fit, bool gpu_leg) {
+    return plan.use_device || governor_gpu_placement_allowed(lane_requested, gpu_fit, gpu_leg);
 }
 
 bool htp_runtime_failure(

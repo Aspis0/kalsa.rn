@@ -338,6 +338,7 @@ struct llama_governor_params {
     llama_governor_generation generation = llama_governor_generation::Unknown;
     llama_governor_model_kind model_kind = llama_governor_model_kind::Unknown;
     llama_governor_fit gpu_fit = llama_governor_fit::Unknown;
+    bool gpu_leg = true; // false = the load left the GPU out for the NPU lane; gpu_fit stays the truthful fit verdict
     llama_governor_fit npu_fit = llama_governor_fit::Unknown;
     bool htp_trunk_readable = false;
     bool htp_experts_readable = false;

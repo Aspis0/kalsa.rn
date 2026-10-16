@@ -159,6 +159,13 @@ private:
     // accelerators run only in the non-safety states.
     bool npu_lane_live() const;
     bool not_a_safety_state() const;
+    // The GPU is loaded (params_.gpu_leg), fits, and is a measured prefill
+    // backend on a generation the owner enabled for GPU prefill: the whole
+    // "a GPU leg is really there to prefill on" fact, which prefill_engine's
+    // GPU fallback folds in so the leg flag is read in one place.
+    // prefill_engine's bench overrides read the leg directly instead -
+    // bench A/Bs an unmeasured GPU.
+    bool gpu_prefill_capable() const;
 
     // Rule 4's leg choice (llama-governor-policy-hop.cpp): called only at
     // window boundaries while the hop is active; decides decode_hop_leg_,

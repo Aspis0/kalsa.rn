@@ -41,7 +41,7 @@ int8_t observed_leg(llama_governor_engine engine) {
 rn_governor::rn_governor(llama_model * prefill_model, llama_model * decode_model,
                          llama_context_params prefill_params, llama_context_params decode_params,
                          const llama_governor_params & params)
-    : gpu_fit_(params.gpu_fit) {
+    : gpu_fit_(params.gpu_fit), gpu_leg_(params.gpu_leg) {
     // This is the same two-model call order as governor-bench. The v0.3 API
     // overload additionally enables the parsed policy inputs and thermo gate.
     std::string failure_reason;
@@ -60,7 +60,7 @@ rn_governor::rn_governor(llama_model * prefill_model, llama_model * decode_model
 
 rn_governor::rn_governor(llama_model * model, const llama_governor_leg * legs, uint32_t n_legs,
                          const llama_governor_params & params)
-    : gpu_fit_(params.gpu_fit) {
+    : gpu_fit_(params.gpu_fit), gpu_leg_(params.gpu_leg) {
     // One shared llama_model, one context per leg (F1). A null engine
     // governor logged its reason on the engine side (no out-param in the
     // one-model form); the caller falls back to the two-model load.

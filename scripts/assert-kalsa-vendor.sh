@@ -18,6 +18,8 @@
 #   5. the committed lib/ output agrees with src/version.ts -- lib/ is what
 #      npm consumers read, and it has already drifted to a commit the pin
 #      had left behind
+#   6. the v73 HMX flash-attention gate is in the vendored ggml-hexagon.cpp,
+#      exactly once (its marker is a comment, so that check reads the raw file)
 #
 # (3) is the post-condition of a guard the old flattened-tree sync enforced at
 # the source: it wrote ${sha:0:7} rather than `git rev-parse --short=7`,
@@ -157,4 +159,13 @@ for rel in lib/commonjs/version.js lib/module/version.js lib/typescript/version.
     || fail "$rel disagrees with src/version.ts (want $src_number/$src_commit) -- run npm run build"
 done
 
-echo "assert-kalsa-vendor: ok (marker x1, kalsa_moe x1, upstream hunks present, governor src real, lib/ matches src/version.ts)"
+# 6. the v73 HMX flash-attention gate. The marker lives in a comment on purpose
+# (it names the hunk), so this one check reads the raw file: code_only would
+# strip it. Exactly once, so a duplicated or half-applied hunk fails.
+hexagon_cpp="$LLAMA/ggml/src/ggml-hexagon/ggml-hexagon.cpp"
+[ -f "$hexagon_cpp" ] || fail "missing $hexagon_cpp"
+v73_n=$(grep -c 'KALSA-V73-FA-NOPIPE' "$hexagon_cpp" || true)
+[ "$v73_n" = "1" ] \
+  || fail "expected exactly one 'KALSA-V73-FA-NOPIPE' in ggml-hexagon.cpp, found ${v73_n:-0} -- the v73 gate is missing from the vendored tree"
+
+echo "assert-kalsa-vendor: ok (marker x1, kalsa_moe x1, upstream hunks present, governor src real, lib/ matches src/version.ts, v73 gate x1)"

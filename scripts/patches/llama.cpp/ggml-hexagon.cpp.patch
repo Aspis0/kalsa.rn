@@ -1,6 +1,34 @@
 --- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 +++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-@@ -6048,6 +6048,24 @@
+@@ -5494,7 +5494,13 @@
+         const uint32_t DK_pad = hex_round_up(DK, 64);
+         const uint32_t DV_pad = hex_round_up(DV, 64);
+         size_t Br = 0, Bc = 0;
+-        int ret = hmx_fa_find_chunk_size(&Br, &Bc, G, DK_pad, DV_pad, neq1, nek1, sess->vtcm_size, sess->n_threads, (q->type == GGML_TYPE_F32), sinks != nullptr, n_head);
++        // KALSA-V73-FA-NOPIPE. v73 (S23): every HMX FA runs single-threaded, pipeline off. This changes
++        // behaviour wherever n_kv_blocks >= 3, not only past 1024. The drift was measured once n_kv > 1024
++        // (21/32 top-1 flips vs CPU, 2175-position prompt, LFM2.5 2.6B, q8_0 KV); pipeline off + 1 thread
++        // gave 1/32 twice, at +31% prefill; v79 with pipeline 0 gave 0/32. Pipeline vs threads not separated.
++        // Evidence: kalsa-moe-experiments scratchpad/agents/s23-oracle-m5/REPORT.md §13-14.
++        const uint32_t fa_threads = opt_arch < 75 ? 1 : sess->n_threads;
++        int ret = hmx_fa_find_chunk_size(&Br, &Bc, G, DK_pad, DV_pad, neq1, nek1, sess->vtcm_size, fa_threads, (q->type == GGML_TYPE_F32), sinks != nullptr, n_head);
+         if (ret == 0) {
+             kparams->kernel_type = HTP_FA_KERNEL_HMX;
+             if (logit_softcap == 0.0f) {
+@@ -5507,10 +5513,10 @@
+             kparams->Br = Br;
+             kparams->Bc = Bc;
+             kparams->n_kv_blocks = (nek1 + Bc - 1) / Bc;
+-            kparams->n_threads = (kparams->n_kv_blocks >= 3 && sess->n_threads >= 2) ? sess->n_threads : 1;
++            kparams->n_threads = (kparams->n_kv_blocks >= 3 && fa_threads >= 2) ? fa_threads : 1;
+ 
+             kparams->u.hmx.g_br = hex_align_up(G * Br, 32);
+-            kparams->u.hmx.pipeline = (kparams->n_kv_blocks >= 3 && sess->n_threads >= 2) ? 1 : 0;
++            kparams->u.hmx.pipeline = (kparams->n_kv_blocks >= 3 && fa_threads >= 2) ? 1 : 0;
+             kparams->vtcm_size = hmx_fa_compute_vtcm_usage(G, DK_pad, DV_pad, Br, Bc, kparams->n_threads, kparams->u.hmx.pipeline != 0, (q->type == GGML_TYPE_F32), sinks != nullptr, n_head);
+ 
+             const size_t row_vec_bytes = hex_align_up(Bc * sizeof(uint16_t), 256);
+@@ -9516,6 +9522,24 @@
          devices[i].context = new ggml_backend_hexagon_device_context(i, opt_device_configs[i], &devices[i]);
      }
  

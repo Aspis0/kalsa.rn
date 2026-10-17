@@ -5431,6 +5431,33 @@ static bool ggml_hexagon_flash_attn_is_hmx_eligible(
     return S >= s_cross;
 }
 
+// Lab knobs for the HMX flash-attention geometry, read once on first use:
+//   GGML_HEXAGON_FA_BC_MAX=<n>  cap Bc at n, aligned down to 64 (below 64 is ignored)
+//   GGML_HEXAGON_FA_NOPIPE=1    force the pipeline off and a single thread
+struct hex_fa_geom_lab {
+    size_t bc_max = 0;      // 0 = off
+    bool   nopipe = false;
+};
+
+static const hex_fa_geom_lab & hex_fa_geom_lab_get() {
+    static const hex_fa_geom_lab lab = [] {
+        hex_fa_geom_lab l;
+        const char * str_bc_max = getenv("GGML_HEXAGON_FA_BC_MAX");
+        const char * str_nopipe = getenv("GGML_HEXAGON_FA_NOPIPE");
+        if (str_bc_max) {
+            l.bc_max = hex_align_down((size_t) strtoul(str_bc_max, nullptr, 10), 64);
+            if (l.bc_max < 64) {
+                GGML_LOG_WARN("ggml-hex FA-geom: ignoring GGML_HEXAGON_FA_BC_MAX=%s (needs >= 64)\n", str_bc_max);
+                l.bc_max = 0;
+            }
+        }
+        l.nopipe = str_nopipe && strtoul(str_nopipe, nullptr, 10) != 0;
+        GGML_LOG_INFO("ggml-hex FA-geom: overrides bc_max=%zu (0 = off) nopipe=%d\n", l.bc_max, (int) l.nopipe);
+        return l;
+    }();
+    return lab;
+}
+
 static bool ggml_hexagon_precompute_flash_attn_params(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * op,
@@ -5504,6 +5531,10 @@ static bool ggml_hexagon_precompute_flash_attn_params(
                 kparams->scale = scale;
                 kparams->logit_softcap = logit_softcap * (float) M_LOG2E;
             }
+            const hex_fa_geom_lab & lab = hex_fa_geom_lab_get();
+            if (lab.bc_max != 0 && Bc > lab.bc_max) {
+                Bc = lab.bc_max;
+            }
             kparams->Br = Br;
             kparams->Bc = Bc;
             kparams->n_kv_blocks = (nek1 + Bc - 1) / Bc;
@@ -5511,7 +5542,14 @@ static bool ggml_hexagon_precompute_flash_attn_params(
 
             kparams->u.hmx.g_br = hex_align_up(G * Br, 32);
             kparams->u.hmx.pipeline = (kparams->n_kv_blocks >= 3 && sess->n_threads >= 2) ? 1 : 0;
+            if (lab.nopipe) {
+                kparams->n_threads = 1;
+                kparams->u.hmx.pipeline = 0;
+            }
             kparams->vtcm_size = hmx_fa_compute_vtcm_usage(G, DK_pad, DV_pad, Br, Bc, kparams->n_threads, kparams->u.hmx.pipeline != 0, (q->type == GGML_TYPE_F32), sinks != nullptr, n_head);
+            if (kparams->vtcm_size > sess->vtcm_size) {
+                GGML_LOG_WARN("ggml-hex FA-geom: Bc=%zu needs %u VTCM bytes, budget is %zu\n", Bc, (unsigned) kparams->vtcm_size, (size_t) sess->vtcm_size);
+            }
 
             const size_t row_vec_bytes = hex_align_up(Bc * sizeof(uint16_t), 256);
             kparams->u.hmx.row_buf_stride = row_vec_bytes / 128; // HVX vector is 128 bytes
@@ -5523,6 +5561,13 @@ static bool ggml_hexagon_precompute_flash_attn_params(
             if (mask) {
                 kparams->src3_div2 = init_fastdiv_values(mask->ne[2]);
                 kparams->src3_div3 = init_fastdiv_values(mask->ne[3]);
+            }
+
+            static std::atomic<int> n_geom_logs{0};
+            if (nek1 > 1024 && n_geom_logs++ < 3) {
+                GGML_LOG_INFO("ggml-hex FA-geom: Br=%u Bc=%u n_kv_blocks=%u n_threads=%u pipeline=%u nek1=%u\n",
+                              (unsigned) kparams->Br, (unsigned) kparams->Bc, (unsigned) kparams->n_kv_blocks,
+                              (unsigned) kparams->n_threads, (unsigned) kparams->u.hmx.pipeline, (unsigned) nek1);
             }
 
             kparams->qrows = 0;

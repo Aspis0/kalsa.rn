@@ -20,8 +20,10 @@ import java.util.Map;
 /**
  * Debug-only passthrough for two ggml Hexagon switches, read from
  * {filesDir}/hexagon-env (KEY=VALUE lines):
- *   GGML_HEXAGON_FA_SELECT  digits only, e.g. 1 = no HMX flash attention
- *   GGML_HEXAGON_OPFILTER   [A-Za-z0-9_|]+, e.g. flash_attn_ext or set_rows
+ *   GGML_HEXAGON_FA_SELECT   digits only, e.g. 1 = no HMX flash attention
+ *   GGML_HEXAGON_OPFILTER    [A-Za-z0-9_|]+, e.g. flash_attn_ext or set_rows
+ *   GGML_HEXAGON_FA_BC_MAX   digits only, caps the HMX flash-attention Bc (experiment)
+ *   GGML_HEXAGON_FA_NOPIPE   digits only, 1 = HMX flash attention without pipeline (experiment)
  * Any other key or value is skipped. Only applies to debuggable builds. The file
  * is capped at 4 KB and read once per process, at the first loadNative, so edits
  * need an app restart. A stale file changes NPU behaviour: delete it after experiments.
@@ -32,6 +34,8 @@ final class HexagonDebugEnv {
   private static final int MAX_BYTES = 4 * 1024;
   private static final String FA_SELECT = "GGML_HEXAGON_FA_SELECT";
   private static final String OPFILTER = "GGML_HEXAGON_OPFILTER";
+  private static final String FA_BC_MAX = "GGML_HEXAGON_FA_BC_MAX";
+  private static final String FA_NOPIPE = "GGML_HEXAGON_FA_NOPIPE";
 
   private HexagonDebugEnv() {}
 
@@ -84,8 +88,10 @@ final class HexagonDebugEnv {
   }
 
   static boolean accepts(String key, String value) {
-    if (key.equals(FA_SELECT)) return value.matches("[0-9]+");
     if (key.equals(OPFILTER)) return value.matches("[A-Za-z0-9_|]+");
+    if (key.equals(FA_SELECT) || key.equals(FA_BC_MAX) || key.equals(FA_NOPIPE)) {
+      return value.matches("[0-9]+");
+    }
     return false;
   }
 

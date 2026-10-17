@@ -212,6 +212,9 @@ public class RNLlama {
       Log.w(TAG, "Failed to extract HTP libraries", e);
     }
 
+    // Debug-only GGML_HEXAGON_* passthrough; ggml reads these lazily at backend init, after loadLibrary.
+    HexagonDebugEnv.applyIfDebuggable(context);
+
     String cpuFeatures = getCpuFeatures();
     boolean hasFp16 = cpuFeatures.contains("fp16") || cpuFeatures.contains("fphp");
     boolean hasDotProd = cpuFeatures.contains("dotprod") || cpuFeatures.contains("asimddp");
